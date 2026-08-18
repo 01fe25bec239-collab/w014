@@ -8,6 +8,9 @@
   },
   "scripts": {
     "build": "pnpm --filter @w014/web build",
-    "build:web": "pnpm --filter @w014/web build"
+    "build:web": "pnpm --filter @w014/web build",
+    "test": "pnpm --filter @w014/web test",
+    "test:web": "pnpm --filter @w014/web test",
+    "typecheck": "pnpm --filter @w014/web typecheck"
   }
 }
