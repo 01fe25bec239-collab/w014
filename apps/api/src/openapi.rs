@@ -1,18 +1,15 @@
-//! OpenAPI specification and Swagger UI aggregation for Foundation API.
+//! OpenAPI specification and routing aggregation for Foundation API.
 
-use axum::Json;
-use axum::response::IntoResponse;
 use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::error::ProblemDetails;
 use crate::routes::health::HealthResponse;
 
-/// Aggregated OpenAPI documentation for the Foundation Platform API.
+/// Aggregated OpenAPI documentation metadata and schemas for the Foundation Platform API.
 #[derive(OpenApi)]
 #[openapi(
-    paths(
-        crate::routes::health::healthz_handler,
-    ),
     components(
         schemas(HealthResponse, ProblemDetails)
     ),
@@ -27,9 +24,11 @@ use crate::routes::health::HealthResponse;
 )]
 pub struct ApiDoc;
 
-/// Handler returning the generated OpenAPI 3.x JSON specification.
-pub async fn openapi_json_handler() -> impl IntoResponse {
-    Json(ApiDoc::openapi())
+/// Constructs the OpenApiRouter integrating routes and OpenAPI documentation via utoipa-axum.
+pub fn build_openapi_router() -> (axum::Router, utoipa::openapi::OpenApi) {
+    OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .routes(routes!(crate::routes::health::healthz_handler))
+        .split_for_parts()
 }
 
 #[cfg(test)]
@@ -38,7 +37,7 @@ mod tests {
 
     #[test]
     fn test_openapi_spec_generation() {
-        let spec = ApiDoc::openapi();
+        let (_router, spec) = build_openapi_router();
         let json =
             serde_json::to_string_pretty(&spec).expect("OpenAPI spec should serialize to JSON");
 

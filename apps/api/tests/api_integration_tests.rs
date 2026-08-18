@@ -310,3 +310,44 @@ async fn test_openapi_endpoint_exposes_health_surface_only() {
     assert!(!json_str.contains("WorkspaceDto"));
     assert!(!json_str.contains("DocumentDto"));
 }
+
+#[tokio::test]
+async fn test_swagger_ui_surface_is_absent() {
+    let app = setup_test_app();
+
+    let request = Request::builder()
+        .uri("/swagger-ui")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    // /swagger-ui is removed per dependency-minimization rules; fallback 404 is returned
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        PROBLEM_JSON_MEDIA_TYPE
+    );
+}
+
+#[tokio::test]
+async fn test_utoipa_axum_openapi_router_composition() {
+    use tower::ServiceExt;
+    let (router, openapi) = w014_api::openapi::build_openapi_router();
+
+    // Verify OpenAPI spec contains the operational health endpoint collected via utoipa-axum routes! macro
+    assert!(openapi.paths.paths.contains_key("/healthz"));
+    assert_eq!(openapi.info.title, "W-014 Foundation Platform API");
+    assert_eq!(openapi.info.version, "0.1.0");
+
+    // Verify router directly dispatches /healthz successfully
+    let request = Request::builder()
+        .uri("/healthz")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
