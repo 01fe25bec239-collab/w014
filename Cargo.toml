@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/api",
+    "apps/worker",
+    "tools/w014-cli",
+    "crates/w014-domain",
+    "crates/w014-application",
+    "crates/w014-persistence",
+    "crates/w014-authn",
+    "crates/w014-authz",
+    "crates/w014-ai-contracts",
+    "crates/w014-ai-runtime",
+    "crates/w014-document-processing",
+    "crates/w014-jobs",
+    "crates/w014-reporting",
+    "crates/w014-observability",
+]

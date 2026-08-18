@@ -1,0 +1,13 @@
+{
+  "name": "w014-monorepo",
+  "private": true,
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": "24.18.0",
+    "pnpm": "11.22.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter @w014/web build",
+    "build:web": "pnpm --filter @w014/web build"
+  }
+}
