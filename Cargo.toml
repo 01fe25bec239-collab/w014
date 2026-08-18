@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/api",
+    "apps/worker",
+    "tools/w014-cli",
+    "crates/w014-domain",
+    "crates/w014-application",
+    "crates/w014-persistence",
+    "crates/w014-authn",
+    "crates/w014-authz",
+    "crates/w014-ai-contracts",
+    "crates/w014-ai-runtime",
+    "crates/w014-document-processing",
+    "crates/w014-jobs",
+    "crates/w014-reporting",
+    "crates/w014-observability",
+]
+
+[workspace.dependencies]
+axum = "0.8"
+http = "1.2"
+http-body-util = "0.1"
+opentelemetry = { version = "0.28", features = ["trace"] }
+opentelemetry_sdk = { version = "0.28", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", features = ["trace", "grpc-tonic"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = "0.1"
+tracing-opentelemetry = "0.29"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+utoipa = { version = "5.3", features = ["axum_extras"] }
+utoipa-axum = "0.2"
+uuid = { version = "1.13", features = ["v4", "serde"] }

@@ -1,0 +1,13 @@
+[package]
+name = "w014-worker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+w014-jobs = { path = "../../crates/w014-jobs" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+libc = "0.2"
