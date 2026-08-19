@@ -16,7 +16,10 @@ pub mod rotation;
 pub mod session;
 pub mod transaction;
 
-pub use csrf::{CSRF_HEADER_NAME, CsrfConfig, CsrfProtector, constant_time_eq, derive_csrf_token};
+pub use csrf::{
+    CSRF_HEADER_NAME, CsrfConfig, CsrfProtector, canonicalize_origin, constant_time_eq,
+    derive_csrf_token,
+};
 pub use error::AuthnError;
 pub use identity::{OidcIdentity, OidcIdentityId};
 pub use middleware::AuthenticatedSession;
@@ -26,7 +29,7 @@ pub use oidc::{
 };
 pub use rotation::{SessionRotation, SessionRotationId};
 pub use session::{
-    Session, SessionConfig, SessionCookieBuilder, SessionEvaluator, SessionId, SessionStatus,
-    generate_session_token, hash_session_token,
+    AuthenticationResult, Session, SessionConfig, SessionCookieBuilder, SessionEvaluator,
+    SessionId, SessionStatus, generate_session_token, hash_session_token,
 };
 pub use transaction::{OidcTransaction, OidcTransactionId};

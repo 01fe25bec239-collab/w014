@@ -151,6 +151,50 @@ impl SessionRepository {
         Ok(())
     }
 
+    /// Lists all currently active sessions for a principal, ordered by creation time ASC (oldest first).
+    pub async fn list_active_by_principal(
+        tx: &mut PgConnection,
+        principal_id: PrincipalId,
+    ) -> Result<Vec<Session>, PersistenceError> {
+        let rows = sqlx::query(
+            "SELECT id, principal_id, workspace_id, session_token_hash, status, ip_address, user_agent, created_at, expires_at, last_seen_at
+             FROM sessions
+             WHERE principal_id = $1 AND status = 'active'
+             ORDER BY created_at ASC",
+        )
+        .bind(principal_id.as_uuid())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        let mut sessions = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(session) = Self::map_row_opt(Some(row))? {
+                sessions.push(session);
+            }
+        }
+
+        Ok(sessions)
+    }
+
+    /// Revokes all active sessions for a given principal.
+    pub async fn revoke_all_by_principal(
+        tx: &mut PgConnection,
+        principal_id: PrincipalId,
+    ) -> Result<u64, PersistenceError> {
+        let result = sqlx::query(
+            "UPDATE sessions
+             SET status = 'revoked'
+             WHERE principal_id = $1 AND status = 'active'",
+        )
+        .bind(principal_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        Ok(result.rows_affected())
+    }
+
     fn map_row_opt(
         row_opt: Option<sqlx::postgres::PgRow>,
     ) -> Result<Option<Session>, PersistenceError> {

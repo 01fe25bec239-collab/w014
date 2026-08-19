@@ -214,19 +214,28 @@ impl ApiConfig {
             }
         };
 
-        let session_hmac_secret = std::env::var("SESSION_SECRET")
+        let active_hmac_secret = std::env::var("SESSION_SECRET")
             .or_else(|_| std::env::var("SESSION_HMAC_KEY"))
             .map(|s| s.into_bytes())
             .unwrap_or_else(|_| b"w014-default-dev-session-secret-key-32b!".to_vec());
 
+        let previous_hmac_secret = std::env::var("SESSION_PREVIOUS_SECRET")
+            .or_else(|_| std::env::var("SESSION_PREVIOUS_HMAC_KEY"))
+            .map(|s| s.into_bytes())
+            .ok();
+
         let session = SessionConfig {
             absolute_ttl_secs: 7 * 24 * 3600,
-            idle_ttl_secs: 24 * 3600,
+            idle_ttl_secs: 12 * 3600,
             cookie_name: std::env::var("SESSION_COOKIE_NAME")
                 .unwrap_or_else(|_| "w014_session".to_string()),
             cookie_secure: session_secure,
             cookie_path: "/".to_string(),
-            hmac_secret: session_hmac_secret,
+            active_hmac_secret,
+            previous_hmac_secret,
+            periodic_rotation_interval_secs: 4 * 3600,
+            activity_touch_interval_secs: 5 * 60,
+            max_concurrent_sessions: 5,
         };
 
         let csrf_allowed_origins = if let Ok(origins_str) = std::env::var("CSRF_ALLOWED_ORIGINS") {

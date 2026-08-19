@@ -1,7 +1,7 @@
 //! Session inspection and lifecycle endpoints (E03: Get Session, E04: Logout).
 
 use axum::extract::State;
-use axum::http::header::SET_COOKIE;
+use axum::http::header::{ORIGIN, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
@@ -66,16 +66,26 @@ pub async fn get_session_handler(
         .await
         .map_err(|_| ProblemDetails::internal_server_error(Some("/api/v1/session".into())))?;
 
-    // 2. Authenticate session, evaluate timeouts, and touch
-    let session = SessionAuthnService::authenticate(&mut tx, &raw_token, &state.config.session)
-        .await
-        .map_err(ProblemDetails::from)?;
+    // 2. Authenticate session, evaluate timeouts, key rollover, periodic rotation, and touch
+    let auth_res =
+        SessionAuthnService::authenticate(&mut tx, &raw_token, &state.config.session, None)
+            .await
+            .map_err(ProblemDetails::from)?;
 
     tx.commit()
         .await
         .map_err(|_| ProblemDetails::internal_server_error(Some("/api/v1/session".into())))?;
 
-    let csrf_token = state.csrf_protector.derive_token(&raw_token);
+    let session = auth_res.session;
+
+    let origin = headers
+        .get(ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http://localhost:8080");
+
+    let csrf_token = state
+        .csrf_protector
+        .derive_token(&session.session_token_hash, origin);
 
     let payload = SessionResponse {
         session_id: session.id.to_string(),
@@ -88,7 +98,17 @@ pub async fn get_session_handler(
         csrf_token: Some(csrf_token),
     };
 
-    Ok((StatusCode::OK, axum::Json(payload)).into_response())
+    let mut resp = (StatusCode::OK, axum::Json(payload)).into_response();
+
+    // If key rollover or periodic rotation rotated the session, issue updated Set-Cookie
+    if let Some(new_raw) = auth_res.rotated_token {
+        let set_cookie = SessionCookieBuilder::build_set_cookie(&state.config.session, &new_raw);
+        if let Ok(cookie_val) = HeaderValue::from_str(&set_cookie) {
+            resp.headers_mut().insert(SET_COOKIE, cookie_val);
+        }
+    }
+
+    Ok(resp)
 }
 
 /// E04: POST /api/v1/session/logout
@@ -113,13 +133,6 @@ pub async fn logout_handler(
         SessionCookieBuilder::extract_token(&headers, &state.config.session.cookie_name)
             .ok_or(AuthnError::Unauthenticated)?;
 
-    // 2. CSRF Exact Origin and X-W014-CSRF token validation for POST
-    let expected_csrf = state.csrf_protector.derive_token(&raw_token);
-    state
-        .csrf_protector
-        .validate_request(&Method::POST, &headers, true, Some(&expected_csrf))
-        .map_err(ProblemDetails::from)?;
-
     let pool = state.pool.as_ref().ok_or_else(|| {
         ProblemDetails::internal_server_error(Some("/api/v1/session/logout".into()))
     })?;
@@ -128,23 +141,35 @@ pub async fn logout_handler(
         ProblemDetails::internal_server_error(Some("/api/v1/session/logout".into()))
     })?;
 
-    // 3. Look up and revoke session by keyed HMAC-SHA256 hash
-    let token_hash = state.config.session.hash_token(&raw_token);
-    if let Some(session) =
-        w014_application::persistence::SessionRepository::get_by_token_hash(&mut tx, &token_hash)
-            .await
-            .map_err(ProblemDetails::from)?
-    {
-        SessionAuthnService::revoke(&mut tx, session.id)
+    // 2. Authenticate session first to obtain active session and current rotation identity
+    let auth_res =
+        SessionAuthnService::authenticate(&mut tx, &raw_token, &state.config.session, None)
             .await
             .map_err(ProblemDetails::from)?;
-    }
+
+    let session = auth_res.session;
+
+    // 3. CSRF Exact Origin and X-W014-CSRF token validation for POST (bound to current rotation identity)
+    state
+        .csrf_protector
+        .validate_request(
+            &Method::POST,
+            &headers,
+            true,
+            Some(&session.session_token_hash),
+        )
+        .map_err(ProblemDetails::from)?;
+
+    // 4. Revoke session
+    SessionAuthnService::revoke(&mut tx, session.id)
+        .await
+        .map_err(ProblemDetails::from)?;
 
     tx.commit().await.map_err(|_| {
         ProblemDetails::internal_server_error(Some("/api/v1/session/logout".into()))
     })?;
 
-    // 4. Build clear cookie header
+    // 5. Build clear cookie header
     let clear_cookie = SessionCookieBuilder::build_clear_cookie(&state.config.session);
 
     let mut resp = (

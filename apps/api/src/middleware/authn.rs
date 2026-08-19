@@ -4,9 +4,9 @@ use axum::extract::{Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::Next;
 use axum::response::Response;
-use w014_application::authn::SessionAuthnService;
+use w014_application::persistence::SessionRepository;
 use w014_authn::middleware::AuthenticatedSession;
-use w014_authn::session::{Session, SessionCookieBuilder};
+use w014_authn::session::{Session, SessionCookieBuilder, SessionStatus};
 
 use crate::AppState;
 use crate::error::ProblemDetails;
@@ -29,9 +29,18 @@ async fn try_authenticate(state: &AppState, headers: &HeaderMap) -> Option<Sessi
     let token = SessionCookieBuilder::extract_token(headers, &state.config.session.cookie_name)?;
     let pool = state.pool.as_ref()?;
     let mut tx = pool.begin().await.ok()?;
-    let session = SessionAuthnService::authenticate(&mut tx, &token, &state.config.session)
-        .await
-        .ok()?;
-    let _ = tx.commit().await;
-    Some(session)
+
+    let active_hash = state.config.session.hash_token(&token);
+    let session = match SessionRepository::get_by_token_hash(&mut tx, &active_hash).await {
+        Ok(Some(s)) => Some(s),
+        _ => match state.config.session.hash_token_previous(&token) {
+            Some(prev_hash) => SessionRepository::get_by_token_hash(&mut tx, &prev_hash)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        },
+    };
+
+    session.filter(|s| s.status == SessionStatus::Active)
 }

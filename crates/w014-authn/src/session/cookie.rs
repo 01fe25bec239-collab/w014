@@ -78,12 +78,10 @@ mod tests {
     #[test]
     fn test_cookie_construction_and_extraction() {
         let config = SessionConfig {
-            absolute_ttl_secs: 86400,
-            idle_ttl_secs: 7200,
             cookie_name: "__Host-w014_session".to_string(),
             cookie_secure: true,
             cookie_path: "/".to_string(),
-            hmac_secret: b"test-secret-cookie-key-32-bytes!".to_vec(),
+            ..SessionConfig::for_testing()
         };
 
         let raw_token = "raw_opaque_token_12345";

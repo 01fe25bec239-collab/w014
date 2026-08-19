@@ -1,6 +1,4 @@
 //! Session persistence application service.
-//!
-//! Note: Full WI-0102 session execution flow is deferred to WI-0102.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
@@ -11,11 +9,27 @@ use w014_domain::ids::{PrincipalId, WorkspaceId};
 use crate::error::ApplicationError;
 use crate::persistence::{SessionRepository, SessionRotationRepository};
 
-/// Service managing session persistence and append-style session rotations.
+/// Service managing session persistence, concurrent session bounding, and append-style rotations.
 pub struct SessionService;
 
 impl SessionService {
-    /// Creates a new server-side session.
+    /// Enforces the maximum concurrent active sessions limit for a principal by revoking the oldest active sessions.
+    pub async fn enforce_concurrent_session_limit(
+        tx: &mut PgConnection,
+        principal_id: PrincipalId,
+        max_concurrent: usize,
+    ) -> Result<(), ApplicationError> {
+        let active_sessions = SessionRepository::list_active_by_principal(tx, principal_id).await?;
+        if active_sessions.len() >= max_concurrent {
+            let to_revoke_count = active_sessions.len() + 1 - max_concurrent;
+            for old_sess in active_sessions.into_iter().take(to_revoke_count) {
+                Self::revoke_session(tx, old_sess.id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates a new server-side session, enforcing the maximum active session limit.
     pub async fn create_session(
         tx: &mut PgConnection,
         principal_id: PrincipalId,
@@ -25,6 +39,9 @@ impl SessionService {
         ip_address: Option<impl AsRef<str>>,
         user_agent: Option<impl AsRef<str>>,
     ) -> Result<Session, ApplicationError> {
+        // Enforce maximum 5 active sessions per principal (6th revokes oldest)
+        Self::enforce_concurrent_session_limit(tx, principal_id, 5).await?;
+
         let session = Session::new(
             principal_id,
             workspace_id,
@@ -82,6 +99,16 @@ impl SessionService {
         session.revoke();
         SessionRepository::update(tx, &session).await?;
         Ok(())
+    }
+
+    /// Revokes all active sessions for a principal (e.g. on privilege or membership change).
+    pub async fn revoke_all_for_principal(
+        tx: &mut PgConnection,
+        principal_id: PrincipalId,
+    ) -> Result<u64, ApplicationError> {
+        SessionRepository::revoke_all_by_principal(tx, principal_id)
+            .await
+            .map_err(ApplicationError::from)
     }
 
     /// Retrieves an active session by token hash, validating expiry.

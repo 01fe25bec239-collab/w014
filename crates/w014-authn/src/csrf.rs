@@ -7,6 +7,11 @@
 //! - Missing, opaque ("null"), malformed, or non-allowlisted Origin fails closed with 403 CSRF_FAILED.
 //! - STRICTLY NO REFERER FALLBACK: Referer MUST NOT rescue a request whose Origin is missing or invalid.
 //! - `X-W014-CSRF` header is required on unsafe cookie-authenticated requests and verified using constant-time comparison.
+//! - CSRF token derivation is cryptographically bound to:
+//!   1. Server-side session CSRF secret key
+//!   2. Current session rotation identity (e.g. session token hash / rotation counter)
+//!   3. Canonical exact request origin
+//! - CSRF tokens are invalid after session rotation and cannot be reused across origins.
 //! - HMAC secret key material remains runtime secret material and is never logged.
 
 use hmac::{Hmac, Mac};
@@ -71,12 +76,45 @@ impl CsrfConfig {
     }
 }
 
-/// Computes a session-bound CSRF token via keyed HMAC-SHA256.
-pub fn derive_csrf_token(session_token: &str, secret_key: &[u8]) -> String {
+/// Normalizes an origin string into canonical `scheme://host[:port]` format without trailing slash.
+pub fn canonicalize_origin(origin: &str) -> Result<String, AuthnError> {
+    let trimmed = origin.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Err(AuthnError::CsrfOriginMismatch(origin.to_string()));
+    }
+
+    let parsed =
+        url::Url::parse(trimmed).map_err(|_| AuthnError::CsrfOriginMismatch(origin.to_string()))?;
+
+    if parsed.cannot_be_a_base() || parsed.host_str().is_none() {
+        return Err(AuthnError::CsrfOriginMismatch(origin.to_string()));
+    }
+
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap();
+    let canonical = match parsed.port() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    };
+
+    Ok(canonical)
+}
+
+/// Computes a session- and origin-bound CSRF token via keyed HMAC-SHA256.
+///
+/// Formula:
+/// HMAC-SHA256(csrf_secret, "w014-csrf-v1:" || rotation_identity || ":" || canonical_origin)
+pub fn derive_csrf_token(
+    secret_key: &[u8],
+    rotation_identity: &str,
+    canonical_origin: &str,
+) -> String {
     let mut mac =
         HmacSha256::new_from_slice(secret_key).expect("HMAC-SHA256 can accept any key length");
-    mac.update(b"w014-csrf-token:");
-    mac.update(session_token.trim().as_bytes());
+    mac.update(b"w014-csrf-v1:");
+    mac.update(rotation_identity.trim().as_bytes());
+    mac.update(b":");
+    mac.update(canonical_origin.trim().trim_end_matches('/').as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
 
@@ -109,9 +147,11 @@ impl CsrfProtector {
         &self.config
     }
 
-    /// Derives the expected session-bound CSRF token for a given session handle.
-    pub fn derive_token(&self, session_token: &str) -> String {
-        derive_csrf_token(session_token, &self.config.hmac_secret)
+    /// Derives the expected CSRF token bound to the given session rotation identity and request origin.
+    pub fn derive_token(&self, rotation_identity: &str, request_origin: &str) -> String {
+        let canonical = canonicalize_origin(request_origin)
+            .unwrap_or_else(|_| request_origin.trim().trim_end_matches('/').to_string());
+        derive_csrf_token(&self.config.hmac_secret, rotation_identity, &canonical)
     }
 
     /// Determines if an HTTP method is safe (read-only / idempotent from CSRF perspective).
@@ -120,12 +160,15 @@ impl CsrfProtector {
     }
 
     /// Validates request Origin and X-W014-CSRF header for unsafe cookie-authenticated requests.
+    ///
+    /// When `rotation_identity` is provided, the `X-W014-CSRF` header is checked against the
+    /// token derived specifically for that session rotation and the canonical request origin.
     pub fn validate_request(
         &self,
         method: &Method,
         headers: &HeaderMap,
         is_cookie_authenticated: bool,
-        expected_token: Option<&str>,
+        rotation_identity: Option<&str>,
     ) -> Result<(), AuthnError> {
         // 1. Safe methods bypass CSRF checks
         if Self::is_safe_method(method) {
@@ -143,24 +186,13 @@ impl CsrfProtector {
             .and_then(|v| v.to_str().ok())
             .ok_or(AuthnError::CsrfMissingOrigin)?;
 
-        let trimmed_origin = origin_hdr.trim();
-        if trimmed_origin.is_empty() || trimmed_origin == "null" {
-            return Err(AuthnError::CsrfOriginMismatch(origin_hdr.to_string()));
-        }
+        let canonical_origin = canonicalize_origin(origin_hdr)?;
 
-        // Validate origin structure (must have valid scheme and host)
-        let parsed = url::Url::parse(trimmed_origin)
-            .map_err(|_| AuthnError::CsrfOriginMismatch(origin_hdr.to_string()))?;
-        if parsed.cannot_be_a_base() || parsed.host_str().is_none() {
-            return Err(AuthnError::CsrfOriginMismatch(origin_hdr.to_string()));
-        }
-
-        let normalized = trimmed_origin.trim_end_matches('/');
         let is_allowed = self
             .config
             .allowed_origins
             .iter()
-            .any(|allowed| allowed.trim_end_matches('/') == normalized);
+            .any(|allowed| canonicalize_origin(allowed).is_ok_and(|c| c == canonical_origin));
 
         if !is_allowed {
             return Err(AuthnError::CsrfOriginMismatch(origin_hdr.to_string()));
@@ -179,8 +211,12 @@ impl CsrfProtector {
             return Err(AuthnError::CsrfMissingHeader);
         }
 
-        if expected_token.is_some_and(|expected| !constant_time_eq(csrf_hdr, expected.trim())) {
-            return Err(AuthnError::CsrfTokenMismatch);
+        if let Some(rot_id) = rotation_identity {
+            let expected_token =
+                derive_csrf_token(&self.config.hmac_secret, rot_id, &canonical_origin);
+            if !constant_time_eq(csrf_hdr, expected_token.trim()) {
+                return Err(AuthnError::CsrfTokenMismatch);
+            }
         }
 
         Ok(())

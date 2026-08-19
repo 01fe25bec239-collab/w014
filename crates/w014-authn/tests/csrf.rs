@@ -1,13 +1,18 @@
-//! Integration tests for CSRF Exact Origin validation and X-W014-CSRF token defense behavior.
+//! Integration tests for CSRF Exact Origin validation, 3-way binding, and X-W014-CSRF token defense.
 //!
-//! Frozen Verification Requirements:
-//! 1. Unsafe request + Origin missing + Referer valid/same-origin => 403 CSRF_FAILED (No Referer fallback)
-//! 2. Unsafe request + Origin malformed + Referer valid => 403 CSRF_FAILED
-//! 3. Unsafe request + Origin wrong/non-allowlisted + Referer valid => 403 CSRF_FAILED
-//! 4. Unsafe request + Origin exact allowed + valid X-W014-CSRF => allowed subject to normal route authorization
-//! 5. Missing X-W014-CSRF => 403 CSRF_FAILED
-//! 6. Wrong X-W014-CSRF => 403 CSRF_FAILED
-//! 7. Safe GET/HEAD/OPTIONS remain side-effect-free and do not require application CSRF header.
+//! Frozen Verification Requirements (Matrix):
+//! 1. CSRF_MISSING_ORIGIN: 403 CSRF_FAILED
+//! 2. CSRF_OPAQUE_ORIGIN: 403 CSRF_FAILED
+//! 3. CSRF_MALFORMED_ORIGIN: 403 CSRF_FAILED
+//! 4. CSRF_WRONG_ORIGIN: 403 CSRF_FAILED
+//! 5. CSRF_VALID_REFERER_MISSING_ORIGIN: 403 CSRF_FAILED (No Referer fallback)
+//! 6. CSRF_VALID_REFERER_WRONG_ORIGIN: 403 CSRF_FAILED (No Referer fallback)
+//! 7. CSRF_MISSING_HEADER: 403 CSRF_FAILED
+//! 8. CSRF_WRONG_TOKEN: 403 CSRF_FAILED
+//! 9. CSRF_TOKEN_FROM_OTHER_ORIGIN: 403 CSRF_FAILED (Origin bound)
+//! 10. CSRF_TOKEN_FROM_PREVIOUS_SESSION_ROTATION: 403 CSRF_FAILED (Rotation identity bound)
+//! 11. CSRF_VALID_CURRENT_ROTATION_AND_ORIGIN: PASS (200 OK)
+//! 12. SAFE_GET_HEAD_OPTIONS: side-effect free; application CSRF header not required
 
 use http::header::{ORIGIN, REFERER};
 use http::{HeaderMap, HeaderValue, Method};
@@ -51,152 +56,202 @@ fn test_csrf_non_cookie_authenticated_bypasses() {
 }
 
 #[test]
-fn test_csrf_unsafe_methods_strict_origin_and_no_referer_fallback() {
+fn test_csrf_negative_and_positive_matrix() {
+    let allowed_origin = "https://platform.w014.internal";
+    let other_allowed_origin = "http://localhost:8080";
     let config = CsrfConfig::new(vec![
-        "https://platform.w014.internal".to_string(),
-        "http://localhost:8080".to_string(),
+        allowed_origin.to_string(),
+        other_allowed_origin.to_string(),
     ]);
     let protector = CsrfProtector::new(config);
-    let raw_session = "sample_session_raw_handle_12345678901234567890";
-    let valid_csrf_token = protector.derive_token(raw_session);
+
+    let current_rotation = "rotation_token_hash_current_v2_12345";
+    let previous_rotation = "rotation_token_hash_previous_v1_98765";
+
+    let valid_csrf_token = protector.derive_token(current_rotation, allowed_origin);
+    let previous_rotation_csrf_token = protector.derive_token(previous_rotation, allowed_origin);
+    let other_origin_csrf_token = protector.derive_token(current_rotation, other_allowed_origin);
 
     let unsafe_methods = [Method::POST, Method::PUT, Method::DELETE, Method::PATCH];
 
     for method in &unsafe_methods {
-        // 1. Requirement 1: Origin missing, but valid same-origin Referer present => MUST FAIL CLOSED (No Referer Fallback)
-        let mut missing_origin_valid_referer = HeaderMap::new();
-        missing_origin_valid_referer.insert(
-            REFERER,
-            HeaderValue::from_static("https://platform.w014.internal/app/dashboard"),
-        );
-        missing_origin_valid_referer.insert(
+        // 1. CSRF_MISSING_ORIGIN
+        let mut missing_origin_req = HeaderMap::new();
+        missing_origin_req.insert(
             CSRF_HEADER_NAME,
             HeaderValue::from_str(&valid_csrf_token).unwrap(),
         );
-
-        let res1 = protector.validate_request(
-            method,
-            &missing_origin_valid_referer,
-            true,
-            Some(&valid_csrf_token),
-        );
+        let res =
+            protector.validate_request(method, &missing_origin_req, true, Some(current_rotation));
         assert_eq!(
-            res1,
+            res,
             Err(AuthnError::CsrfMissingOrigin),
-            "Referer must NOT rescue missing Origin on {method}"
+            "CSRF_MISSING_ORIGIN must fail with 403 on {method}"
         );
 
-        // 2. Requirement 2: Origin malformed, valid Referer present => MUST FAIL CLOSED
-        let mut malformed_origin_valid_referer = HeaderMap::new();
-        malformed_origin_valid_referer
-            .insert(ORIGIN, HeaderValue::from_static("not-a-valid-url-origin"));
-        malformed_origin_valid_referer.insert(
-            REFERER,
-            HeaderValue::from_static("https://platform.w014.internal/app/dashboard"),
-        );
-        malformed_origin_valid_referer.insert(
+        // 2. CSRF_OPAQUE_ORIGIN ("null")
+        let mut opaque_origin_req = HeaderMap::new();
+        opaque_origin_req.insert(ORIGIN, HeaderValue::from_static("null"));
+        opaque_origin_req.insert(
             CSRF_HEADER_NAME,
             HeaderValue::from_str(&valid_csrf_token).unwrap(),
         );
-
-        let res2 = protector.validate_request(
-            method,
-            &malformed_origin_valid_referer,
-            true,
-            Some(&valid_csrf_token),
-        );
+        let res =
+            protector.validate_request(method, &opaque_origin_req, true, Some(current_rotation));
         assert!(
-            matches!(res2, Err(AuthnError::CsrfOriginMismatch(_))),
-            "Malformed Origin must fail closed on {method}"
+            matches!(res, Err(AuthnError::CsrfOriginMismatch(_))),
+            "CSRF_OPAQUE_ORIGIN must fail with 403 on {method}"
         );
 
-        // Opaque Origin ("null") => MUST FAIL CLOSED
-        let mut opaque_origin = HeaderMap::new();
-        opaque_origin.insert(ORIGIN, HeaderValue::from_static("null"));
-        opaque_origin.insert(
+        // 3. CSRF_MALFORMED_ORIGIN
+        let mut malformed_origin_req = HeaderMap::new();
+        malformed_origin_req.insert(ORIGIN, HeaderValue::from_static("not-a-valid-origin-uri"));
+        malformed_origin_req.insert(
             CSRF_HEADER_NAME,
             HeaderValue::from_str(&valid_csrf_token).unwrap(),
         );
-        assert!(matches!(
-            protector.validate_request(method, &opaque_origin, true, Some(&valid_csrf_token)),
-            Err(AuthnError::CsrfOriginMismatch(_))
-        ));
+        let res =
+            protector.validate_request(method, &malformed_origin_req, true, Some(current_rotation));
+        assert!(
+            matches!(res, Err(AuthnError::CsrfOriginMismatch(_))),
+            "CSRF_MALFORMED_ORIGIN must fail with 403 on {method}"
+        );
 
-        // 3. Requirement 3: Origin wrong/non-allowlisted, valid Referer present => MUST FAIL CLOSED
-        let mut wrong_origin_valid_referer = HeaderMap::new();
-        wrong_origin_valid_referer.insert(
+        // 4. CSRF_WRONG_ORIGIN
+        let mut wrong_origin_req = HeaderMap::new();
+        wrong_origin_req.insert(
             ORIGIN,
             HeaderValue::from_static("https://evil-attacker.com"),
         );
-        wrong_origin_valid_referer.insert(
+        wrong_origin_req.insert(
+            CSRF_HEADER_NAME,
+            HeaderValue::from_str(&valid_csrf_token).unwrap(),
+        );
+        let res =
+            protector.validate_request(method, &wrong_origin_req, true, Some(current_rotation));
+        assert!(
+            matches!(res, Err(AuthnError::CsrfOriginMismatch(_))),
+            "CSRF_WRONG_ORIGIN must fail with 403 on {method}"
+        );
+
+        // 5. CSRF_VALID_REFERER_MISSING_ORIGIN (No Referer Fallback)
+        let mut referer_no_origin_req = HeaderMap::new();
+        referer_no_origin_req.insert(
             REFERER,
             HeaderValue::from_static("https://platform.w014.internal/app/dashboard"),
         );
-        wrong_origin_valid_referer.insert(
+        referer_no_origin_req.insert(
             CSRF_HEADER_NAME,
             HeaderValue::from_str(&valid_csrf_token).unwrap(),
         );
-
-        let res3 = protector.validate_request(
+        let res = protector.validate_request(
             method,
-            &wrong_origin_valid_referer,
+            &referer_no_origin_req,
             true,
-            Some(&valid_csrf_token),
+            Some(current_rotation),
         );
-        assert!(
-            matches!(res3, Err(AuthnError::CsrfOriginMismatch(_))),
-            "Wrong Origin must fail closed even with valid Referer on {method}"
+        assert_eq!(
+            res,
+            Err(AuthnError::CsrfMissingOrigin),
+            "CSRF_VALID_REFERER_MISSING_ORIGIN must fail with 403 on {method}"
         );
 
-        // 4. Requirement 4: Origin exact allowed + valid X-W014-CSRF => MUST SUCCEED
-        let mut valid_req = HeaderMap::new();
-        valid_req.insert(
+        // 6. CSRF_VALID_REFERER_WRONG_ORIGIN (No Referer Fallback)
+        let mut referer_wrong_origin_req = HeaderMap::new();
+        referer_wrong_origin_req.insert(
             ORIGIN,
-            HeaderValue::from_static("https://platform.w014.internal"),
+            HeaderValue::from_static("https://evil-attacker.com"),
         );
+        referer_wrong_origin_req.insert(
+            REFERER,
+            HeaderValue::from_static("https://platform.w014.internal/app/dashboard"),
+        );
+        referer_wrong_origin_req.insert(
+            CSRF_HEADER_NAME,
+            HeaderValue::from_str(&valid_csrf_token).unwrap(),
+        );
+        let res = protector.validate_request(
+            method,
+            &referer_wrong_origin_req,
+            true,
+            Some(current_rotation),
+        );
+        assert!(
+            matches!(res, Err(AuthnError::CsrfOriginMismatch(_))),
+            "CSRF_VALID_REFERER_WRONG_ORIGIN must fail with 403 on {method}"
+        );
+
+        // 7. CSRF_MISSING_HEADER
+        let mut missing_header_req = HeaderMap::new();
+        missing_header_req.insert(ORIGIN, HeaderValue::from_static(allowed_origin));
+        let res =
+            protector.validate_request(method, &missing_header_req, true, Some(current_rotation));
+        assert_eq!(
+            res,
+            Err(AuthnError::CsrfMissingHeader),
+            "CSRF_MISSING_HEADER must fail with 403 on {method}"
+        );
+
+        // 8. CSRF_WRONG_TOKEN
+        let mut wrong_token_req = HeaderMap::new();
+        wrong_token_req.insert(ORIGIN, HeaderValue::from_static(allowed_origin));
+        wrong_token_req.insert(
+            CSRF_HEADER_NAME,
+            HeaderValue::from_static("invalid_tampered_token_string"),
+        );
+        let res =
+            protector.validate_request(method, &wrong_token_req, true, Some(current_rotation));
+        assert_eq!(
+            res,
+            Err(AuthnError::CsrfTokenMismatch),
+            "CSRF_WRONG_TOKEN must fail with 403 on {method}"
+        );
+
+        // 9. CSRF_TOKEN_FROM_OTHER_ORIGIN (Token derived for Origin A used on Origin B)
+        let mut cross_origin_token_req = HeaderMap::new();
+        cross_origin_token_req.insert(ORIGIN, HeaderValue::from_static(allowed_origin));
+        cross_origin_token_req.insert(
+            CSRF_HEADER_NAME,
+            HeaderValue::from_str(&other_origin_csrf_token).unwrap(),
+        );
+        let res = protector.validate_request(
+            method,
+            &cross_origin_token_req,
+            true,
+            Some(current_rotation),
+        );
+        assert_eq!(
+            res,
+            Err(AuthnError::CsrfTokenMismatch),
+            "CSRF_TOKEN_FROM_OTHER_ORIGIN must fail with 403 on {method}"
+        );
+
+        // 10. CSRF_TOKEN_FROM_PREVIOUS_SESSION_ROTATION
+        let mut old_rotation_req = HeaderMap::new();
+        old_rotation_req.insert(ORIGIN, HeaderValue::from_static(allowed_origin));
+        old_rotation_req.insert(
+            CSRF_HEADER_NAME,
+            HeaderValue::from_str(&previous_rotation_csrf_token).unwrap(),
+        );
+        let res =
+            protector.validate_request(method, &old_rotation_req, true, Some(current_rotation));
+        assert_eq!(
+            res,
+            Err(AuthnError::CsrfTokenMismatch),
+            "CSRF_TOKEN_FROM_PREVIOUS_SESSION_ROTATION must fail with 403 on {method}"
+        );
+
+        // 11. CSRF_VALID_CURRENT_ROTATION_AND_ORIGIN (Positive Case)
+        let mut valid_req = HeaderMap::new();
+        valid_req.insert(ORIGIN, HeaderValue::from_static(allowed_origin));
         valid_req.insert(
             CSRF_HEADER_NAME,
             HeaderValue::from_str(&valid_csrf_token).unwrap(),
         );
-
-        let res4 = protector.validate_request(method, &valid_req, true, Some(&valid_csrf_token));
+        let res = protector.validate_request(method, &valid_req, true, Some(current_rotation));
         assert!(
-            res4.is_ok(),
-            "Exact allowed Origin + valid X-W014-CSRF must succeed on {method}"
-        );
-
-        // 5. Requirement 5: Missing X-W014-CSRF => MUST FAIL CLOSED
-        let mut missing_csrf_header = HeaderMap::new();
-        missing_csrf_header.insert(
-            ORIGIN,
-            HeaderValue::from_static("https://platform.w014.internal"),
-        );
-
-        let res5 =
-            protector.validate_request(method, &missing_csrf_header, true, Some(&valid_csrf_token));
-        assert_eq!(
-            res5,
-            Err(AuthnError::CsrfMissingHeader),
-            "Missing X-W014-CSRF must fail closed on {method}"
-        );
-
-        // 6. Requirement 6: Wrong X-W014-CSRF => MUST FAIL CLOSED
-        let mut wrong_csrf_header = HeaderMap::new();
-        wrong_csrf_header.insert(
-            ORIGIN,
-            HeaderValue::from_static("https://platform.w014.internal"),
-        );
-        wrong_csrf_header.insert(
-            CSRF_HEADER_NAME,
-            HeaderValue::from_static("tampered-or-wrong-csrf-token"),
-        );
-
-        let res6 =
-            protector.validate_request(method, &wrong_csrf_header, true, Some(&valid_csrf_token));
-        assert_eq!(
-            res6,
-            Err(AuthnError::CsrfTokenMismatch),
-            "Wrong X-W014-CSRF must fail closed on {method}"
+            res.is_ok(),
+            "CSRF_VALID_CURRENT_ROTATION_AND_ORIGIN must PASS on {method}"
         );
     }
 }

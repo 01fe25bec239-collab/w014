@@ -8,10 +8,12 @@
 //! 5. CALLBACK_VALIDATION: E02 callback exchange, token validation, principal resolution, session creation.
 //! 6. OPAQUE_SERVER_SIDE_SESSION: Raw token never stored (keyed HMAC-SHA256 in DB), authoritative lookup on E03.
 //! 7. SESSION_ROTATION: Distinct hashes, rotation audit append, old token invalidation.
-//! 8. SESSION_EXPIRY: Absolute and idle expiration policies, touch updates.
-//! 9. SESSION_REPLAY_REVOCATION: E04 logout revocation, cookie clearing, revoked token rejection.
-//! 10. CSRF_SESSION_BEHAVIOR: Exact Origin validation on unsafe methods, X-W014-CSRF header enforcement, NO referer fallback, fail closed.
-//! 11. E01_E04_CONTRACT_BEHAVIOR: Strict adherence to frozen endpoints, HTTP statuses, and ProblemDetails.
+//! 8. ACTIVE_PREVIOUS_HMAC_KEYS: Session lookup under previous key recognizes session and rotates to active key.
+//! 9. CONCURRENT_SESSION_LIMIT: Maximum 5 active sessions per principal, 6th revokes oldest.
+//! 10. PRIVILEGE_CHANGE_INVALIDATION: Revoking all sessions for a principal invalidates active sessions.
+//! 11. SESSION_EXPIRY: Absolute (7d) and idle (12h) expiration policies, throttled touch updates.
+//! 12. CSRF_SESSION_BEHAVIOR: Exact Origin validation, 3-way bound token derivation, no referer fallback, fail closed.
+//! 13. SESSION_REPLAY_REVOCATION: E04 logout revocation, cookie clearing, revoked token rejection.
 
 use axum::Router;
 use axum::body::Body;
@@ -485,7 +487,199 @@ async fn test_e02_callback_flow_creates_opaque_session_and_cookie() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. SESSION EXPIRY, IDLE TIMEOUT, ROTATION, AND REVOCATION (E03, E04)
+// 4. KEY ROLLOVER (ACTIVE + PREVIOUS HMAC KEYS) & ROTATION TO ACTIVE KEY
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_active_and_previous_hmac_key_rollover_rotates_session() {
+    let test_db = provision_migrated_db().await;
+    let pool = test_db.pool().clone();
+
+    let active_key = b"active-hmac-secret-key-32b-length!!".to_vec();
+    let previous_key = b"previous-hmac-secret-key-32b-len!".to_vec();
+
+    let mut config = ApiConfig::for_testing();
+    config.session.active_hmac_secret = active_key.clone();
+    config.session.previous_hmac_secret = Some(previous_key.clone());
+    config.session.cookie_name = "w014_session".to_string();
+
+    let app = create_app_with_pool(&config, pool.clone());
+
+    // 1. Create a session hashed under the PREVIOUS HMAC key (simulating pre-rollover session)
+    let raw_token = generate_session_token();
+    let prev_token_hash = hash_session_token(&raw_token, &previous_key);
+
+    let mut tx = pool.begin().await.unwrap();
+    let org = w014_domain::organization::Organization::new("Default Org", "default").unwrap();
+    w014_application::persistence::OrganizationRepository::insert(&mut tx, &org)
+        .await
+        .unwrap();
+    let principal = w014_domain::principal::Principal::new(
+        org.id,
+        w014_domain::principal::PrincipalType::User,
+        Some("rollover@example.com"),
+        "Rollover User",
+    )
+    .unwrap();
+    PrincipalRepository::insert(&mut tx, &principal)
+        .await
+        .unwrap();
+
+    let session = Session::new(
+        principal.id,
+        None,
+        &prev_token_hash,
+        Utc::now() + Duration::hours(24),
+        None::<&str>,
+        None::<&str>,
+    )
+    .unwrap();
+    SessionRepository::insert(&mut tx, &session).await.unwrap();
+    tx.commit().await.unwrap();
+
+    // 2. Request /api/v1/session with cookie created under previous key
+    let req = Request::builder()
+        .uri("/api/v1/session")
+        .method("GET")
+        .header(COOKIE, format!("w014_session={raw_token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 3. Response MUST issue a fresh Set-Cookie rotated under the ACTIVE key
+    let set_cookie_hdr = resp
+        .headers()
+        .get(SET_COOKIE)
+        .expect("Must issue updated Set-Cookie when authenticating previous-key session")
+        .to_str()
+        .unwrap();
+
+    let new_raw_token =
+        SessionCookieBuilder::extract_token_from_str(set_cookie_hdr, "w014_session")
+            .expect("New raw token must be in Set-Cookie");
+
+    assert_ne!(raw_token, new_raw_token);
+
+    // 4. In DB, the session's hash is now hashed under the ACTIVE key
+    let mut check_tx = pool.begin().await.unwrap();
+    let updated_session = SessionRepository::get_by_id(&mut check_tx, session.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let active_hash = hash_session_token(&new_raw_token, &active_key);
+    assert_eq!(updated_session.session_token_hash, active_hash);
+
+    // Old token under previous key is now INVALID
+    let old_attempt = SessionRepository::get_by_token_hash(&mut check_tx, &prev_token_hash)
+        .await
+        .unwrap();
+    assert!(old_attempt.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 5. CONCURRENT SESSION BOUNDING (MAX 5 ACTIVE SESSIONS, 6TH REVOKES OLDEST)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_max_concurrent_sessions_limit_revokes_oldest() {
+    let test_db = provision_migrated_db().await;
+    let pool = test_db.pool().clone();
+
+    let config = ApiConfig::for_testing();
+
+    let mut tx = pool.begin().await.unwrap();
+    let org = w014_domain::organization::Organization::new("Default Org", "default").unwrap();
+    w014_application::persistence::OrganizationRepository::insert(&mut tx, &org)
+        .await
+        .unwrap();
+    let principal = w014_domain::principal::Principal::new(
+        org.id,
+        w014_domain::principal::PrincipalType::User,
+        Some("limit@example.com"),
+        "Limit User",
+    )
+    .unwrap();
+    PrincipalRepository::insert(&mut tx, &principal)
+        .await
+        .unwrap();
+
+    // Create 5 active sessions
+    let mut session_ids = Vec::new();
+    for i in 0..5 {
+        let raw = generate_session_token();
+        let hash = config.session.hash_token(&raw);
+        let sess = w014_application::services::SessionService::create_session(
+            &mut tx,
+            principal.id,
+            None,
+            hash,
+            Utc::now() + Duration::hours(10 + i),
+            None::<&str>,
+            None::<&str>,
+        )
+        .await
+        .unwrap();
+        session_ids.push(sess.id);
+    }
+
+    let active_before = SessionRepository::list_active_by_principal(&mut tx, principal.id)
+        .await
+        .unwrap();
+    assert_eq!(active_before.len(), 5);
+
+    // Create 6th session -> Must revoke oldest session (session_ids[0])
+    let raw6 = generate_session_token();
+    let hash6 = config.session.hash_token(&raw6);
+    let sess6 = w014_application::services::SessionService::create_session(
+        &mut tx,
+        principal.id,
+        None,
+        hash6,
+        Utc::now() + Duration::hours(20),
+        None::<&str>,
+        None::<&str>,
+    )
+    .await
+    .unwrap();
+
+    let active_after = SessionRepository::list_active_by_principal(&mut tx, principal.id)
+        .await
+        .unwrap();
+    assert_eq!(active_after.len(), 5);
+
+    // Oldest session is revoked
+    let oldest_sess = SessionRepository::get_by_id(&mut tx, session_ids[0])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(oldest_sess.status, SessionStatus::Revoked);
+
+    // Newest session is active
+    let sixth_sess = SessionRepository::get_by_id(&mut tx, sess6.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sixth_sess.status, SessionStatus::Active);
+
+    // 7. Privilege change revocation: revokes all 5 active sessions
+    let revoked_count = SessionAuthnService::revoke_all_for_principal(&mut tx, principal.id)
+        .await
+        .unwrap();
+    assert_eq!(revoked_count, 5);
+
+    let active_after_priv_change =
+        SessionRepository::list_active_by_principal(&mut tx, principal.id)
+            .await
+            .unwrap();
+    assert_eq!(active_after_priv_change.len(), 0);
+    tx.commit().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 6. SESSION EXPIRY, IDLE TIMEOUT, ROTATION, AND REVOCATION (E03, E04)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -625,19 +819,19 @@ async fn test_session_rotation_invalidation_and_audit() {
     // 3. Old token is rejected
     let mut tx_check1 = pool.begin().await.unwrap();
     let old_auth =
-        SessionAuthnService::authenticate(&mut tx_check1, &old_raw, &config.session).await;
+        SessionAuthnService::authenticate(&mut tx_check1, &old_raw, &config.session, None).await;
     assert!(old_auth.is_err());
 
     // 4. New token authenticates successfully
     let mut tx_check2 = pool.begin().await.unwrap();
     let new_auth =
-        SessionAuthnService::authenticate(&mut tx_check2, &new_raw, &config.session).await;
+        SessionAuthnService::authenticate(&mut tx_check2, &new_raw, &config.session, None).await;
     assert!(new_auth.is_ok());
-    assert_eq!(new_auth.unwrap().id, session.id);
+    assert_eq!(new_auth.unwrap().session.id, session.id);
 }
 
 // ---------------------------------------------------------------------------
-// 5. CSRF PROTECTION & LOGOUT REVOCATION (E04)
+// 7. CSRF PROTECTION & LOGOUT REVOCATION (E04)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -645,8 +839,14 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
     let test_db = provision_migrated_db().await;
     let pool = test_db.pool().clone();
 
+    let allowed_origin = "http://localhost:8080";
+    let other_allowed_origin = "http://localhost:3000";
+
     let mut config = ApiConfig::for_testing();
-    config.csrf = CsrfConfig::new(vec!["http://localhost:8080".to_string()]);
+    config.csrf = CsrfConfig::new(vec![
+        allowed_origin.to_string(),
+        other_allowed_origin.to_string(),
+    ]);
     config.session.cookie_name = "test_session".to_string();
 
     let app = create_app_with_pool(&config, pool.clone());
@@ -682,9 +882,17 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
     SessionRepository::insert(&mut tx, &session).await.unwrap();
     tx.commit().await.unwrap();
 
-    let valid_csrf = derive_csrf_token(&raw_token, &config.csrf.hmac_secret);
+    // 3-way bound CSRF token: HMAC(secret, "w014-csrf-v1:" || token_hash || ":" || canonical_origin)
+    let valid_csrf = derive_csrf_token(&config.csrf.hmac_secret, &token_hash, allowed_origin);
+    let other_origin_csrf =
+        derive_csrf_token(&config.csrf.hmac_secret, &token_hash, other_allowed_origin);
+    let old_rotation_csrf = derive_csrf_token(
+        &config.csrf.hmac_secret,
+        "old_rotation_token_hash_12345",
+        allowed_origin,
+    );
 
-    // 2. CSRF Defect 1 Test A: Origin missing + valid Referer => MUST FAIL CLOSED (No Referer Fallback)
+    // 2. CSRF_MISSING_ORIGIN: Origin missing + valid Referer => MUST FAIL CLOSED (No Referer Fallback)
     let missing_origin_req = Request::builder()
         .uri("/api/v1/session/logout")
         .method("POST")
@@ -701,7 +909,7 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
         "Missing Origin must fail closed even with valid Referer"
     );
 
-    // 3. CSRF Defect 1 Test B: Malformed Origin + valid Referer => MUST FAIL CLOSED
+    // 3. CSRF_MALFORMED_ORIGIN: Malformed Origin + valid Referer => MUST FAIL CLOSED
     let malformed_origin_req = Request::builder()
         .uri("/api/v1/session/logout")
         .method("POST")
@@ -719,7 +927,7 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
         "Malformed Origin must fail closed"
     );
 
-    // 4. CSRF Defect 1 Test C: Wrong / Mismatched Origin + valid Referer => MUST FAIL CLOSED
+    // 4. CSRF_WRONG_ORIGIN: Wrong Origin + valid Referer => MUST FAIL CLOSED
     let attacker_csrf_req = Request::builder()
         .uri("/api/v1/session/logout")
         .method("POST")
@@ -737,12 +945,12 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
         "Wrong Origin must fail closed"
     );
 
-    // 5. CSRF Defect 1 Test D: Missing X-W014-CSRF Header => MUST FAIL CLOSED
+    // 5. CSRF_MISSING_HEADER: Missing X-W014-CSRF Header => MUST FAIL CLOSED
     let missing_header_req = Request::builder()
         .uri("/api/v1/session/logout")
         .method("POST")
         .header(COOKIE, format!("test_session={raw_token}"))
-        .header(ORIGIN, "http://localhost:8080")
+        .header(ORIGIN, allowed_origin)
         .body(Body::empty())
         .unwrap();
 
@@ -753,12 +961,12 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
         "Missing X-W014-CSRF header must fail closed"
     );
 
-    // 6. CSRF Defect 1 Test E: Wrong X-W014-CSRF Header => MUST FAIL CLOSED
+    // 6. CSRF_WRONG_TOKEN: Wrong X-W014-CSRF Header => MUST FAIL CLOSED
     let wrong_header_req = Request::builder()
         .uri("/api/v1/session/logout")
         .method("POST")
         .header(COOKIE, format!("test_session={raw_token}"))
-        .header(ORIGIN, "http://localhost:8080")
+        .header(ORIGIN, allowed_origin)
         .header(CSRF_HEADER_NAME, "wrong-csrf-token-12345")
         .body(Body::empty())
         .unwrap();
@@ -770,12 +978,46 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
         "Wrong X-W014-CSRF header must fail closed"
     );
 
-    // 7. Valid CSRF: Exact Allowed Origin + Valid X-W014-CSRF => MUST SUCCEED (200 OK & clear cookie)
+    // 7. CSRF_TOKEN_FROM_OTHER_ORIGIN: Token derived for Origin A used on Origin B => MUST FAIL CLOSED
+    let cross_origin_req = Request::builder()
+        .uri("/api/v1/session/logout")
+        .method("POST")
+        .header(COOKIE, format!("test_session={raw_token}"))
+        .header(ORIGIN, allowed_origin)
+        .header(CSRF_HEADER_NAME, &other_origin_csrf)
+        .body(Body::empty())
+        .unwrap();
+
+    let cross_origin_resp = app.clone().oneshot(cross_origin_req).await.unwrap();
+    assert_eq!(
+        cross_origin_resp.status(),
+        StatusCode::FORBIDDEN,
+        "CSRF Token from other origin must fail closed"
+    );
+
+    // 8. CSRF_TOKEN_FROM_PREVIOUS_SESSION_ROTATION => MUST FAIL CLOSED
+    let old_rot_req = Request::builder()
+        .uri("/api/v1/session/logout")
+        .method("POST")
+        .header(COOKIE, format!("test_session={raw_token}"))
+        .header(ORIGIN, allowed_origin)
+        .header(CSRF_HEADER_NAME, &old_rotation_csrf)
+        .body(Body::empty())
+        .unwrap();
+
+    let old_rot_resp = app.clone().oneshot(old_rot_req).await.unwrap();
+    assert_eq!(
+        old_rot_resp.status(),
+        StatusCode::FORBIDDEN,
+        "CSRF Token from previous rotation must fail closed"
+    );
+
+    // 9. Valid CSRF: Exact Allowed Origin + Valid X-W014-CSRF => MUST SUCCEED (200 OK & clear cookie)
     let valid_logout_req = Request::builder()
         .uri("/api/v1/session/logout")
         .method("POST")
         .header(COOKIE, format!("test_session={raw_token}"))
-        .header(ORIGIN, "http://localhost:8080")
+        .header(ORIGIN, allowed_origin)
         .header(CSRF_HEADER_NAME, &valid_csrf)
         .body(Body::empty())
         .unwrap();
@@ -797,7 +1039,7 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
     assert!(clear_cookie_hdr.contains("test_session="));
     assert!(clear_cookie_hdr.contains("Max-Age=0"));
 
-    // 8. Verify Session in DB is marked as Revoked
+    // 10. Verify Session in DB is marked as Revoked
     let mut check_tx = pool.begin().await.unwrap();
     let revoked_session = SessionRepository::get_by_id(&mut check_tx, session.id)
         .await
@@ -805,7 +1047,7 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
         .unwrap();
     assert_eq!(revoked_session.status, SessionStatus::Revoked);
 
-    // 9. Replay of revoked session on E03 GET /api/v1/session fails with 401 Unauthorized
+    // 11. Replay of revoked session on E03 GET /api/v1/session fails with 401 Unauthorized
     let replay_req = Request::builder()
         .uri("/api/v1/session")
         .method("GET")

@@ -6,7 +6,8 @@ use w014_authn::error::AuthnError;
 use w014_authn::oidc::{AuthorizationParameters, IdTokenClaims, OidcClient};
 use w014_authn::rotation::SessionRotation;
 use w014_authn::session::{
-    Session, SessionConfig, SessionEvaluator, SessionId, SessionStatus, generate_session_token,
+    AuthenticationResult, Session, SessionConfig, SessionEvaluator, SessionId, SessionStatus,
+    generate_session_token,
 };
 use w014_domain::ids::{OrganizationId, PrincipalId};
 use w014_domain::organization::Organization;
@@ -43,7 +44,7 @@ impl OidcFlowService {
     }
 
     /// Handles OIDC authorization callback, validating state single-use, exchanging tokens,
-    /// resolving principal identity, and establishing a server-side session.
+    /// resolving principal identity, and establishing a server-side session with concurrent bounding.
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_callback(
         tx: &mut PgConnection,
@@ -83,7 +84,7 @@ impl OidcFlowService {
         // 5. Authoritatively resolve identity by composite (issuer, subject)
         let principal_id = Self::resolve_or_create_principal(tx, &claims, default_org_id).await?;
 
-        // 6. Create authoritative server-side session with fresh opaque handle
+        // 6. Create authoritative server-side session with fresh opaque handle (bounded to max 5 active)
         let raw_token = generate_session_token();
         let token_hash = session_config.hash_token(&raw_token);
         let expires_at = now + Duration::seconds(session_config.absolute_ttl_secs);
@@ -163,26 +164,46 @@ impl OidcFlowService {
     }
 }
 
-/// Service managing session authentication, verification, rotation, and revocation.
+/// Service managing session authentication, verification, key rollover rotation, and revocation.
 pub struct SessionAuthnService;
 
 impl SessionAuthnService {
-    /// Authenticates a raw opaque session token against the database, validating status and idle/absolute expiry.
+    /// Authenticates a raw opaque session token against the database.
+    ///
+    /// Lifecycle features:
+    /// - Key rollover: Recognizes sessions created under the previous HMAC key and immediately rotates them to the active key.
+    /// - Periodic rotation: Automatically rotates sessions active for >= 4 hours.
+    /// - Activity touch: Throttles `last_seen_at` updates to at most once every 5 minutes.
+    /// - Expiration: Evaluates idle (12h default) and absolute (7d default) timeouts.
     pub async fn authenticate(
         tx: &mut PgConnection,
         raw_token: &str,
         session_config: &SessionConfig,
-    ) -> Result<Session, ApplicationError> {
-        let token_hash = session_config.hash_token(raw_token);
-
-        let mut session = SessionRepository::get_by_token_hash(tx, &token_hash)
-            .await?
-            .ok_or(AuthnError::SessionNotFound)?;
-
+        ip_address: Option<&str>,
+    ) -> Result<AuthenticationResult, ApplicationError> {
         let now = Utc::now();
         let idle_ttl = Duration::seconds(session_config.idle_ttl_secs);
 
-        // Evaluate active status and timeouts
+        // 1. Try active HMAC key lookup
+        let active_hash = session_config.hash_token(raw_token);
+        let (mut session, is_previous_key) =
+            match SessionRepository::get_by_token_hash(tx, &active_hash).await? {
+                Some(sess) => (sess, false),
+                None => {
+                    let prev_sess = match session_config.hash_token_previous(raw_token) {
+                        Some(prev_hash) => {
+                            SessionRepository::get_by_token_hash(tx, &prev_hash).await?
+                        }
+                        None => None,
+                    };
+                    match prev_sess {
+                        Some(sess) => (sess, true),
+                        None => return Err(ApplicationError::Authn(AuthnError::SessionNotFound)),
+                    }
+                }
+            };
+
+        // 3. Evaluate active status and idle/absolute expiry
         if let Err(err) = SessionEvaluator::evaluate_active(&session, idle_ttl, now) {
             if session.status == SessionStatus::Active
                 && (now >= session.expires_at || now - session.last_seen_at > idle_ttl)
@@ -193,11 +214,37 @@ impl SessionAuthnService {
             return Err(ApplicationError::Authn(err));
         }
 
-        // Touch active session
-        session.touch(now)?;
-        SessionRepository::update(tx, &session).await?;
+        let mut rotated_token = None;
 
-        Ok(session)
+        // 4. If validated under previous key, rotate immediately to active key
+        if is_previous_key {
+            let (rotation, new_raw_token) =
+                Self::rotate(tx, session.id, session_config, ip_address).await?;
+            session.session_token_hash = rotation.new_token_hash;
+            rotated_token = Some(new_raw_token);
+        } else {
+            // 5. Periodic 4-hour rotation: if active use >= 4 hours since creation
+            let periodic_ttl = Duration::seconds(session_config.periodic_rotation_interval_secs);
+            if now - session.created_at >= periodic_ttl {
+                let (rotation, new_raw_token) =
+                    Self::rotate(tx, session.id, session_config, ip_address).await?;
+                session.session_token_hash = rotation.new_token_hash;
+                rotated_token = Some(new_raw_token);
+            } else {
+                // 6. Throttled activity touch (at most once every 5 minutes)
+                let touch_threshold =
+                    Duration::seconds(session_config.activity_touch_interval_secs);
+                if now - session.last_seen_at >= touch_threshold {
+                    session.touch(now)?;
+                    SessionRepository::update(tx, &session).await?;
+                }
+            }
+        }
+
+        Ok(AuthenticationResult {
+            session,
+            rotated_token,
+        })
     }
 
     /// Rotates a session, generating a new raw token and appending an immutable rotation record.
@@ -229,5 +276,13 @@ impl SessionAuthnService {
         session_id: SessionId,
     ) -> Result<(), ApplicationError> {
         SessionService::revoke_session(tx, session_id).await
+    }
+
+    /// Revokes all active sessions for a principal (e.g. on privilege, role, or membership change).
+    pub async fn revoke_all_for_principal(
+        tx: &mut PgConnection,
+        principal_id: PrincipalId,
+    ) -> Result<u64, ApplicationError> {
+        SessionService::revoke_all_for_principal(tx, principal_id).await
     }
 }

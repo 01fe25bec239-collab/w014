@@ -41,18 +41,20 @@ fn test_keyed_hmac_sha256_session_token_hashing_and_uniqueness() {
 
 #[test]
 fn test_session_config_redacts_hmac_secret_in_debug() {
-    let config = SessionConfig::default();
+    let config = SessionConfig::default()
+        .with_previous_hmac_secret(b"previous-secret-retained-8d!".to_vec());
     let debug_repr = format!("{:?}", config);
     assert!(debug_repr.contains("[REDACTED_SESSION_HMAC_SECRET]"));
     assert!(!debug_repr.contains("w014-default-dev-session-secret"));
+    assert!(!debug_repr.contains("previous-secret-retained"));
 }
 
 #[test]
 fn test_session_lifecycle_expiry_and_idle_policies() {
     let p_id = PrincipalId::new();
     let now = Utc::now();
-    let abs_expires = now + Duration::hours(24);
-    let idle_ttl = Duration::hours(2);
+    let abs_expires = now + Duration::days(7); // 7 days absolute
+    let idle_ttl = Duration::hours(12); // 12 hours idle
 
     let mut session = Session::new(
         p_id,
@@ -68,19 +70,19 @@ fn test_session_lifecycle_expiry_and_idle_policies() {
 
     // 1. Valid session within idle and absolute windows
     assert!(
-        SessionEvaluator::evaluate_active(&session, idle_ttl, now + Duration::minutes(30)).is_ok()
+        SessionEvaluator::evaluate_active(&session, idle_ttl, now + Duration::hours(4)).is_ok()
     );
 
     // 2. Touch session advances last_seen_at
-    let touch_time = now + Duration::minutes(45);
+    let touch_time = now + Duration::hours(6);
     session.touch(touch_time).unwrap();
     assert_eq!(session.last_seen_at, touch_time);
 
-    // 3. Idle timeout exceeded past last touch
-    let past_idle = touch_time + Duration::hours(3);
+    // 3. Idle timeout (12h) exceeded past last touch
+    let past_idle = touch_time + Duration::hours(13);
     assert!(SessionEvaluator::evaluate_active(&session, idle_ttl, past_idle).is_err());
 
-    // 4. Absolute expiration exceeded
+    // 4. Absolute expiration exceeded (7d)
     let past_abs = abs_expires + Duration::minutes(1);
     assert!(SessionEvaluator::evaluate_active(&session, idle_ttl, past_abs).is_err());
 
@@ -116,12 +118,16 @@ fn test_session_rotation_semantics() {
 #[test]
 fn test_session_cookie_attributes_and_extraction() {
     let config = SessionConfig {
-        absolute_ttl_secs: 86400,
-        idle_ttl_secs: 7200,
+        absolute_ttl_secs: 7 * 24 * 3600,
+        idle_ttl_secs: 12 * 3600,
         cookie_name: "__Host-w014_session".to_string(),
         cookie_secure: true,
         cookie_path: "/".to_string(),
-        hmac_secret: b"secret-for-cookie-test-key-32b!".to_vec(),
+        active_hmac_secret: b"secret-for-cookie-test-key-32b!".to_vec(),
+        previous_hmac_secret: None,
+        periodic_rotation_interval_secs: 4 * 3600,
+        activity_touch_interval_secs: 300,
+        max_concurrent_sessions: 5,
     };
 
     let raw_token = generate_session_token();
