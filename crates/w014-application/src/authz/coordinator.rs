@@ -28,7 +28,7 @@ pub async fn get_current_workspace_id(
     tx: &mut PgConnection,
 ) -> Result<Option<Uuid>, ApplicationError> {
     let raw: Option<String> =
-        sqlx::query_scalar("SELECT NULLIF(current_setting('app.current_workspace_id', true), '')")
+        sqlx::query_scalar("SELECT NULLIF(current_setting('app.workspace_id', true), '')")
             .fetch_one(tx)
             .await
             .map_err(|e| ApplicationError::Persistence(PersistenceError::Connection(e)))?;
@@ -107,7 +107,7 @@ impl WorkspaceTxOptions {
 /// An active workspace-scoped application transaction.
 ///
 /// Owns the underlying SQLx transaction and binds the authoritative `AuthorizedWorkspaceContext`
-/// to PostgreSQL transaction-local RLS (`app.current_workspace_id`).
+/// to PostgreSQL transaction-local RLS (`app.workspace_id`).
 pub struct WorkspaceTransaction<'a> {
     tx: Transaction<'a, Postgres>,
     awc: &'a AuthorizedWorkspaceContext,
@@ -245,7 +245,7 @@ impl WorkspaceTransactionCoordinator {
     /// 2. Evaluates Rust capability requirements (Primary authz).
     /// 3. Sets optional local database role (if configured).
     /// 4. Sets transaction-local RLS workspace ID (`is_local = true`).
-    /// 5. Queries and verifies `current_setting('app.current_workspace_id', true)` matches `awc.workspace_id()`.
+    /// 5. Queries and verifies `current_setting('app.workspace_id', true)` matches `awc.workspace_id()`.
     pub async fn bind_and_verify_tx(
         tx: &mut PgConnection,
         awc: &AuthorizedWorkspaceContext,

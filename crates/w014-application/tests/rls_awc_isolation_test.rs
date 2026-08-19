@@ -1,7 +1,7 @@
 //! Comprehensive integration tests for WI-0104 RLS + AWC Tenant Isolation.
 //!
 //! Validates:
-//! - AuthorizedWorkspaceContext binding to transaction-local PostgreSQL RLS context (`app.current_workspace_id`).
+//! - AuthorizedWorkspaceContext binding to transaction-local PostgreSQL RLS context (`app.workspace_id`).
 //! - Primary Rust authorization before tenant SQL / transaction initiation.
 //! - Untrusted client workspace selector matching against authoritative AWC.
 //! - Transaction-local context lifecycle (context wiped upon commit and rollback).
