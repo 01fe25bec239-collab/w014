@@ -12,12 +12,11 @@ export interface BreadcrumbsProps {
 }
 
 /**
- * Breadcrumbs provides structural route/hierarchy context.
- * In WI-0006 (W0), it does NOT invent domain or object truth.
+ * Breadcrumbs provides structural route and hierarchy context.
  */
 export function Breadcrumbs({
   items = [
-    { label: "W-014" },
+    { label: "W-014", href: "/" },
     { label: "Presentation Shell", current: true },
   ],
   className = "",
@@ -26,6 +25,7 @@ export function Breadcrumbs({
     <nav
       aria-label="Breadcrumbs"
       className={`breadcrumbs-container ${className}`.trim()}
+      data-testid="breadcrumbs"
     >
       <ol
         style={{
@@ -57,9 +57,18 @@ export function Breadcrumbs({
                 <span
                   className="breadcrumbs-current"
                   aria-current="page"
+                  data-testid="breadcrumb-current"
                 >
                   {item.label}
                 </span>
+              ) : item.href ? (
+                <a
+                  href={item.href}
+                  className="breadcrumb-link"
+                  data-testid={`breadcrumb-link-${index}`}
+                >
+                  {item.label}
+                </a>
               ) : (
                 <span>{item.label}</span>
               )}

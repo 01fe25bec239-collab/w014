@@ -4,7 +4,7 @@ use std::error::Error;
 use tokio::signal;
 use tracing::info;
 use w014_api::config::ApiConfig;
-use w014_api::create_app;
+use w014_api::{create_app, create_app_with_pool};
 use w014_observability::init_tracing;
 
 #[tokio::main]
@@ -25,8 +25,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "Starting W-014 Foundation Platform API Server"
     );
 
-    // 3. Construct the API composition root router
-    let app = create_app(&config);
+    // 3. Construct the API composition root router with optional database pool
+    let app = if let Some(ref db_url) = config.database_url {
+        info!("Connecting to PostgreSQL database pool");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(20)
+            .connect(db_url)
+            .await?;
+        create_app_with_pool(&config, pool)
+    } else {
+        create_app(&config)
+    };
 
     // 4. Bind TCP listener
     let addr = config.server.socket_addr();
