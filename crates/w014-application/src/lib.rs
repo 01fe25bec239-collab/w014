@@ -4,10 +4,12 @@
 //! domain models to PostgreSQL, and consumption of authoritative Persistence contracts
 //! (`AuditAppendContract`, `AuditChainHashContract`, `IdempotencyStore`).
 
+pub mod authn;
 pub mod error;
 pub mod persistence;
 pub mod services;
 
+pub use authn::{OidcFlowService, SessionAuthnService};
 pub use error::ApplicationError;
 pub use persistence::{
     CapabilityGrantRepository, MembershipRepository, OidcIdentityRepository,

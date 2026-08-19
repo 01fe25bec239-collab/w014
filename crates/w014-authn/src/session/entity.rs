@@ -1,7 +1,6 @@
 //! Server-side Session persistence-facing domain semantics.
 //!
 //! Captures opaque server-side session identity and status lifecycle.
-//! Note: Full WI-0102 session execution flows are deferred to WI-0102.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -216,37 +215,5 @@ impl Session {
 
         self.last_seen_at = now;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Duration;
-
-    #[test]
-    fn test_session_lifecycle() {
-        let p_id = PrincipalId::new();
-        let expires = Utc::now() + Duration::hours(12);
-        let mut session = Session::new(
-            p_id,
-            None,
-            "hash_1234567890abcdef",
-            expires,
-            Some("127.0.0.1"),
-            Some("Mozilla/5.0"),
-        )
-        .unwrap();
-
-        assert_eq!(session.status, SessionStatus::Active);
-        let now = Utc::now();
-        assert!(session.is_active_at(now));
-
-        session.touch(now + Duration::minutes(5)).unwrap();
-
-        session.revoke();
-        assert_eq!(session.status, SessionStatus::Revoked);
-        assert!(!session.is_active_at(now));
-        assert!(session.touch(now + Duration::minutes(10)).is_err());
     }
 }

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+w014-domain = { path = "../../crates/w014-domain" }
+w014-authn = { path = "../../crates/w014-authn" }
+w014-application = { path = "../../crates/w014-application" }
+w014-persistence = { path = "../../crates/w014-persistence" }
 w014-observability = { path = "../../crates/w014-observability" }
 axum = { workspace = true }
 http = { workspace = true }
@@ -15,9 +19,15 @@ tokio = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
 utoipa-axum = { workspace = true }
 uuid = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json"] }
+cookie = { version = "0.18", features = ["percent-encode"] }
+url = "2"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
+tempfile = "3"
+jsonwebtoken = "9"

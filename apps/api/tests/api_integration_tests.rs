@@ -335,6 +335,8 @@ async fn test_swagger_ui_surface_is_absent() {
 async fn test_utoipa_axum_openapi_router_composition() {
     use tower::ServiceExt;
     let (router, openapi) = w014_api::openapi::build_openapi_router();
+    let state = w014_api::AppState::new(w014_api::config::ApiConfig::for_testing(), None);
+    let app = router.with_state(state);
 
     // Verify OpenAPI spec contains the operational health endpoint collected via utoipa-axum routes! macro
     assert!(openapi.paths.paths.contains_key("/healthz"));
@@ -348,6 +350,6 @@ async fn test_utoipa_axum_openapi_router_composition() {
         .body(Body::empty())
         .unwrap();
 
-    let response = router.oneshot(request).await.unwrap();
+    let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }

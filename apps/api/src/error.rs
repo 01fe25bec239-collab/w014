@@ -79,6 +79,34 @@ impl ProblemDetails {
         }
     }
 
+    /// Creates a ProblemDetails payload for an Unauthorized (401) error.
+    #[must_use]
+    pub fn unauthorized(detail: impl Into<String>, instance: Option<String>) -> Self {
+        Self {
+            type_uri: "urn:w014:error:unauthorized".to_string(),
+            title: "Unauthorized".to_string(),
+            status: StatusCode::UNAUTHORIZED.as_u16(),
+            detail: Some(detail.into()),
+            instance,
+            code: Some("UNAUTHORIZED".to_string()),
+            correlation_id: None,
+        }
+    }
+
+    /// Creates a ProblemDetails payload for a Forbidden (403) error.
+    #[must_use]
+    pub fn forbidden(detail: impl Into<String>, instance: Option<String>) -> Self {
+        Self {
+            type_uri: "urn:w014:error:forbidden".to_string(),
+            title: "Forbidden".to_string(),
+            status: StatusCode::FORBIDDEN.as_u16(),
+            detail: Some(detail.into()),
+            instance,
+            code: Some("FORBIDDEN".to_string()),
+            correlation_id: None,
+        }
+    }
+
     /// Creates a ProblemDetails payload for an Internal Server Error (500).
     /// Always masks internal details to prevent leaking internal state.
     #[must_use]
@@ -105,6 +133,16 @@ impl ProblemDetails {
 /// Foundation platform error enumeration.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
+    #[error("Unauthorized: {detail}")]
+    Unauthorized {
+        detail: String,
+        instance: Option<String>,
+    },
+    #[error("Forbidden: {detail}")]
+    Forbidden {
+        detail: String,
+        instance: Option<String>,
+    },
     #[error("Not Found: {detail}")]
     NotFound {
         detail: String,
@@ -128,6 +166,12 @@ impl ApiError {
     #[must_use]
     pub fn to_problem_details(&self) -> ProblemDetails {
         match self {
+            Self::Unauthorized { detail, instance } => {
+                ProblemDetails::unauthorized(detail.clone(), instance.clone())
+            }
+            Self::Forbidden { detail, instance } => {
+                ProblemDetails::forbidden(detail.clone(), instance.clone())
+            }
             Self::NotFound { detail, instance } => {
                 ProblemDetails::not_found(detail.clone(), instance.clone())
             }
@@ -175,6 +219,94 @@ impl IntoResponse for ProblemDetails {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         self.to_problem_details().into_response()
+    }
+}
+
+impl From<w014_authn::error::AuthnError> for ProblemDetails {
+    fn from(err: w014_authn::error::AuthnError) -> Self {
+        match err {
+            w014_authn::error::AuthnError::Unauthenticated
+            | w014_authn::error::AuthnError::SessionNotFound
+            | w014_authn::error::AuthnError::SessionExpired(_)
+            | w014_authn::error::AuthnError::SessionRevoked(_) => {
+                ProblemDetails::unauthorized(err.to_string(), None)
+            }
+            w014_authn::error::AuthnError::CsrfOriginMismatch(_)
+            | w014_authn::error::AuthnError::CsrfMissingOrigin => {
+                ProblemDetails::forbidden(err.to_string(), None)
+            }
+            w014_authn::error::AuthnError::StateMismatch
+            | w014_authn::error::AuthnError::TransactionExpired
+            | w014_authn::error::AuthnError::TransactionNotFound
+            | w014_authn::error::AuthnError::NonceMismatch
+            | w014_authn::error::AuthnError::EmptyField(_)
+            | w014_authn::error::AuthnError::InvalidIssuer(_)
+            | w014_authn::error::AuthnError::InvalidSubject(_)
+            | w014_authn::error::AuthnError::InvalidSessionStatus(_)
+            | w014_authn::error::AuthnError::IdenticalRotationHashes
+            | w014_authn::error::AuthnError::InvalidExpiry(_)
+            | w014_authn::error::AuthnError::AlgorithmNotAllowed(_)
+            | w014_authn::error::AuthnError::AlgorithmNoneRejected
+            | w014_authn::error::AuthnError::SymmetricAlgorithmRejected(_)
+            | w014_authn::error::AuthnError::InvalidAudience { .. }
+            | w014_authn::error::AuthnError::InvalidAzp { .. }
+            | w014_authn::error::AuthnError::TokenExpired { .. }
+            | w014_authn::error::AuthnError::TokenNotYetValid { .. }
+            | w014_authn::error::AuthnError::InvalidIssuedAt { .. }
+            | w014_authn::error::AuthnError::KeyNotFound(_)
+            | w014_authn::error::AuthnError::SignatureVerificationFailed(_)
+            | w014_authn::error::AuthnError::InvalidPkce(_)
+            | w014_authn::error::AuthnError::InvalidToken(_)
+            | w014_authn::error::AuthnError::InvalidCookie(_)
+            | w014_authn::error::AuthnError::IdpTokenExchangeError { .. } => {
+                ProblemDetails::bad_request(err.to_string(), None)
+            }
+            w014_authn::error::AuthnError::IdpCommunicationError(_)
+            | w014_authn::error::AuthnError::JwksFetchError(_) => {
+                ProblemDetails::internal_server_error(None)
+            }
+        }
+    }
+}
+
+impl From<w014_application::error::ApplicationError> for ProblemDetails {
+    fn from(err: w014_application::error::ApplicationError) -> Self {
+        match err {
+            w014_application::error::ApplicationError::Authn(authn_err) => authn_err.into(),
+            w014_application::error::ApplicationError::Unauthorized(msg) => {
+                ProblemDetails::unauthorized(msg, None)
+            }
+            w014_application::error::ApplicationError::NotFound(msg) => {
+                ProblemDetails::not_found(msg, None)
+            }
+            w014_application::error::ApplicationError::Domain(dom_err) => {
+                ProblemDetails::bad_request(dom_err.to_string(), None)
+            }
+            w014_application::error::ApplicationError::Authz(authz_err) => {
+                ProblemDetails::forbidden(authz_err.to_string(), None)
+            }
+            w014_application::error::ApplicationError::Conflict(msg) => {
+                ProblemDetails::bad_request(msg, None)
+            }
+            w014_application::error::ApplicationError::IdempotencyMismatch { .. } => {
+                ProblemDetails::bad_request(err.to_string(), None)
+            }
+            w014_application::error::ApplicationError::IdempotencyInProgress => {
+                ProblemDetails::bad_request(err.to_string(), None)
+            }
+            w014_application::error::ApplicationError::Persistence(_) => {
+                ProblemDetails::internal_server_error(None)
+            }
+            w014_application::error::ApplicationError::Internal(_) => {
+                ProblemDetails::internal_server_error(None)
+            }
+        }
+    }
+}
+
+impl From<w014_persistence::error::PersistenceError> for ProblemDetails {
+    fn from(_: w014_persistence::error::PersistenceError) -> Self {
+        ProblemDetails::internal_server_error(None)
     }
 }
 
