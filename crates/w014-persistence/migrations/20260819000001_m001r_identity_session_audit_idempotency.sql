@@ -103,32 +103,31 @@ CREATE TABLE IF NOT EXISTS oidc_identities (
 CREATE INDEX IF NOT EXISTS idx_oidc_identities_principal ON oidc_identities(principal_id);
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     principal_id UUID NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
-    workspace_id UUID REFERENCES workspaces(id) ON DELETE SET NULL,
-    session_token_hash TEXT NOT NULL UNIQUE,
-    status TEXT NOT NULL,
-    ip_address TEXT,
-    user_agent TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMPTZ NOT NULL,
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT chk_sessions_status CHECK (status IN ('active', 'revoked', 'expired')),
-    CONSTRAINT chk_sessions_token_hash_non_empty CHECK (length(trim(session_token_hash)) > 0)
+    handle_hash BYTEA NOT NULL UNIQUE,
+    csrf_secret_hash BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    idle_expires_at TIMESTAMPTZ NOT NULL,
+    absolute_expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ NULL,
+    rotation_counter INTEGER NOT NULL DEFAULT 0,
+    CONSTRAINT chk_sessions_idle_expires CHECK (idle_expires_at > last_seen_at),
+    CONSTRAINT chk_sessions_absolute_expires CHECK (absolute_expires_at > created_at),
+    CONSTRAINT chk_sessions_rotation_counter CHECK (rotation_counter >= 0)
 );
-CREATE INDEX IF NOT EXISTS idx_sessions_principal ON sessions(principal_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(session_token_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_handle_hash ON sessions(handle_hash);
+CREATE INDEX IF NOT EXISTS idx_sessions_principal_revoked ON sessions(principal_id, revoked_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_idle_expires ON sessions(idle_expires_at);
 
 CREATE TABLE IF NOT EXISTS session_rotations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    old_token_hash TEXT NOT NULL,
-    new_token_hash TEXT NOT NULL,
-    rotated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    ip_address TEXT,
-    CONSTRAINT chk_session_rotations_old_hash_non_empty CHECK (length(trim(old_token_hash)) > 0),
-    CONSTRAINT chk_session_rotations_new_hash_non_empty CHECK (length(trim(new_token_hash)) > 0)
+    session_id UUID NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    old_handle_hash BYTEA NOT NULL,
+    new_handle_hash BYTEA NOT NULL,
+    rotated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    ip_address TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_session_rotations_session ON session_rotations(session_id);
 
@@ -293,8 +292,8 @@ CREATE POLICY rls_capability_grants_isolation ON capability_grants
 
 CREATE POLICY rls_sessions_isolation ON sessions
     FOR ALL
-    USING (workspace_id IS NULL OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid)
-    WITH CHECK (workspace_id IS NULL OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid);
+    USING (true)
+    WITH CHECK (true);
 
 CREATE POLICY rls_audit_chain_heads_isolation ON audit_chain_heads
     FOR ALL

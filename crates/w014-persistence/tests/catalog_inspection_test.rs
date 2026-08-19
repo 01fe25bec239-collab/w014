@@ -244,3 +244,268 @@ async fn test_database_catalog_state_and_security_mechanics() {
 
     test_db.close().await.expect("Failed to drop test database");
 }
+
+#[tokio::test]
+async fn test_m001r_session_schema_prompt12_conformance() {
+    let test_db = TestDatabase::new()
+        .await
+        .expect("Failed to provision isolated test database");
+
+    MigrationRunner::new(&MIGRATOR)
+        .run(test_db.pool())
+        .await
+        .expect("Failed to apply M001R migrations");
+
+    // 1. Check sessions columns in information_schema.columns
+    let columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'sessions'
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(test_db.pool())
+    .await
+    .expect("Failed to query sessions columns");
+
+    let col_map: std::collections::HashMap<String, (String, String)> = columns
+        .into_iter()
+        .map(|(name, dt, nullable)| (name, (dt, nullable)))
+        .collect();
+
+    // sessions.session_id: uuid, NOT NULL
+    assert!(
+        col_map.contains_key("session_id"),
+        "session_id column must exist"
+    );
+    assert_eq!(col_map["session_id"].0, "uuid");
+    assert_eq!(col_map["session_id"].1, "NO");
+
+    // sessions.principal_id: uuid, NOT NULL
+    assert!(
+        col_map.contains_key("principal_id"),
+        "principal_id column must exist"
+    );
+    assert_eq!(col_map["principal_id"].0, "uuid");
+    assert_eq!(col_map["principal_id"].1, "NO");
+
+    // sessions.handle_hash: bytea, NOT NULL
+    assert!(
+        col_map.contains_key("handle_hash"),
+        "handle_hash column must exist"
+    );
+    assert_eq!(col_map["handle_hash"].0, "bytea");
+    assert_eq!(col_map["handle_hash"].1, "NO");
+
+    // sessions.csrf_secret_hash: bytea, NOT NULL
+    assert!(
+        col_map.contains_key("csrf_secret_hash"),
+        "csrf_secret_hash column must exist"
+    );
+    assert_eq!(col_map["csrf_secret_hash"].0, "bytea");
+    assert_eq!(col_map["csrf_secret_hash"].1, "NO");
+
+    // sessions.created_at: timestamp with time zone, NOT NULL
+    assert!(
+        col_map.contains_key("created_at"),
+        "created_at column must exist"
+    );
+    assert_eq!(col_map["created_at"].0, "timestamp with time zone");
+    assert_eq!(col_map["created_at"].1, "NO");
+
+    // sessions.last_seen_at: timestamp with time zone, NOT NULL
+    assert!(
+        col_map.contains_key("last_seen_at"),
+        "last_seen_at column must exist"
+    );
+    assert_eq!(col_map["last_seen_at"].0, "timestamp with time zone");
+    assert_eq!(col_map["last_seen_at"].1, "NO");
+
+    // sessions.idle_expires_at: timestamp with time zone, NOT NULL
+    assert!(
+        col_map.contains_key("idle_expires_at"),
+        "idle_expires_at column must exist"
+    );
+    assert_eq!(col_map["idle_expires_at"].0, "timestamp with time zone");
+    assert_eq!(col_map["idle_expires_at"].1, "NO");
+
+    // sessions.absolute_expires_at: timestamp with time zone, NOT NULL
+    assert!(
+        col_map.contains_key("absolute_expires_at"),
+        "absolute_expires_at column must exist"
+    );
+    assert_eq!(col_map["absolute_expires_at"].0, "timestamp with time zone");
+    assert_eq!(col_map["absolute_expires_at"].1, "NO");
+
+    // sessions.revoked_at: timestamp with time zone, NULLABLE
+    assert!(
+        col_map.contains_key("revoked_at"),
+        "revoked_at column must exist"
+    );
+    assert_eq!(col_map["revoked_at"].0, "timestamp with time zone");
+    assert_eq!(col_map["revoked_at"].1, "YES");
+
+    // sessions.rotation_counter: integer, NOT NULL
+    assert!(
+        col_map.contains_key("rotation_counter"),
+        "rotation_counter column must exist"
+    );
+    assert_eq!(col_map["rotation_counter"].0, "integer");
+    assert_eq!(col_map["rotation_counter"].1, "NO");
+
+    // sessions.session_token_hash must NOT exist
+    assert!(
+        !col_map.contains_key("session_token_hash"),
+        "session_token_hash must NOT exist in sessions"
+    );
+
+    // sessions old defective columns must NOT exist
+    assert!(
+        !col_map.contains_key("status"),
+        "status column must NOT exist in Prompt 12 sessions"
+    );
+    assert!(
+        !col_map.contains_key("expires_at"),
+        "expires_at column must NOT exist in Prompt 12 sessions"
+    );
+
+    // 2. Verify UNIQUE(handle_hash)
+    let handle_hash_unique: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indrelid
+            JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+            WHERE c.relname = 'sessions'
+              AND a.attname = 'handle_hash'
+              AND i.indisunique = true
+        )",
+    )
+    .fetch_one(test_db.pool())
+    .await
+    .expect("Failed to check handle_hash unique constraint");
+    assert!(
+        handle_hash_unique,
+        "sessions.handle_hash must have a UNIQUE index"
+    );
+
+    // 3. Verify BTREE(principal_id, revoked_at)
+    let principal_revoked_index_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM pg_indexes
+            WHERE tablename = 'sessions'
+              AND indexdef LIKE '%(principal_id, revoked_at)%'
+        )",
+    )
+    .fetch_one(test_db.pool())
+    .await
+    .expect("Failed to check principal_id, revoked_at index");
+    assert!(
+        principal_revoked_index_exists,
+        "BTREE(principal_id, revoked_at) index must exist on sessions"
+    );
+
+    // 4. Verify BTREE(idle_expires_at)
+    let idle_expires_index_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM pg_indexes
+            WHERE tablename = 'sessions'
+              AND indexdef LIKE '%(idle_expires_at)%'
+        )",
+    )
+    .fetch_one(test_db.pool())
+    .await
+    .expect("Failed to check idle_expires_at index");
+    assert!(
+        idle_expires_index_exists,
+        "BTREE(idle_expires_at) index must exist on sessions"
+    );
+
+    // 5. Verify Check Constraints on sessions
+    let constraints: Vec<String> = sqlx::query_scalar(
+        "SELECT conname
+         FROM pg_constraint
+         WHERE conrelid = 'sessions'::regclass AND contype = 'c'",
+    )
+    .fetch_all(test_db.pool())
+    .await
+    .expect("Failed to query check constraints on sessions");
+
+    assert!(
+        constraints.contains(&"chk_sessions_idle_expires".to_string()),
+        "chk_sessions_idle_expires constraint must exist"
+    );
+    assert!(
+        constraints.contains(&"chk_sessions_absolute_expires".to_string()),
+        "chk_sessions_absolute_expires constraint must exist"
+    );
+    assert!(
+        constraints.contains(&"chk_sessions_rotation_counter".to_string()),
+        "chk_sessions_rotation_counter constraint must exist"
+    );
+
+    // 6. Verify session_rotations columns
+    let rot_columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'session_rotations'
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(test_db.pool())
+    .await
+    .expect("Failed to query session_rotations columns");
+
+    let rot_col_map: std::collections::HashMap<String, (String, String)> = rot_columns
+        .into_iter()
+        .map(|(name, dt, nullable)| (name, (dt, nullable)))
+        .collect();
+
+    // old_handle_hash: bytea, NOT NULL
+    assert!(
+        rot_col_map.contains_key("old_handle_hash"),
+        "old_handle_hash column must exist"
+    );
+    assert_eq!(rot_col_map["old_handle_hash"].0, "bytea");
+    assert_eq!(rot_col_map["old_handle_hash"].1, "NO");
+
+    // new_handle_hash: bytea, NOT NULL
+    assert!(
+        rot_col_map.contains_key("new_handle_hash"),
+        "new_handle_hash column must exist"
+    );
+    assert_eq!(rot_col_map["new_handle_hash"].0, "bytea");
+    assert_eq!(rot_col_map["new_handle_hash"].1, "NO");
+
+    // old_token_hash and new_token_hash must NOT exist
+    assert!(
+        !rot_col_map.contains_key("old_token_hash"),
+        "old_token_hash must NOT exist in session_rotations"
+    );
+    assert!(
+        !rot_col_map.contains_key("new_token_hash"),
+        "new_token_hash must NOT exist in session_rotations"
+    );
+
+    // 7. Verify NO compatibility representation exists
+    let views_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.views WHERE table_schema = 'public'",
+    )
+    .fetch_one(test_db.pool())
+    .await
+    .expect("Failed to query views");
+    assert_eq!(views_count, 0, "No compatibility views should exist");
+
+    let session_triggers_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.triggers WHERE event_object_table = 'sessions'",
+    )
+    .fetch_one(test_db.pool())
+    .await
+    .expect("Failed to query sessions triggers");
+    assert_eq!(
+        session_triggers_count, 0,
+        "No compatibility translation triggers should exist on sessions"
+    );
+
+    test_db.close().await.expect("Failed to drop test database");
+}
