@@ -208,7 +208,7 @@ async fn test_database_catalog_state_and_security_mechanics() {
         "audit_chain_heads must have trg_prevent_audit_chain_heads_deletion trigger"
     );
 
-    // 8. Verify database roles exist
+    // 8. Verify database roles exist and have NO BYPASSRLS privilege
     let roles: Vec<String> = sqlx::query_scalar(
         "SELECT rolname FROM pg_roles WHERE rolname IN ('w014_app', 'w014_readonly')",
     )
@@ -223,6 +223,19 @@ async fn test_database_catalog_state_and_security_mechanics() {
     assert!(
         roles.contains(&"w014_readonly".to_string()),
         "Role 'w014_readonly' must exist"
+    );
+
+    // Verify neither role has BYPASSRLS
+    let bypass_roles: Vec<String> = sqlx::query_scalar(
+        "SELECT rolname FROM pg_roles WHERE rolname IN ('w014_app', 'w014_readonly') AND rolbypassrls = true",
+    )
+    .fetch_all(test_db.pool())
+    .await
+    .expect("Failed to query rolbypassrls");
+
+    assert!(
+        bypass_roles.is_empty(),
+        "Neither w014_app nor w014_readonly should have BYPASSRLS privilege, found: {bypass_roles:?}"
     );
 
     // 9. Verify w014_app has NO UPDATE or DELETE grant on audit_events
@@ -241,6 +254,42 @@ async fn test_database_catalog_state_and_security_mechanics() {
         prohibited_grants.is_empty(),
         "w014_app must NOT have UPDATE or DELETE grants on audit_events, found: {prohibited_grants:?}"
     );
+
+    // 10. Verify composite unique constraints and composite foreign keys
+    let expected_constraints = vec![
+        ("programs", "uq_programs_id_org"),
+        ("principals", "uq_principals_id_org"),
+        ("workspaces", "uq_workspaces_id_org"),
+        ("workspaces", "fk_workspaces_program_org"),
+        ("memberships", "uq_memberships_id_workspace"),
+        ("capability_grants", "uq_capability_grants_id_workspace"),
+        ("audit_events", "uq_audit_events_id_workspace"),
+        ("idempotency_records", "uq_idempotency_id_workspace"),
+    ];
+
+    for (table, constraint) in expected_constraints {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.table_constraints
+                WHERE table_schema = 'public'
+                  AND table_name = $1
+                  AND constraint_name = $2
+            )",
+        )
+        .bind(table)
+        .bind(constraint)
+        .fetch_one(test_db.pool())
+        .await
+        .unwrap_or_else(|e| {
+            panic!("Failed to inspect constraint '{constraint}' on '{table}': {e}")
+        });
+
+        assert!(
+            exists,
+            "Constraint '{constraint}' on table '{table}' must exist in PostgreSQL catalog"
+        );
+    }
 
     test_db.close().await.expect("Failed to drop test database");
 }

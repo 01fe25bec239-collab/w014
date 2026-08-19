@@ -26,7 +26,7 @@ pub use idempotency::{
     IdempotencyCheckResult, IdempotencyHasher, IdempotencyRecord, IdempotencyStatus,
     IdempotencyStore, PostgresIdempotencyStore,
 };
-pub use rls::{clear_session_workspace_id, set_session_workspace_id};
+pub use rls::{clear_session_workspace_id, get_session_workspace_id, set_session_workspace_id};
 pub use runner::{
     AppliedMigrationRecord, MIGRATOR, MigrationReport, MigrationRunner, MigrationStatus,
     PendingMigrationRecord,

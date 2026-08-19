@@ -35,3 +35,25 @@ pub async fn clear_session_workspace_id(tx: &mut PgConnection) -> Result<(), Per
 
     Ok(())
 }
+
+/// Retrieves the current session-level workspace identifier, if set.
+pub async fn get_session_workspace_id(
+    tx: &mut PgConnection,
+) -> Result<Option<Uuid>, PersistenceError> {
+    let row: Option<String> =
+        sqlx::query_scalar("SELECT NULLIF(current_setting('app.current_workspace_id', true), '')")
+            .fetch_optional(tx)
+            .await
+            .map_err(|e| {
+                PersistenceError::Rls(format!("Failed to query RLS workspace context: {e}"))
+            })?;
+
+    match row {
+        Some(s) if !s.is_empty() => {
+            let id = Uuid::parse_str(&s)
+                .map_err(|e| PersistenceError::Rls(format!("Invalid UUID in RLS context: {e}")))?;
+            Ok(Some(id))
+        }
+        _ => Ok(None),
+    }
+}

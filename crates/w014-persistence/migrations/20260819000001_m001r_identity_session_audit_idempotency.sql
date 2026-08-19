@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS principals (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_principals_type CHECK (principal_type IN ('user', 'service', 'system')),
     CONSTRAINT chk_principals_display_name_non_empty CHECK (length(trim(display_name)) > 0),
-    CONSTRAINT uq_principals_org_email UNIQUE (organization_id, email)
+    CONSTRAINT uq_principals_org_email UNIQUE (organization_id, email),
+    CONSTRAINT uq_principals_id_org UNIQUE (id, organization_id)
 );
 CREATE INDEX IF NOT EXISTS idx_principals_org ON principals(organization_id);
 
@@ -40,13 +41,14 @@ CREATE TABLE IF NOT EXISTS programs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_programs_name_non_empty CHECK (length(trim(name)) > 0),
     CONSTRAINT chk_programs_slug_non_empty CHECK (length(trim(slug)) > 0),
-    CONSTRAINT uq_programs_org_slug UNIQUE (organization_id, slug)
+    CONSTRAINT uq_programs_org_slug UNIQUE (organization_id, slug),
+    CONSTRAINT uq_programs_id_org UNIQUE (id, organization_id)
 );
 CREATE INDEX IF NOT EXISTS idx_programs_org ON programs(organization_id);
 
 CREATE TABLE IF NOT EXISTS workspaces (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    program_id UUID NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+    program_id UUID NOT NULL,
     organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     slug TEXT NOT NULL,
@@ -56,10 +58,13 @@ CREATE TABLE IF NOT EXISTS workspaces (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_workspaces_name_non_empty CHECK (length(trim(name)) > 0),
     CONSTRAINT chk_workspaces_slug_non_empty CHECK (length(trim(slug)) > 0),
-    CONSTRAINT uq_workspaces_program_slug UNIQUE (program_id, slug)
+    CONSTRAINT uq_workspaces_program_slug UNIQUE (program_id, slug),
+    CONSTRAINT uq_workspaces_id_org UNIQUE (id, organization_id),
+    CONSTRAINT fk_workspaces_program_org FOREIGN KEY (program_id, organization_id) REFERENCES programs(id, organization_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_workspaces_program ON workspaces(program_id);
 CREATE INDEX IF NOT EXISTS idx_workspaces_org ON workspaces(organization_id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_program_org ON workspaces(program_id, organization_id);
 
 CREATE TABLE IF NOT EXISTS memberships (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -69,7 +74,8 @@ CREATE TABLE IF NOT EXISTS memberships (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_memberships_role CHECK (role IN ('owner', 'admin', 'member', 'viewer', 'auditor')),
-    CONSTRAINT uq_memberships_workspace_principal UNIQUE (workspace_id, principal_id)
+    CONSTRAINT uq_memberships_workspace_principal UNIQUE (workspace_id, principal_id),
+    CONSTRAINT uq_memberships_id_workspace UNIQUE (id, workspace_id)
 );
 CREATE INDEX IF NOT EXISTS idx_memberships_workspace ON memberships(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_memberships_principal ON memberships(principal_id);
@@ -83,7 +89,8 @@ CREATE TABLE IF NOT EXISTS capability_grants (
     granted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     expires_at TIMESTAMPTZ NULL,
     CONSTRAINT chk_capability_grants_capability_non_empty CHECK (length(trim(capability)) > 0),
-    CONSTRAINT uq_capability_grants_workspace_principal_cap UNIQUE (workspace_id, principal_id, capability)
+    CONSTRAINT uq_capability_grants_workspace_principal_cap UNIQUE (workspace_id, principal_id, capability),
+    CONSTRAINT uq_capability_grants_id_workspace UNIQUE (id, workspace_id)
 );
 CREATE INDEX IF NOT EXISTS idx_capability_grants_lookup ON capability_grants(workspace_id, principal_id);
 
@@ -184,7 +191,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
     CONSTRAINT chk_audit_events_res_type_non_empty CHECK (length(trim(resource_type)) > 0),
     CONSTRAINT chk_audit_events_res_id_non_empty CHECK (length(trim(resource_id)) > 0),
     CONSTRAINT uq_audit_events_workspace_seq UNIQUE (workspace_id, sequence_num),
-    CONSTRAINT uq_audit_events_workspace_hash UNIQUE (workspace_id, event_hash)
+    CONSTRAINT uq_audit_events_workspace_hash UNIQUE (workspace_id, event_hash),
+    CONSTRAINT uq_audit_events_id_workspace UNIQUE (id, workspace_id)
 );
 CREATE INDEX IF NOT EXISTS idx_audit_events_workspace_seq ON audit_events(workspace_id, sequence_num ASC);
 CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor_principal_id);
@@ -204,7 +212,8 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
     completed_at TIMESTAMPTZ,
     CONSTRAINT chk_idempotency_status CHECK (status IN ('in_progress', 'completed', 'failed')),
     CONSTRAINT chk_idempotency_key_non_empty CHECK (length(trim(idempotency_key)) > 0),
-    CONSTRAINT chk_idempotency_req_hash_len CHECK (length(request_hash) = 64)
+    CONSTRAINT chk_idempotency_req_hash_len CHECK (length(request_hash) = 64),
+    CONSTRAINT uq_idempotency_id_workspace UNIQUE (id, workspace_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_idempotency_workspace_key 
 ON idempotency_records(COALESCE(workspace_id, '00000000-0000-0000-0000-000000000000'::uuid), idempotency_key);
