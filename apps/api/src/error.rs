@@ -296,6 +296,12 @@ impl From<w014_application::error::ApplicationError> for ProblemDetails {
             w014_application::error::ApplicationError::IdempotencyInProgress => {
                 ProblemDetails::bad_request(err.to_string(), None)
             }
+            w014_application::error::ApplicationError::SecurityViolation(msg) => {
+                ProblemDetails::forbidden(msg, None)
+            }
+            w014_application::error::ApplicationError::RlsContextVerificationFailed { .. } => {
+                ProblemDetails::internal_server_error(None)
+            }
             w014_application::error::ApplicationError::Persistence(_) => {
                 ProblemDetails::internal_server_error(None)
             }

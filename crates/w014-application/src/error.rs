@@ -36,6 +36,21 @@ pub enum ApplicationError {
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
 
+    #[error("Security violation: {0}")]
+    SecurityViolation(String),
+
+    #[error("RLS workspace context verification failed: expected {expected}, actual {actual:?}")]
+    RlsContextVerificationFailed {
+        expected: uuid::Uuid,
+        actual: Option<uuid::Uuid>,
+    },
+
     #[error("Internal application error: {0}")]
     Internal(String),
+}
+
+impl From<sqlx::Error> for ApplicationError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Persistence(PersistenceError::Connection(err))
+    }
 }

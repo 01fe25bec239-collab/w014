@@ -11,7 +11,10 @@ pub mod persistence;
 pub mod services;
 
 pub use authn::{OidcFlowService, SessionAuthnService};
-pub use authz::WorkspaceAuthzResolver;
+pub use authz::{
+    DatabaseRole, WorkspaceAuthzResolver, WorkspaceTransaction, WorkspaceTransactionCoordinator,
+    WorkspaceTxOptions, get_current_workspace_id,
+};
 pub use error::ApplicationError;
 pub use persistence::{
     CapabilityGrantRepository, MembershipRepository, OidcIdentityRepository,

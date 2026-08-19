@@ -26,6 +26,18 @@ impl WorkspaceAuthzResolver {
         principal_id: PrincipalId,
         evaluated_at: DateTime<Utc>,
     ) -> Result<AuthorizedWorkspaceContext, ApplicationError> {
+        // Set transaction-local RLS context for workspace resolution
+        w014_persistence::set_session_workspace_id(tx, workspace_id.into_uuid()).await?;
+
+        // Verify RLS context before executing queries
+        let current_ctx = super::coordinator::get_current_workspace_id(tx).await?;
+        if current_ctx != Some(workspace_id.into_uuid()) {
+            return Err(ApplicationError::RlsContextVerificationFailed {
+                expected: workspace_id.into_uuid(),
+                actual: current_ctx,
+            });
+        }
+
         // 1. Fetch workspace
         let workspace = WorkspaceRepository::get_by_id(tx, workspace_id)
             .await?
