@@ -2356,14 +2356,45 @@ dependencies = [
 [[package]]
 name = "w014-application"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "w014-authn",
+ "w014-authz",
+ "w014-domain",
+ "w014-persistence",
+]
 
 [[package]]
 name = "w014-authn"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+ "w014-domain",
+]
 
 [[package]]
 name = "w014-authz"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "thiserror",
+ "uuid",
+ "w014-domain",
+]
 
 [[package]]
 name = "w014-cli"
@@ -2380,6 +2411,13 @@ version = "0.1.0"
 [[package]]
 name = "w014-domain"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
 
 [[package]]
 name = "w014-jobs"
