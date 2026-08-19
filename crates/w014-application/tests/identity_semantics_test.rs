@@ -735,3 +735,184 @@ async fn test_staged_fks_and_boundary_checks() {
 
     test_db.close().await.expect("drop test db");
 }
+
+#[tokio::test]
+async fn test_workspace_authz_resolver_end_to_end() {
+    use w014_application::authz::WorkspaceAuthzResolver;
+    use w014_authz::authority::SpecialAuthority;
+    use w014_authz::error::AuthzError;
+
+    let test_db = provision_migrated_db().await;
+    let pool = test_db.pool();
+    let audit_store = PostgresAuditStore::new();
+
+    let mut tx = pool.begin().await.unwrap();
+    let org = Organization::new("Authz Org", "authz-org").unwrap();
+    OrganizationRepository::insert(&mut tx, &org).await.unwrap();
+
+    let prog = Program::new(org.id, "Core Platform", "core-platform", None::<&str>).unwrap();
+    ProgramRepository::insert(&mut tx, &prog).await.unwrap();
+
+    let creator = Principal::new(org.id, PrincipalType::User, None::<&str>, "Creator").unwrap();
+    PrincipalRepository::insert(&mut tx, &creator)
+        .await
+        .unwrap();
+
+    let member_user =
+        Principal::new(org.id, PrincipalType::User, None::<&str>, "Member User").unwrap();
+    PrincipalRepository::insert(&mut tx, &member_user)
+        .await
+        .unwrap();
+
+    let non_member_user =
+        Principal::new(org.id, PrincipalType::User, None::<&str>, "Non Member").unwrap();
+    PrincipalRepository::insert(&mut tx, &non_member_user)
+        .await
+        .unwrap();
+
+    let mut inactive_user =
+        Principal::new(org.id, PrincipalType::User, None::<&str>, "Inactive User").unwrap();
+    inactive_user.deactivate();
+    PrincipalRepository::insert(&mut tx, &inactive_user)
+        .await
+        .unwrap();
+
+    // Create workspace with creator as actor
+    let ws = WorkspaceInitializationService::create_workspace_with_audit_head(
+        &mut tx,
+        &audit_store,
+        prog.id,
+        org.id,
+        "Authz WS",
+        "authz-ws",
+        Some(creator.id),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Assign creator as Admin
+    w014_application::services::MembershipService::add_member_with_audit(
+        &mut tx,
+        &audit_store,
+        ws.id,
+        creator.id,
+        MembershipRole::Admin,
+        Some(creator.id),
+        Some("corr-add-creator".to_string()),
+    )
+    .await
+    .unwrap();
+
+    // Add member_user with Member role
+    w014_application::services::MembershipService::add_member_with_audit(
+        &mut tx,
+        &audit_store,
+        ws.id,
+        member_user.id,
+        MembershipRole::Member,
+        Some(creator.id),
+        Some("corr-add-member".to_string()),
+    )
+    .await
+    .unwrap();
+
+    // Add inactive_user with Viewer role
+    w014_application::services::MembershipService::add_member_with_audit(
+        &mut tx,
+        &audit_store,
+        ws.id,
+        inactive_user.id,
+        MembershipRole::Viewer,
+        Some(creator.id),
+        Some("corr-add-inactive".to_string()),
+    )
+    .await
+    .unwrap();
+
+    // Add an explicit active grant for OVERRIDE_BLOCK to member_user
+    let now = Utc::now();
+    CapabilityGrantService::grant_capability_with_audit(
+        &mut tx,
+        &audit_store,
+        ws.id,
+        member_user.id,
+        Capability::OverrideBlock,
+        Some(creator.id),
+        Some(now + Duration::hours(2)),
+        Some(creator.id),
+        Some("corr-grant-override".to_string()),
+    )
+    .await
+    .unwrap();
+
+    // Add an expired grant for RIGHTS_REVIEW to member_user
+    let expired_grant = w014_authz::grant::CapabilityGrant::reconstruct(
+        w014_authz::CapabilityGrantId::new(),
+        ws.id,
+        member_user.id,
+        Capability::RightsReview,
+        Some(creator.id),
+        now - Duration::hours(3),
+        Some(now - Duration::hours(1)),
+    );
+    CapabilityGrantRepository::insert(&mut tx, &expired_grant)
+        .await
+        .unwrap();
+
+    // 1. Resolve context for creator (Admin)
+    let creator_ctx = WorkspaceAuthzResolver::resolve(&mut tx, ws.id, creator.id, now)
+        .await
+        .unwrap();
+    assert_eq!(creator_ctx.membership_role(), MembershipRole::Admin);
+    assert!(creator_ctx.can_admin_workspace());
+    assert!(creator_ctx.can_read_workspace());
+    assert!(creator_ctx.can_write_workspace());
+    assert!(creator_ctx.can_read_audit());
+    // Admin does NOT have special authorities by default
+    assert!(!creator_ctx.can_override_block());
+    assert!(!creator_ctx.can_review_rights());
+    assert!(!creator_ctx.can_activate_rule());
+    assert!(!creator_ctx.can_grant_authority());
+
+    // 2. Resolve context for member_user (Member + OVERRIDE_BLOCK grant)
+    let member_ctx = WorkspaceAuthzResolver::resolve(&mut tx, ws.id, member_user.id, now)
+        .await
+        .unwrap();
+    assert_eq!(member_ctx.membership_role(), MembershipRole::Member);
+    assert!(member_ctx.can_read_workspace());
+    assert!(member_ctx.can_write_workspace());
+    assert!(!member_ctx.can_admin_workspace());
+    assert!(
+        member_ctx.can_override_block(),
+        "Explicit active grant must resolve"
+    );
+    assert!(
+        !member_ctx.can_review_rights(),
+        "Expired grant must NOT resolve"
+    );
+    assert!(member_ctx.has_special_authority(SpecialAuthority::OverrideBlock));
+    assert!(!member_ctx.has_special_authority(SpecialAuthority::RightsReview));
+
+    // 3. Resolve context for non_member_user -> Fails closed with NoMembership
+    let non_member_res =
+        WorkspaceAuthzResolver::resolve(&mut tx, ws.id, non_member_user.id, now).await;
+    assert!(matches!(
+        non_member_res,
+        Err(w014_application::ApplicationError::Authz(
+            AuthzError::NoMembership { .. }
+        ))
+    ));
+
+    // 4. Resolve context for inactive_user -> Fails closed with InactivePrincipal
+    let inactive_res = WorkspaceAuthzResolver::resolve(&mut tx, ws.id, inactive_user.id, now).await;
+    assert!(matches!(
+        inactive_res,
+        Err(w014_application::ApplicationError::Authz(
+            AuthzError::InactivePrincipal(_)
+        ))
+    ));
+
+    tx.commit().await.unwrap();
+    test_db.close().await.expect("drop test db");
+}
