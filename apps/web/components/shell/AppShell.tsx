@@ -11,6 +11,7 @@ export interface AppShellProps {
   breadcrumbs?: ReactNode;
   workspaceSlot?: ReactNode;
   sessionSlot?: ReactNode;
+  enableW1Nav?: boolean;
   className?: string;
 }
 
@@ -19,6 +20,7 @@ export function AppShell({
   breadcrumbs,
   workspaceSlot,
   sessionSlot,
+  enableW1Nav = false,
   className = "",
 }: AppShellProps) {
   const [isNavOpen, setIsNavOpen] = useState(false);
@@ -51,7 +53,11 @@ export function AppShell({
       {/* Main Shell Body */}
       <div className="shell-body">
         {/* Responsive Primary Navigation Sidebar */}
-        <PrimaryNav isOpen={isNavOpen} onClose={handleCloseNav} />
+        <PrimaryNav
+          isOpen={isNavOpen}
+          onClose={handleCloseNav}
+          enableW1Nav={enableW1Nav}
+        />
 
         {/* Primary Content Landmark */}
         <main id="main-content" className="primary-content" tabIndex={-1}>
