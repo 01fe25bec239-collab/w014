@@ -2,12 +2,12 @@
 //!
 //! Captures opaque server-side session identity and status lifecycle.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
-use w014_domain::ids::{PrincipalId, WorkspaceId};
+use w014_domain::ids::PrincipalId;
 
 use crate::error::AuthnError;
 
@@ -66,7 +66,7 @@ impl FromStr for SessionId {
     }
 }
 
-/// Status lifecycle of a server-side session.
+/// Status lifecycle of a server-side session (derived at runtime from timestamps and revocation state).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
@@ -104,116 +104,149 @@ impl FromStr for SessionStatus {
     }
 }
 
-/// Persistence-facing representation of a server-side Session.
+/// Persistence-facing representation of a server-side Session conforming to Prompt-12.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
-    pub id: SessionId,
+    pub session_id: SessionId,
     pub principal_id: PrincipalId,
-    pub workspace_id: Option<WorkspaceId>,
-    pub session_token_hash: String,
-    pub status: SessionStatus,
-    pub ip_address: Option<String>,
-    pub user_agent: Option<String>,
+    pub handle_hash: Vec<u8>,
+    pub csrf_secret_hash: Vec<u8>,
     pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
+    pub idle_expires_at: DateTime<Utc>,
+    pub absolute_expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub rotation_counter: i32,
 }
 
 impl Session {
     /// Creates a new active session domain entity.
     pub fn new(
         principal_id: PrincipalId,
-        workspace_id: Option<WorkspaceId>,
-        session_token_hash: impl AsRef<str>,
-        expires_at: DateTime<Utc>,
-        ip_address: Option<impl AsRef<str>>,
-        user_agent: Option<impl AsRef<str>>,
+        handle_hash: impl Into<Vec<u8>>,
+        csrf_secret_hash: impl Into<Vec<u8>>,
+        idle_expires_at: DateTime<Utc>,
+        absolute_expires_at: DateTime<Utc>,
     ) -> Result<Self, AuthnError> {
-        let trimmed_hash = session_token_hash.as_ref().trim();
-        if trimmed_hash.is_empty() {
-            return Err(AuthnError::EmptyField("session_token_hash"));
+        let handle_bytes = handle_hash.into();
+        if handle_bytes.is_empty() {
+            return Err(AuthnError::EmptyField("handle_hash"));
+        }
+
+        let csrf_bytes = csrf_secret_hash.into();
+        if csrf_bytes.is_empty() {
+            return Err(AuthnError::EmptyField("csrf_secret_hash"));
         }
 
         let now = Utc::now();
-        if expires_at <= now {
+        if idle_expires_at <= now {
             return Err(AuthnError::InvalidExpiry(
-                "expires_at must be strictly in the future".to_string(),
+                "idle_expires_at must be strictly in the future".to_string(),
+            ));
+        }
+
+        if absolute_expires_at <= now {
+            return Err(AuthnError::InvalidExpiry(
+                "absolute_expires_at must be strictly in the future".to_string(),
             ));
         }
 
         Ok(Self {
-            id: SessionId::new(),
+            session_id: SessionId::new(),
             principal_id,
-            workspace_id,
-            session_token_hash: trimmed_hash.to_string(),
-            status: SessionStatus::Active,
-            ip_address: ip_address.map(|s| s.as_ref().trim().to_string()),
-            user_agent: user_agent.map(|s| s.as_ref().trim().to_string()),
+            handle_hash: handle_bytes,
+            csrf_secret_hash: csrf_bytes,
             created_at: now,
-            expires_at,
             last_seen_at: now,
+            idle_expires_at,
+            absolute_expires_at,
+            revoked_at: None,
+            rotation_counter: 0,
         })
     }
 
     /// Reconstructs an existing Session from persistent storage.
     #[allow(clippy::too_many_arguments)]
     pub fn reconstruct(
-        id: SessionId,
+        session_id: SessionId,
         principal_id: PrincipalId,
-        workspace_id: Option<WorkspaceId>,
-        session_token_hash: String,
-        status: SessionStatus,
-        ip_address: Option<String>,
-        user_agent: Option<String>,
+        handle_hash: Vec<u8>,
+        csrf_secret_hash: Vec<u8>,
         created_at: DateTime<Utc>,
-        expires_at: DateTime<Utc>,
         last_seen_at: DateTime<Utc>,
+        idle_expires_at: DateTime<Utc>,
+        absolute_expires_at: DateTime<Utc>,
+        revoked_at: Option<DateTime<Utc>>,
+        rotation_counter: i32,
     ) -> Result<Self, AuthnError> {
-        let trimmed_hash = session_token_hash.trim();
-        if trimmed_hash.is_empty() {
-            return Err(AuthnError::EmptyField("session_token_hash"));
+        if handle_hash.is_empty() {
+            return Err(AuthnError::EmptyField("handle_hash"));
+        }
+        if csrf_secret_hash.is_empty() {
+            return Err(AuthnError::EmptyField("csrf_secret_hash"));
         }
 
         Ok(Self {
-            id,
+            session_id,
             principal_id,
-            workspace_id,
-            session_token_hash: trimmed_hash.to_string(),
-            status,
-            ip_address,
-            user_agent,
+            handle_hash,
+            csrf_secret_hash,
             created_at,
-            expires_at,
             last_seen_at,
+            idle_expires_at,
+            absolute_expires_at,
+            revoked_at,
+            rotation_counter,
         })
     }
 
     /// Evaluates if the session is currently active at `now`.
     pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
-        self.status == SessionStatus::Active && now < self.expires_at
+        self.revoked_at.is_none() && now < self.idle_expires_at && now < self.absolute_expires_at
+    }
+
+    /// Evaluates if the session has been revoked.
+    pub fn is_revoked(&self) -> bool {
+        self.revoked_at.is_some()
     }
 
     /// Evaluates if the session has expired at `now`.
     pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
-        now >= self.expires_at || self.status == SessionStatus::Expired
+        now >= self.idle_expires_at || now >= self.absolute_expires_at
     }
 
-    /// Revokes the session (one-way status transition).
-    pub fn revoke(&mut self) {
-        self.status = SessionStatus::Revoked;
+    /// Derives the current lifecycle status of the session at `now`.
+    pub fn status_at(&self, now: DateTime<Utc>) -> SessionStatus {
+        if self.revoked_at.is_some() {
+            SessionStatus::Revoked
+        } else if self.is_expired_at(now) {
+            SessionStatus::Expired
+        } else {
+            SessionStatus::Active
+        }
     }
 
-    /// Updates `last_seen_at` if the session is active.
-    pub fn touch(&mut self, now: DateTime<Utc>) -> Result<(), AuthnError> {
-        if self.status == SessionStatus::Revoked {
-            return Err(AuthnError::SessionRevoked(self.id.to_string()));
+    /// Revokes the session by setting `revoked_at`.
+    pub fn revoke(&mut self, now: DateTime<Utc>) {
+        self.revoked_at = Some(now);
+    }
+
+    /// Updates `last_seen_at` and extends `idle_expires_at` if the session is active.
+    pub fn touch(&mut self, now: DateTime<Utc>, idle_ttl: Duration) -> Result<(), AuthnError> {
+        if self.revoked_at.is_some() {
+            return Err(AuthnError::SessionRevoked(self.session_id.to_string()));
         }
         if self.is_expired_at(now) {
-            self.status = SessionStatus::Expired;
-            return Err(AuthnError::SessionExpired(self.id.to_string()));
+            return Err(AuthnError::SessionExpired(self.session_id.to_string()));
         }
 
         self.last_seen_at = now;
+        self.idle_expires_at = now + idle_ttl;
         Ok(())
+    }
+
+    /// Returns a hex-encoded representation of handle_hash for rotation identity binding (e.g. CSRF tokens).
+    pub fn rotation_identity(&self) -> String {
+        hex::encode(&self.handle_hash)
     }
 }

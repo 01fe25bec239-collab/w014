@@ -19,12 +19,12 @@ use crate::error::ProblemDetails;
 pub struct SessionResponse {
     pub session_id: String,
     pub principal_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<String>,
     pub status: String,
     pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
+    pub idle_expires_at: DateTime<Utc>,
+    pub absolute_expires_at: DateTime<Utc>,
+    pub rotation_counter: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub csrf_token: Option<String>,
 }
@@ -77,6 +77,7 @@ pub async fn get_session_handler(
         .map_err(|_| ProblemDetails::internal_server_error(Some("/api/v1/session".into())))?;
 
     let session = auth_res.session;
+    let now = Utc::now();
 
     let origin = headers
         .get(ORIGIN)
@@ -85,16 +86,17 @@ pub async fn get_session_handler(
 
     let csrf_token = state
         .csrf_protector
-        .derive_token(&session.session_token_hash, origin);
+        .derive_token(&session.rotation_identity(), origin);
 
     let payload = SessionResponse {
-        session_id: session.id.to_string(),
+        session_id: session.session_id.to_string(),
         principal_id: session.principal_id.to_string(),
-        workspace_id: session.workspace_id.map(|w| w.to_string()),
-        status: session.status.to_string(),
+        status: session.status_at(now).to_string(),
         created_at: session.created_at,
-        expires_at: session.expires_at,
         last_seen_at: session.last_seen_at,
+        idle_expires_at: session.idle_expires_at,
+        absolute_expires_at: session.absolute_expires_at,
+        rotation_counter: session.rotation_counter,
         csrf_token: Some(csrf_token),
     };
 
@@ -156,12 +158,12 @@ pub async fn logout_handler(
             &Method::POST,
             &headers,
             true,
-            Some(&session.session_token_hash),
+            Some(&session.rotation_identity()),
         )
         .map_err(ProblemDetails::from)?;
 
     // 4. Revoke session
-    SessionAuthnService::revoke(&mut tx, session.id)
+    SessionAuthnService::revoke(&mut tx, session.session_id)
         .await
         .map_err(ProblemDetails::from)?;
 

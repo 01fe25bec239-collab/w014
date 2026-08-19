@@ -45,7 +45,8 @@ pub struct CallbackResponse {
     pub session_id: String,
     pub principal_id: String,
     pub status: String,
-    pub expires_at: DateTime<Utc>,
+    pub idle_expires_at: DateTime<Utc>,
+    pub absolute_expires_at: DateTime<Utc>,
 }
 
 /// E01: GET /api/v1/auth/login
@@ -194,10 +195,11 @@ pub async fn callback_handler(
 
     if wants_json {
         let resp_payload = CallbackResponse {
-            session_id: session.id.to_string(),
+            session_id: session.session_id.to_string(),
             principal_id: principal_id.to_string(),
-            status: session.status.to_string(),
-            expires_at: session.expires_at,
+            status: "active".to_string(),
+            idle_expires_at: session.idle_expires_at,
+            absolute_expires_at: session.absolute_expires_at,
         };
 
         let mut resp = (StatusCode::OK, axum::Json(resp_payload)).into_response();

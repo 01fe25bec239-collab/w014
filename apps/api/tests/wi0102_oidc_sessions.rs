@@ -39,9 +39,7 @@ use w014_application::services::OidcPersistenceService;
 use w014_authn::csrf::{CSRF_HEADER_NAME, CsrfConfig, derive_csrf_token};
 use w014_authn::oidc::token::{AudienceClaim, RawIdTokenClaims};
 use w014_authn::oidc::{OidcClient, OidcConfig};
-use w014_authn::session::{
-    Session, SessionCookieBuilder, SessionStatus, generate_session_token, hash_session_token,
-};
+use w014_authn::session::{Session, SessionCookieBuilder, SessionStatus, generate_session_token};
 use w014_persistence::harness::TestDatabase;
 use w014_persistence::runner::{MIGRATOR, MigrationRunner};
 
@@ -424,23 +422,24 @@ async fn test_e02_callback_flow_creates_opaque_session_and_cookie() {
             .expect("Raw session token must be extractable from Set-Cookie");
 
     // 4. Verify Authoritative DB state: Raw token is NEVER stored in database, only keyed HMAC-SHA256
-    let token_hash = config.session.hash_token(&raw_token);
+    let handle_hash = config.session.hash_handle(&raw_token);
     let mut check_tx = pool.begin().await.unwrap();
-    let db_session = SessionRepository::get_by_token_hash(&mut check_tx, &token_hash)
+    let db_session = SessionRepository::get_by_handle_hash(&mut check_tx, &handle_hash)
         .await
         .unwrap()
         .expect("Session must exist in DB by keyed HMAC token hash");
 
-    assert_eq!(db_session.status, SessionStatus::Active);
-    assert_eq!(db_session.session_token_hash, token_hash);
+    assert_eq!(db_session.status_at(Utc::now()), SessionStatus::Active);
+    assert_eq!(db_session.handle_hash, handle_hash);
 
     // Raw token is NEVER equal to the stored hash
-    assert_ne!(db_session.session_token_hash, raw_token);
+    assert_ne!(db_session.rotation_identity(), raw_token);
 
     // Keyed property: A different HMAC key produces a completely different hash that does NOT match DB
-    let other_key_hash = hash_session_token(&raw_token, b"different-secret-key-material-32b");
-    assert_ne!(other_key_hash, token_hash);
-    let wrong_key_lookup = SessionRepository::get_by_token_hash(&mut check_tx, &other_key_hash)
+    let other_key_hash =
+        w014_authn::session::hash_session_handle(&raw_token, b"different-secret-key-material-32b");
+    assert_ne!(other_key_hash, handle_hash);
+    let wrong_key_lookup = SessionRepository::get_by_handle_hash(&mut check_tx, &other_key_hash)
         .await
         .unwrap();
     assert!(
@@ -474,7 +473,7 @@ async fn test_e02_callback_flow_creates_opaque_session_and_cookie() {
 
     let session_body = session_resp.into_body().collect().await.unwrap().to_bytes();
     let session_data: SessionResponse = serde_json::from_slice(&session_body).unwrap();
-    assert_eq!(session_data.session_id, db_session.id.to_string());
+    assert_eq!(session_data.session_id, db_session.session_id.to_string());
     assert_eq!(
         session_data.principal_id,
         db_session.principal_id.to_string()
@@ -507,7 +506,8 @@ async fn test_active_and_previous_hmac_key_rollover_rotates_session() {
 
     // 1. Create a session hashed under the PREVIOUS HMAC key (simulating pre-rollover session)
     let raw_token = generate_session_token();
-    let prev_token_hash = hash_session_token(&raw_token, &previous_key);
+    let prev_handle_hash = w014_authn::session::hash_session_handle(&raw_token, &previous_key);
+    let csrf_hash = w014_authn::session::hash_session_handle("csrf_test", &previous_key);
 
     let mut tx = pool.begin().await.unwrap();
     let org = w014_domain::organization::Organization::new("Default Org", "default").unwrap();
@@ -527,11 +527,10 @@ async fn test_active_and_previous_hmac_key_rollover_rotates_session() {
 
     let session = Session::new(
         principal.id,
-        None,
-        &prev_token_hash,
+        prev_handle_hash.to_vec(),
+        csrf_hash.to_vec(),
+        Utc::now() + Duration::hours(12),
         Utc::now() + Duration::hours(24),
-        None::<&str>,
-        None::<&str>,
     )
     .unwrap();
     SessionRepository::insert(&mut tx, &session).await.unwrap();
@@ -564,16 +563,16 @@ async fn test_active_and_previous_hmac_key_rollover_rotates_session() {
 
     // 4. In DB, the session's hash is now hashed under the ACTIVE key
     let mut check_tx = pool.begin().await.unwrap();
-    let updated_session = SessionRepository::get_by_id(&mut check_tx, session.id)
+    let updated_session = SessionRepository::get_by_id(&mut check_tx, session.session_id)
         .await
         .unwrap()
         .unwrap();
 
-    let active_hash = hash_session_token(&new_raw_token, &active_key);
-    assert_eq!(updated_session.session_token_hash, active_hash);
+    let active_hash = w014_authn::session::hash_session_handle(&new_raw_token, &active_key);
+    assert_eq!(updated_session.handle_hash, active_hash);
 
     // Old token under previous key is now INVALID
-    let old_attempt = SessionRepository::get_by_token_hash(&mut check_tx, &prev_token_hash)
+    let old_attempt = SessionRepository::get_by_handle_hash(&mut check_tx, &prev_handle_hash)
         .await
         .unwrap();
     assert!(old_attempt.is_none());
@@ -608,21 +607,21 @@ async fn test_max_concurrent_sessions_limit_revokes_oldest() {
 
     // Create 5 active sessions
     let mut session_ids = Vec::new();
+    let csrf_hash = config.session.hash_handle("csrf_test");
     for i in 0..5 {
         let raw = generate_session_token();
-        let hash = config.session.hash_token(&raw);
+        let hash = config.session.hash_handle(&raw);
         let sess = w014_application::services::SessionService::create_session(
             &mut tx,
             principal.id,
-            None,
-            hash,
+            hash.to_vec(),
+            csrf_hash.to_vec(),
             Utc::now() + Duration::hours(10 + i),
-            None::<&str>,
-            None::<&str>,
+            Utc::now() + Duration::hours(20 + i),
         )
         .await
         .unwrap();
-        session_ids.push(sess.id);
+        session_ids.push(sess.session_id);
     }
 
     let active_before = SessionRepository::list_active_by_principal(&mut tx, principal.id)
@@ -632,15 +631,14 @@ async fn test_max_concurrent_sessions_limit_revokes_oldest() {
 
     // Create 6th session -> Must revoke oldest session (session_ids[0])
     let raw6 = generate_session_token();
-    let hash6 = config.session.hash_token(&raw6);
+    let hash6 = config.session.hash_handle(&raw6);
     let sess6 = w014_application::services::SessionService::create_session(
         &mut tx,
         principal.id,
-        None,
-        hash6,
+        hash6.to_vec(),
+        csrf_hash.to_vec(),
         Utc::now() + Duration::hours(20),
-        None::<&str>,
-        None::<&str>,
+        Utc::now() + Duration::hours(30),
     )
     .await
     .unwrap();
@@ -655,14 +653,14 @@ async fn test_max_concurrent_sessions_limit_revokes_oldest() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(oldest_sess.status, SessionStatus::Revoked);
+    assert_eq!(oldest_sess.status_at(Utc::now()), SessionStatus::Revoked);
 
     // Newest session is active
-    let sixth_sess = SessionRepository::get_by_id(&mut tx, sess6.id)
+    let sixth_sess = SessionRepository::get_by_id(&mut tx, sess6.session_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(sixth_sess.status, SessionStatus::Active);
+    assert_eq!(sixth_sess.status_at(Utc::now()), SessionStatus::Active);
 
     // 7. Privilege change revocation: revokes all 5 active sessions
     let revoked_count = SessionAuthnService::revoke_all_for_principal(&mut tx, principal.id)
@@ -696,7 +694,8 @@ async fn test_session_lifecycle_expiry_idle_and_touch() {
 
     // 1. Create active session in DB
     let raw_token = generate_session_token();
-    let token_hash = config.session.hash_token(&raw_token);
+    let handle_hash = config.session.hash_handle(&raw_token);
+    let csrf_hash = config.session.hash_handle("csrf_test");
     let now = Utc::now();
 
     let mut tx = pool.begin().await.unwrap();
@@ -717,11 +716,10 @@ async fn test_session_lifecycle_expiry_idle_and_touch() {
 
     let session = Session::new(
         principal.id,
-        None,
-        &token_hash,
+        handle_hash.to_vec(),
+        csrf_hash.to_vec(),
+        now + Duration::seconds(60),
         now + Duration::hours(1),
-        Some("127.0.0.1"),
-        Some("TestRunner"),
     )
     .unwrap();
     SessionRepository::insert(&mut tx, &session).await.unwrap();
@@ -738,13 +736,14 @@ async fn test_session_lifecycle_expiry_idle_and_touch() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // 3. Simulate Idle Expiry: set last_seen_at back by 2 hours
+    // 3. Simulate Idle Expiry: set last_seen_at back by 2 hours and idle_expires_at back by 1 hour
     let mut tx_idle = pool.begin().await.unwrap();
-    let mut idle_session = SessionRepository::get_by_id(&mut tx_idle, session.id)
+    let mut idle_session = SessionRepository::get_by_id(&mut tx_idle, session.session_id)
         .await
         .unwrap()
         .unwrap();
     idle_session.last_seen_at = Utc::now() - Duration::hours(2);
+    idle_session.idle_expires_at = Utc::now() - Duration::hours(1);
     SessionRepository::update(&mut tx_idle, &idle_session)
         .await
         .unwrap();
@@ -791,14 +790,14 @@ async fn test_session_rotation_invalidation_and_audit() {
         .unwrap();
 
     let old_raw = generate_session_token();
-    let old_hash = config.session.hash_token(&old_raw);
+    let old_hash = config.session.hash_handle(&old_raw);
+    let csrf_hash = config.session.hash_handle("csrf_test");
     let session = Session::new(
         principal.id,
-        None,
-        &old_hash,
+        old_hash.to_vec(),
+        csrf_hash.to_vec(),
+        Utc::now() + Duration::hours(12),
         Utc::now() + Duration::hours(24),
-        None::<&str>,
-        None::<&str>,
     )
     .unwrap();
     SessionRepository::insert(&mut tx, &session).await.unwrap();
@@ -806,15 +805,22 @@ async fn test_session_rotation_invalidation_and_audit() {
 
     // 2. Rotate session
     let mut tx_rot = pool.begin().await.unwrap();
-    let (rotation, new_raw) =
-        SessionAuthnService::rotate(&mut tx_rot, session.id, &config.session, Some("10.0.0.50"))
-            .await
-            .unwrap();
+    let (rotation, new_raw) = SessionAuthnService::rotate(
+        &mut tx_rot,
+        session.session_id,
+        &config.session,
+        Some("10.0.0.50"),
+    )
+    .await
+    .unwrap();
     tx_rot.commit().await.unwrap();
 
     assert_ne!(old_raw, new_raw);
-    assert_eq!(rotation.old_token_hash, old_hash);
-    assert_eq!(rotation.new_token_hash, config.session.hash_token(&new_raw));
+    assert_eq!(rotation.old_handle_hash, old_hash.to_vec());
+    assert_eq!(
+        rotation.new_handle_hash,
+        config.session.hash_handle(&new_raw).to_vec()
+    );
 
     // 3. Old token is rejected
     let mut tx_check1 = pool.begin().await.unwrap();
@@ -827,7 +833,7 @@ async fn test_session_rotation_invalidation_and_audit() {
     let new_auth =
         SessionAuthnService::authenticate(&mut tx_check2, &new_raw, &config.session, None).await;
     assert!(new_auth.is_ok());
-    assert_eq!(new_auth.unwrap().session.id, session.id);
+    assert_eq!(new_auth.unwrap().session.session_id, session.session_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -869,23 +875,24 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
         .unwrap();
 
     let raw_token = generate_session_token();
-    let token_hash = config.session.hash_token(&raw_token);
+    let handle_hash = config.session.hash_handle(&raw_token);
+    let csrf_hash = config.session.hash_handle("csrf_test");
     let session = Session::new(
         principal.id,
-        None,
-        &token_hash,
+        handle_hash.to_vec(),
+        csrf_hash.to_vec(),
         Utc::now() + Duration::hours(12),
-        None::<&str>,
-        None::<&str>,
+        Utc::now() + Duration::hours(12),
     )
     .unwrap();
     SessionRepository::insert(&mut tx, &session).await.unwrap();
     tx.commit().await.unwrap();
 
-    // 3-way bound CSRF token: HMAC(secret, "w014-csrf-v1:" || token_hash || ":" || canonical_origin)
-    let valid_csrf = derive_csrf_token(&config.csrf.hmac_secret, &token_hash, allowed_origin);
+    let rot_id = session.rotation_identity();
+    // 3-way bound CSRF token: HMAC(secret, "w014-csrf-v1:" || rot_id || ":" || canonical_origin)
+    let valid_csrf = derive_csrf_token(&config.csrf.hmac_secret, &rot_id, allowed_origin);
     let other_origin_csrf =
-        derive_csrf_token(&config.csrf.hmac_secret, &token_hash, other_allowed_origin);
+        derive_csrf_token(&config.csrf.hmac_secret, &rot_id, other_allowed_origin);
     let old_rotation_csrf = derive_csrf_token(
         &config.csrf.hmac_secret,
         "old_rotation_token_hash_12345",
@@ -1041,11 +1048,14 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
 
     // 10. Verify Session in DB is marked as Revoked
     let mut check_tx = pool.begin().await.unwrap();
-    let revoked_session = SessionRepository::get_by_id(&mut check_tx, session.id)
+    let revoked_session = SessionRepository::get_by_id(&mut check_tx, session.session_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(revoked_session.status, SessionStatus::Revoked);
+    assert_eq!(
+        revoked_session.status_at(Utc::now()),
+        SessionStatus::Revoked
+    );
 
     // 11. Replay of revoked session on E03 GET /api/v1/session fails with 401 Unauthorized
     let replay_req = Request::builder()

@@ -1,12 +1,11 @@
 //! PostgreSQL repository operations for OIDC Identities, Sessions, Session Rotations, and OIDC Transactions.
 
 use sqlx::{PgConnection, Row};
-use uuid::Uuid;
 use w014_authn::identity::{OidcIdentity, OidcIdentityId};
 use w014_authn::rotation::SessionRotation;
-use w014_authn::session::{Session, SessionId, SessionStatus};
+use w014_authn::session::{Session, SessionId};
 use w014_authn::transaction::{OidcTransaction, OidcTransactionId};
-use w014_domain::ids::{PrincipalId, WorkspaceId};
+use w014_domain::ids::PrincipalId;
 use w014_persistence::error::PersistenceError;
 
 /// Repository operations for OIDC Identities.
@@ -79,19 +78,19 @@ pub struct SessionRepository;
 impl SessionRepository {
     pub async fn insert(tx: &mut PgConnection, session: &Session) -> Result<(), PersistenceError> {
         sqlx::query(
-            "INSERT INTO sessions (id, principal_id, workspace_id, session_token_hash, status, ip_address, user_agent, created_at, expires_at, last_seen_at)
+            "INSERT INTO sessions (session_id, principal_id, handle_hash, csrf_secret_hash, created_at, last_seen_at, idle_expires_at, absolute_expires_at, revoked_at, rotation_counter)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
-        .bind(session.id.as_uuid())
+        .bind(session.session_id.as_uuid())
         .bind(session.principal_id.as_uuid())
-        .bind(session.workspace_id.map(|w| w.as_uuid()))
-        .bind(&session.session_token_hash)
-        .bind(session.status.as_str())
-        .bind(&session.ip_address)
-        .bind(&session.user_agent)
+        .bind(&session.handle_hash[..])
+        .bind(&session.csrf_secret_hash[..])
         .bind(session.created_at)
-        .bind(session.expires_at)
         .bind(session.last_seen_at)
+        .bind(session.idle_expires_at)
+        .bind(session.absolute_expires_at)
+        .bind(session.revoked_at)
+        .bind(session.rotation_counter)
         .execute(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
@@ -101,14 +100,14 @@ impl SessionRepository {
 
     pub async fn get_by_id(
         tx: &mut PgConnection,
-        id: SessionId,
+        session_id: SessionId,
     ) -> Result<Option<Session>, PersistenceError> {
         let row_opt = sqlx::query(
-            "SELECT id, principal_id, workspace_id, session_token_hash, status, ip_address, user_agent, created_at, expires_at, last_seen_at
+            "SELECT session_id, principal_id, handle_hash, csrf_secret_hash, created_at, last_seen_at, idle_expires_at, absolute_expires_at, revoked_at, rotation_counter
              FROM sessions
-             WHERE id = $1",
+             WHERE session_id = $1",
         )
-        .bind(id.as_uuid())
+        .bind(session_id.as_uuid())
         .fetch_optional(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
@@ -116,16 +115,16 @@ impl SessionRepository {
         Self::map_row_opt(row_opt)
     }
 
-    pub async fn get_by_token_hash(
+    pub async fn get_by_handle_hash(
         tx: &mut PgConnection,
-        token_hash: &str,
+        handle_hash: &[u8],
     ) -> Result<Option<Session>, PersistenceError> {
         let row_opt = sqlx::query(
-            "SELECT id, principal_id, workspace_id, session_token_hash, status, ip_address, user_agent, created_at, expires_at, last_seen_at
+            "SELECT session_id, principal_id, handle_hash, csrf_secret_hash, created_at, last_seen_at, idle_expires_at, absolute_expires_at, revoked_at, rotation_counter
              FROM sessions
-             WHERE session_token_hash = $1",
+             WHERE handle_hash = $1",
         )
-        .bind(token_hash)
+        .bind(handle_hash)
         .fetch_optional(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
@@ -136,14 +135,17 @@ impl SessionRepository {
     pub async fn update(tx: &mut PgConnection, session: &Session) -> Result<(), PersistenceError> {
         sqlx::query(
             "UPDATE sessions
-             SET status = $2, session_token_hash = $3, last_seen_at = $4, expires_at = $5
-             WHERE id = $1",
+             SET handle_hash = $2, csrf_secret_hash = $3, last_seen_at = $4, idle_expires_at = $5, absolute_expires_at = $6, revoked_at = $7, rotation_counter = $8
+             WHERE session_id = $1",
         )
-        .bind(session.id.as_uuid())
-        .bind(session.status.as_str())
-        .bind(&session.session_token_hash)
+        .bind(session.session_id.as_uuid())
+        .bind(&session.handle_hash[..])
+        .bind(&session.csrf_secret_hash[..])
         .bind(session.last_seen_at)
-        .bind(session.expires_at)
+        .bind(session.idle_expires_at)
+        .bind(session.absolute_expires_at)
+        .bind(session.revoked_at)
+        .bind(session.rotation_counter)
         .execute(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
@@ -157,9 +159,12 @@ impl SessionRepository {
         principal_id: PrincipalId,
     ) -> Result<Vec<Session>, PersistenceError> {
         let rows = sqlx::query(
-            "SELECT id, principal_id, workspace_id, session_token_hash, status, ip_address, user_agent, created_at, expires_at, last_seen_at
+            "SELECT session_id, principal_id, handle_hash, csrf_secret_hash, created_at, last_seen_at, idle_expires_at, absolute_expires_at, revoked_at, rotation_counter
              FROM sessions
-             WHERE principal_id = $1 AND status = 'active'
+             WHERE principal_id = $1
+               AND revoked_at IS NULL
+               AND idle_expires_at > CURRENT_TIMESTAMP
+               AND absolute_expires_at > CURRENT_TIMESTAMP
              ORDER BY created_at ASC",
         )
         .bind(principal_id.as_uuid())
@@ -184,8 +189,9 @@ impl SessionRepository {
     ) -> Result<u64, PersistenceError> {
         let result = sqlx::query(
             "UPDATE sessions
-             SET status = 'revoked'
-             WHERE principal_id = $1 AND status = 'active'",
+             SET revoked_at = CURRENT_TIMESTAMP
+             WHERE principal_id = $1
+               AND revoked_at IS NULL",
         )
         .bind(principal_id.as_uuid())
         .execute(&mut *tx)
@@ -200,27 +206,17 @@ impl SessionRepository {
     ) -> Result<Option<Session>, PersistenceError> {
         match row_opt {
             Some(row) => {
-                let status_str: String = row.get("status");
-                let status: SessionStatus =
-                    status_str
-                        .parse()
-                        .map_err(|e: w014_authn::error::AuthnError| {
-                            PersistenceError::Operation(e.to_string())
-                        })?;
-
-                let ws_uuid: Option<Uuid> = row.get("workspace_id");
-
                 let s = Session::reconstruct(
-                    SessionId::from_uuid(row.get("id")),
+                    SessionId::from_uuid(row.get("session_id")),
                     PrincipalId::from_uuid(row.get("principal_id")),
-                    ws_uuid.map(WorkspaceId::from_uuid),
-                    row.get("session_token_hash"),
-                    status,
-                    row.get("ip_address"),
-                    row.get("user_agent"),
+                    row.get("handle_hash"),
+                    row.get("csrf_secret_hash"),
                     row.get("created_at"),
-                    row.get("expires_at"),
                     row.get("last_seen_at"),
+                    row.get("idle_expires_at"),
+                    row.get("absolute_expires_at"),
+                    row.get("revoked_at"),
+                    row.get("rotation_counter"),
                 )
                 .map_err(|e| PersistenceError::Operation(e.to_string()))?;
 
@@ -240,13 +236,13 @@ impl SessionRotationRepository {
         rotation: &SessionRotation,
     ) -> Result<(), PersistenceError> {
         sqlx::query(
-            "INSERT INTO session_rotations (id, session_id, old_token_hash, new_token_hash, rotated_at, ip_address)
+            "INSERT INTO session_rotations (id, session_id, old_handle_hash, new_handle_hash, rotated_at, ip_address)
              VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(rotation.id.as_uuid())
         .bind(rotation.session_id.as_uuid())
-        .bind(&rotation.old_token_hash)
-        .bind(&rotation.new_token_hash)
+        .bind(&rotation.old_handle_hash[..])
+        .bind(&rotation.new_handle_hash[..])
         .bind(rotation.rotated_at)
         .bind(&rotation.ip_address)
         .execute(&mut *tx)

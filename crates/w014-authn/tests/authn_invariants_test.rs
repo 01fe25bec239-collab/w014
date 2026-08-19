@@ -44,32 +44,38 @@ fn test_oidc_identity_invariants() {
 fn test_session_lifecycle_and_status_invariants() {
     let p_id = PrincipalId::new();
     let now = Utc::now();
-    let expires = now + Duration::hours(8);
+    let idle_expires = now + Duration::hours(12);
+    let abs_expires = now + Duration::days(7);
 
     let mut session = Session::new(
         p_id,
-        None,
-        "session_hash_abcdef0123456789",
-        expires,
-        Some("192.168.1.100"),
-        Some("UserAgent/1.0"),
+        b"session_hash_abcdef0123456789012".to_vec(),
+        b"csrf_secret_hash_abcdef012345678".to_vec(),
+        idle_expires,
+        abs_expires,
     )
     .unwrap();
 
-    assert_eq!(session.status, SessionStatus::Active);
+    assert_eq!(session.status_at(now), SessionStatus::Active);
     assert!(session.is_active_at(now));
     assert!(!session.is_expired_at(now));
 
     // Touch session
     let touch_time = now + Duration::hours(1);
-    session.touch(touch_time).unwrap();
+    let idle_ttl = Duration::hours(12);
+    session.touch(touch_time, idle_ttl).unwrap();
     assert_eq!(session.last_seen_at, touch_time);
+    assert_eq!(session.idle_expires_at, touch_time + idle_ttl);
 
     // Revocation
-    session.revoke();
-    assert_eq!(session.status, SessionStatus::Revoked);
+    session.revoke(touch_time);
+    assert_eq!(session.status_at(touch_time), SessionStatus::Revoked);
     assert!(!session.is_active_at(touch_time));
-    assert!(session.touch(touch_time + Duration::minutes(1)).is_err());
+    assert!(
+        session
+            .touch(touch_time + Duration::minutes(1), idle_ttl)
+            .is_err()
+    );
 }
 
 #[test]
@@ -79,18 +85,24 @@ fn test_session_rotation_invariants() {
     // Valid rotation
     let rot = SessionRotation::new(
         s_id,
-        "old_token_hash_val",
-        "new_token_hash_val",
+        b"old_token_hash_val".to_vec(),
+        b"new_token_hash_val".to_vec(),
         Some("10.0.0.1"),
     )
     .unwrap();
 
     assert_eq!(rot.session_id, s_id);
-    assert_eq!(rot.old_token_hash, "old_token_hash_val");
-    assert_eq!(rot.new_token_hash, "new_token_hash_val");
+    assert_eq!(rot.old_handle_hash, b"old_token_hash_val".to_vec());
+    assert_eq!(rot.new_handle_hash, b"new_token_hash_val".to_vec());
 
     // Identical hash rejected
-    let err = SessionRotation::new(s_id, "same_hash", "same_hash", None::<&str>).unwrap_err();
+    let err = SessionRotation::new(
+        s_id,
+        b"same_hash".to_vec(),
+        b"same_hash".to_vec(),
+        None::<&str>,
+    )
+    .unwrap_err();
     assert_eq!(err, AuthnError::IdenticalRotationHashes);
 }
 

@@ -25,6 +25,11 @@ fn test_keyed_hmac_sha256_session_token_hashing_and_uniqueness() {
     assert_ne!(hash1_k1, hash2_k1);
     assert_eq!(hash1_k1.len(), 64);
 
+    let bin_hash1_k1 = w014_authn::session::hash_session_handle(&raw1, key1);
+    let bin_hash2_k1 = w014_authn::session::hash_session_handle(&raw2, key1);
+    assert_ne!(bin_hash1_k1, bin_hash2_k1);
+    assert_eq!(bin_hash1_k1.len(), 32);
+
     // 1. Same token under different HMAC keys produces DIFFERENT hashes (keyed HMAC property)
     let hash1_k2 = hash_session_token(&raw1, key2);
     assert_ne!(
@@ -53,30 +58,31 @@ fn test_session_config_redacts_hmac_secret_in_debug() {
 fn test_session_lifecycle_expiry_and_idle_policies() {
     let p_id = PrincipalId::new();
     let now = Utc::now();
-    let abs_expires = now + Duration::days(7); // 7 days absolute
     let idle_ttl = Duration::hours(12); // 12 hours idle
+    let idle_expires = now + idle_ttl;
+    let abs_expires = now + Duration::days(7); // 7 days absolute
 
     let mut session = Session::new(
         p_id,
-        None,
-        "session_hash_1",
+        b"session_hash_1_abcdef0123456789".to_vec(),
+        b"csrf_secret_hash_abcdef01234567".to_vec(),
+        idle_expires,
         abs_expires,
-        Some("192.168.1.50"),
-        Some("TestAgent/1.0"),
     )
     .unwrap();
 
-    assert_eq!(session.status, SessionStatus::Active);
+    assert_eq!(session.status_at(now), SessionStatus::Active);
 
     // 1. Valid session within idle and absolute windows
     assert!(
         SessionEvaluator::evaluate_active(&session, idle_ttl, now + Duration::hours(4)).is_ok()
     );
 
-    // 2. Touch session advances last_seen_at
+    // 2. Touch session advances last_seen_at and idle_expires_at
     let touch_time = now + Duration::hours(6);
-    session.touch(touch_time).unwrap();
+    session.touch(touch_time, idle_ttl).unwrap();
     assert_eq!(session.last_seen_at, touch_time);
+    assert_eq!(session.idle_expires_at, touch_time + idle_ttl);
 
     // 3. Idle timeout (12h) exceeded past last touch
     let past_idle = touch_time + Duration::hours(13);
@@ -87,10 +93,14 @@ fn test_session_lifecycle_expiry_and_idle_policies() {
     assert!(SessionEvaluator::evaluate_active(&session, idle_ttl, past_abs).is_err());
 
     // 5. Explicit revocation
-    session.revoke();
-    assert_eq!(session.status, SessionStatus::Revoked);
+    session.revoke(touch_time);
+    assert_eq!(session.status_at(touch_time), SessionStatus::Revoked);
     assert!(SessionEvaluator::evaluate_active(&session, idle_ttl, touch_time).is_err());
-    assert!(session.touch(touch_time + Duration::minutes(5)).is_err());
+    assert!(
+        session
+            .touch(touch_time + Duration::minutes(5), idle_ttl)
+            .is_err()
+    );
 }
 
 #[test]
@@ -99,19 +109,21 @@ fn test_session_rotation_semantics() {
     let key = b"w014-rotation-key-12345678901234";
 
     let old_raw = generate_session_token();
-    let old_hash = hash_session_token(&old_raw, key);
+    let old_hash = w014_authn::session::hash_session_handle(&old_raw, key);
 
     let new_raw = generate_session_token();
-    let new_hash = hash_session_token(&new_raw, key);
+    let new_hash = w014_authn::session::hash_session_handle(&new_raw, key);
 
     // 1. Distinct rotation succeeds
-    let rotation = SessionRotation::new(s_id, &old_hash, &new_hash, Some("10.0.0.1")).unwrap();
+    let rotation =
+        SessionRotation::new(s_id, old_hash.to_vec(), new_hash.to_vec(), Some("10.0.0.1")).unwrap();
     assert_eq!(rotation.session_id, s_id);
-    assert_eq!(rotation.old_token_hash, old_hash);
-    assert_eq!(rotation.new_token_hash, new_hash);
+    assert_eq!(rotation.old_handle_hash, old_hash.to_vec());
+    assert_eq!(rotation.new_handle_hash, new_hash.to_vec());
 
     // 2. Identical rotation hash is rejected
-    let same_err = SessionRotation::new(s_id, &old_hash, &old_hash, None::<&str>).unwrap_err();
+    let same_err =
+        SessionRotation::new(s_id, old_hash.to_vec(), old_hash.to_vec(), None::<&str>).unwrap_err();
     assert_eq!(same_err, AuthnError::IdenticalRotationHashes);
 }
 

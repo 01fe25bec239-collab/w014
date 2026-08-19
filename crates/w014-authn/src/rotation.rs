@@ -71,8 +71,8 @@ impl FromStr for SessionRotationId {
 pub struct SessionRotation {
     pub id: SessionRotationId,
     pub session_id: SessionId,
-    pub old_token_hash: String,
-    pub new_token_hash: String,
+    pub old_handle_hash: Vec<u8>,
+    pub new_handle_hash: Vec<u8>,
     pub rotated_at: DateTime<Utc>,
     pub ip_address: Option<String>,
 }
@@ -81,29 +81,29 @@ impl SessionRotation {
     /// Creates a new SessionRotation record validating hash distinctness.
     pub fn new(
         session_id: SessionId,
-        old_token_hash: impl AsRef<str>,
-        new_token_hash: impl AsRef<str>,
+        old_handle_hash: impl Into<Vec<u8>>,
+        new_handle_hash: impl Into<Vec<u8>>,
         ip_address: Option<impl AsRef<str>>,
     ) -> Result<Self, AuthnError> {
-        let old_trimmed = old_token_hash.as_ref().trim();
-        if old_trimmed.is_empty() {
-            return Err(AuthnError::EmptyField("old_token_hash"));
+        let old_bytes = old_handle_hash.into();
+        if old_bytes.is_empty() {
+            return Err(AuthnError::EmptyField("old_handle_hash"));
         }
 
-        let new_trimmed = new_token_hash.as_ref().trim();
-        if new_trimmed.is_empty() {
-            return Err(AuthnError::EmptyField("new_token_hash"));
+        let new_bytes = new_handle_hash.into();
+        if new_bytes.is_empty() {
+            return Err(AuthnError::EmptyField("new_handle_hash"));
         }
 
-        if old_trimmed == new_trimmed {
+        if old_bytes == new_bytes {
             return Err(AuthnError::IdenticalRotationHashes);
         }
 
         Ok(Self {
             id: SessionRotationId::new(),
             session_id,
-            old_token_hash: old_trimmed.to_string(),
-            new_token_hash: new_trimmed.to_string(),
+            old_handle_hash: old_bytes,
+            new_handle_hash: new_bytes,
             rotated_at: Utc::now(),
             ip_address: ip_address.map(|s| s.as_ref().trim().to_string()),
         })
@@ -113,30 +113,28 @@ impl SessionRotation {
     pub fn reconstruct(
         id: SessionRotationId,
         session_id: SessionId,
-        old_token_hash: String,
-        new_token_hash: String,
+        old_handle_hash: Vec<u8>,
+        new_handle_hash: Vec<u8>,
         rotated_at: DateTime<Utc>,
         ip_address: Option<String>,
     ) -> Result<Self, AuthnError> {
-        let old_trimmed = old_token_hash.trim();
-        if old_trimmed.is_empty() {
-            return Err(AuthnError::EmptyField("old_token_hash"));
+        if old_handle_hash.is_empty() {
+            return Err(AuthnError::EmptyField("old_handle_hash"));
         }
 
-        let new_trimmed = new_token_hash.trim();
-        if new_trimmed.is_empty() {
-            return Err(AuthnError::EmptyField("new_token_hash"));
+        if new_handle_hash.is_empty() {
+            return Err(AuthnError::EmptyField("new_handle_hash"));
         }
 
-        if old_trimmed == new_trimmed {
+        if old_handle_hash == new_handle_hash {
             return Err(AuthnError::IdenticalRotationHashes);
         }
 
         Ok(Self {
             id,
             session_id,
-            old_token_hash: old_trimmed.to_string(),
-            new_token_hash: new_trimmed.to_string(),
+            old_handle_hash,
+            new_handle_hash,
             rotated_at,
             ip_address,
         })
@@ -150,12 +148,24 @@ mod tests {
     #[test]
     fn test_rotation_creation() {
         let s_id = SessionId::new();
-        let rot = SessionRotation::new(s_id, "old_hash", "new_hash", Some("127.0.0.1")).unwrap();
+        let rot = SessionRotation::new(
+            s_id,
+            b"old_hash".to_vec(),
+            b"new_hash".to_vec(),
+            Some("127.0.0.1"),
+        )
+        .unwrap();
         assert_eq!(rot.session_id, s_id);
-        assert_eq!(rot.old_token_hash, "old_hash");
-        assert_eq!(rot.new_token_hash, "new_hash");
+        assert_eq!(rot.old_handle_hash, b"old_hash".to_vec());
+        assert_eq!(rot.new_handle_hash, b"new_hash".to_vec());
 
-        let err = SessionRotation::new(s_id, "same_hash", "same_hash", None::<&str>).unwrap_err();
+        let err = SessionRotation::new(
+            s_id,
+            b"same_hash".to_vec(),
+            b"same_hash".to_vec(),
+            None::<&str>,
+        )
+        .unwrap_err();
         assert_eq!(err, AuthnError::IdenticalRotationHashes);
     }
 }

@@ -30,6 +30,6 @@ pub use oidc::{
 pub use rotation::{SessionRotation, SessionRotationId};
 pub use session::{
     AuthenticationResult, Session, SessionConfig, SessionCookieBuilder, SessionEvaluator,
-    SessionId, SessionStatus, generate_session_token, hash_session_token,
+    SessionId, SessionStatus, generate_session_token, hash_session_handle, hash_session_token,
 };
 pub use transaction::{OidcTransaction, OidcTransactionId};

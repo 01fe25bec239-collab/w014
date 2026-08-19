@@ -6,7 +6,7 @@ use w014_authn::error::AuthnError;
 use w014_authn::oidc::{AuthorizationParameters, IdTokenClaims, OidcClient};
 use w014_authn::rotation::SessionRotation;
 use w014_authn::session::{
-    AuthenticationResult, Session, SessionConfig, SessionEvaluator, SessionId, SessionStatus,
+    AuthenticationResult, Session, SessionConfig, SessionEvaluator, SessionId,
     generate_session_token,
 };
 use w014_domain::ids::{OrganizationId, PrincipalId};
@@ -53,8 +53,8 @@ impl OidcFlowService {
         state: &str,
         session_config: &SessionConfig,
         default_org_id: Option<OrganizationId>,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<(Session, String, PrincipalId), ApplicationError> {
         // 1. Consume transient transaction by state token (single-use semantics)
         let transaction = OidcPersistenceService::consume_transaction(tx, state)
@@ -86,17 +86,19 @@ impl OidcFlowService {
 
         // 6. Create authoritative server-side session with fresh opaque handle (bounded to max 5 active)
         let raw_token = generate_session_token();
-        let token_hash = session_config.hash_token(&raw_token);
-        let expires_at = now + Duration::seconds(session_config.absolute_ttl_secs);
+        let handle_hash = session_config.hash_handle(&raw_token);
+        let csrf_secret_material = generate_session_token();
+        let csrf_secret_hash = session_config.hash_handle(&csrf_secret_material);
+        let idle_expires_at = now + Duration::seconds(session_config.idle_ttl_secs);
+        let absolute_expires_at = now + Duration::seconds(session_config.absolute_ttl_secs);
 
         let session = SessionService::create_session(
             tx,
             principal_id,
-            None,
-            token_hash,
-            expires_at,
-            ip_address,
-            user_agent,
+            handle_hash.to_vec(),
+            csrf_secret_hash.to_vec(),
+            idle_expires_at,
+            absolute_expires_at,
         )
         .await?;
 
@@ -185,14 +187,14 @@ impl SessionAuthnService {
         let idle_ttl = Duration::seconds(session_config.idle_ttl_secs);
 
         // 1. Try active HMAC key lookup
-        let active_hash = session_config.hash_token(raw_token);
+        let active_hash = session_config.hash_handle(raw_token);
         let (mut session, is_previous_key) =
-            match SessionRepository::get_by_token_hash(tx, &active_hash).await? {
+            match SessionRepository::get_by_handle_hash(tx, &active_hash).await? {
                 Some(sess) => (sess, false),
                 None => {
-                    let prev_sess = match session_config.hash_token_previous(raw_token) {
+                    let prev_sess = match session_config.hash_handle_previous(raw_token) {
                         Some(prev_hash) => {
-                            SessionRepository::get_by_token_hash(tx, &prev_hash).await?
+                            SessionRepository::get_by_handle_hash(tx, &prev_hash).await?
                         }
                         None => None,
                     };
@@ -205,12 +207,6 @@ impl SessionAuthnService {
 
         // 3. Evaluate active status and idle/absolute expiry
         if let Err(err) = SessionEvaluator::evaluate_active(&session, idle_ttl, now) {
-            if session.status == SessionStatus::Active
-                && (now >= session.expires_at || now - session.last_seen_at > idle_ttl)
-            {
-                session.status = SessionStatus::Expired;
-                let _ = SessionRepository::update(tx, &session).await;
-            }
             return Err(ApplicationError::Authn(err));
         }
 
@@ -219,23 +215,25 @@ impl SessionAuthnService {
         // 4. If validated under previous key, rotate immediately to active key
         if is_previous_key {
             let (rotation, new_raw_token) =
-                Self::rotate(tx, session.id, session_config, ip_address).await?;
-            session.session_token_hash = rotation.new_token_hash;
+                Self::rotate(tx, session.session_id, session_config, ip_address).await?;
+            session.handle_hash = rotation.new_handle_hash;
+            session.rotation_counter += 1;
             rotated_token = Some(new_raw_token);
         } else {
             // 5. Periodic 4-hour rotation: if active use >= 4 hours since creation
             let periodic_ttl = Duration::seconds(session_config.periodic_rotation_interval_secs);
             if now - session.created_at >= periodic_ttl {
                 let (rotation, new_raw_token) =
-                    Self::rotate(tx, session.id, session_config, ip_address).await?;
-                session.session_token_hash = rotation.new_token_hash;
+                    Self::rotate(tx, session.session_id, session_config, ip_address).await?;
+                session.handle_hash = rotation.new_handle_hash;
+                session.rotation_counter += 1;
                 rotated_token = Some(new_raw_token);
             } else {
                 // 6. Throttled activity touch (at most once every 5 minutes)
                 let touch_threshold =
                     Duration::seconds(session_config.activity_touch_interval_secs);
                 if now - session.last_seen_at >= touch_threshold {
-                    session.touch(now)?;
+                    session.touch(now, idle_ttl)?;
                     SessionRepository::update(tx, &session).await?;
                 }
             }
@@ -255,14 +253,17 @@ impl SessionAuthnService {
         ip_address: Option<&str>,
     ) -> Result<(SessionRotation, String), ApplicationError> {
         let new_raw_token = generate_session_token();
-        let new_token_hash = session_config.hash_token(&new_raw_token);
-        let new_expires_at = Utc::now() + Duration::seconds(session_config.absolute_ttl_secs);
+        let new_handle_hash = session_config.hash_handle(&new_raw_token);
+        let now = Utc::now();
+        let new_idle_expires_at = now + Duration::seconds(session_config.idle_ttl_secs);
+        let new_absolute_expires_at = now + Duration::seconds(session_config.absolute_ttl_secs);
 
         let rotation = SessionService::rotate_session(
             tx,
             session_id,
-            new_token_hash,
-            new_expires_at,
+            new_handle_hash.to_vec(),
+            new_idle_expires_at,
+            new_absolute_expires_at,
             ip_address,
         )
         .await?;

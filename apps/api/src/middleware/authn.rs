@@ -4,9 +4,10 @@ use axum::extract::{Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::Next;
 use axum::response::Response;
+use chrono::Utc;
 use w014_application::persistence::SessionRepository;
 use w014_authn::middleware::AuthenticatedSession;
-use w014_authn::session::{Session, SessionCookieBuilder, SessionStatus};
+use w014_authn::session::{Session, SessionCookieBuilder};
 
 use crate::AppState;
 use crate::error::ProblemDetails;
@@ -30,11 +31,11 @@ async fn try_authenticate(state: &AppState, headers: &HeaderMap) -> Option<Sessi
     let pool = state.pool.as_ref()?;
     let mut tx = pool.begin().await.ok()?;
 
-    let active_hash = state.config.session.hash_token(&token);
-    let session = match SessionRepository::get_by_token_hash(&mut tx, &active_hash).await {
+    let active_hash = state.config.session.hash_handle(&token);
+    let session = match SessionRepository::get_by_handle_hash(&mut tx, &active_hash).await {
         Ok(Some(s)) => Some(s),
-        _ => match state.config.session.hash_token_previous(&token) {
-            Some(prev_hash) => SessionRepository::get_by_token_hash(&mut tx, &prev_hash)
+        _ => match state.config.session.hash_handle_previous(&token) {
+            Some(prev_hash) => SessionRepository::get_by_handle_hash(&mut tx, &prev_hash)
                 .await
                 .ok()
                 .flatten(),
@@ -42,5 +43,6 @@ async fn try_authenticate(state: &AppState, headers: &HeaderMap) -> Option<Sessi
         },
     };
 
-    session.filter(|s| s.status == SessionStatus::Active)
+    let now = Utc::now();
+    session.filter(|s| s.is_active_at(now))
 }

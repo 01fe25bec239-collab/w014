@@ -12,7 +12,7 @@ use rand::rngs::OsRng;
 use sha2::Sha256;
 
 use crate::error::AuthnError;
-use crate::session::{Session, SessionStatus};
+use crate::session::Session;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -32,12 +32,17 @@ pub fn generate_session_token() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Computes the keyed HMAC-SHA256 hex digest of a raw opaque session token.
-pub fn hash_session_token(token: &str, secret_key: &[u8]) -> String {
+/// Computes the 32-byte keyed HMAC-SHA256 binary digest of a raw opaque session handle.
+pub fn hash_session_handle(handle: &str, secret_key: &[u8]) -> [u8; 32] {
     let mut mac =
         HmacSha256::new_from_slice(secret_key).expect("HMAC-SHA256 can accept any key length");
-    mac.update(token.trim().as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+    mac.update(handle.trim().as_bytes());
+    mac.finalize().into_bytes().into()
+}
+
+/// Computes the keyed HMAC-SHA256 hex digest of a raw opaque session token.
+pub fn hash_session_token(token: &str, secret_key: &[u8]) -> String {
+    hex::encode(hash_session_handle(token, secret_key))
 }
 
 /// Session configuration governing TTL, idle timeouts, cookie parameters, and HMAC key lifecycle.
@@ -124,12 +129,24 @@ impl SessionConfig {
         self
     }
 
-    /// Computes the authoritative HMAC-SHA256 hash of a session token under the active key.
+    /// Computes the authoritative 32-byte binary HMAC-SHA256 digest of a session handle under active key.
+    pub fn hash_handle(&self, handle: &str) -> [u8; 32] {
+        hash_session_handle(handle, &self.active_hmac_secret)
+    }
+
+    /// Computes the 32-byte binary HMAC-SHA256 digest under previous key, if configured.
+    pub fn hash_handle_previous(&self, handle: &str) -> Option<[u8; 32]> {
+        self.previous_hmac_secret
+            .as_ref()
+            .map(|secret| hash_session_handle(handle, secret))
+    }
+
+    /// Computes the HMAC-SHA256 hex string under active key.
     pub fn hash_token(&self, token: &str) -> String {
         hash_session_token(token, &self.active_hmac_secret)
     }
 
-    /// Computes the HMAC-SHA256 hash under the previous key, if configured.
+    /// Computes the HMAC-SHA256 hex string under previous key, if configured.
     pub fn hash_token_previous(&self, token: &str) -> Option<String> {
         self.previous_hmac_secret
             .as_ref()
@@ -147,19 +164,12 @@ impl SessionEvaluator {
         idle_timeout: Duration,
         now: DateTime<Utc>,
     ) -> Result<(), AuthnError> {
-        if session.status == SessionStatus::Revoked {
-            return Err(AuthnError::SessionRevoked(session.id.to_string()));
+        if session.revoked_at.is_some() {
+            return Err(AuthnError::SessionRevoked(session.session_id.to_string()));
         }
 
-        if session.status == SessionStatus::Expired || now >= session.expires_at {
-            return Err(AuthnError::SessionExpired(session.id.to_string()));
-        }
-
-        if now - session.last_seen_at > idle_timeout {
-            return Err(AuthnError::SessionExpired(format!(
-                "Session '{}' expired due to idle timeout",
-                session.id
-            )));
+        if session.is_expired_at(now) || now - session.last_seen_at > idle_timeout {
+            return Err(AuthnError::SessionExpired(session.session_id.to_string()));
         }
 
         Ok(())

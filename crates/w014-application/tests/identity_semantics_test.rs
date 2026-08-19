@@ -481,67 +481,75 @@ async fn test_session_persistence_rotation_and_revocation() {
         .await
         .unwrap();
 
-    let expires = Utc::now() + Duration::hours(12);
+    let now = Utc::now();
+    let idle_expires = now + Duration::hours(12);
+    let abs_expires = now + Duration::days(7);
+    let initial_hash = b"initial_handle_hash_123456789012".to_vec();
+    let csrf_hash = b"csrf_secret_hash_123456789012345".to_vec();
+
     let session = SessionService::create_session(
         &mut tx,
         principal.id,
-        None,
-        "initial_token_hash_12345",
-        expires,
-        Some("127.0.0.1"),
-        Some("Agent/1.0"),
+        initial_hash.clone(),
+        csrf_hash,
+        idle_expires,
+        abs_expires,
     )
     .await
     .unwrap();
 
     assert_eq!(session.principal_id, principal.id);
-    assert_eq!(session.session_token_hash, "initial_token_hash_12345");
+    assert_eq!(session.handle_hash, initial_hash);
 
-    // 1. Query by token hash
-    let found = SessionService::get_session_by_token_hash(&mut tx, "initial_token_hash_12345")
+    // 1. Query by handle hash
+    let found = SessionService::get_session_by_handle_hash(&mut tx, &initial_hash)
         .await
         .unwrap()
         .expect("session found");
-    assert_eq!(found.id, session.id);
+    assert_eq!(found.session_id, session.session_id);
 
     // 2. Rotate session
-    let new_expires = Utc::now() + Duration::hours(24);
+    let new_idle_expires = Utc::now() + Duration::hours(12);
+    let new_abs_expires = Utc::now() + Duration::days(7);
+    let rotated_hash = b"rotated_handle_hash_678901234567".to_vec();
     let rotation = SessionService::rotate_session(
         &mut tx,
-        session.id,
-        "rotated_token_hash_67890",
-        new_expires,
+        session.session_id,
+        rotated_hash.clone(),
+        new_idle_expires,
+        new_abs_expires,
         Some("127.0.0.2"),
     )
     .await
     .unwrap();
-    assert_eq!(rotation.session_id, session.id);
-    assert_eq!(rotation.old_token_hash, "initial_token_hash_12345");
-    assert_eq!(rotation.new_token_hash, "rotated_token_hash_67890");
+    assert_eq!(rotation.session_id, session.session_id);
+    assert_eq!(rotation.old_handle_hash, initial_hash);
+    assert_eq!(rotation.new_handle_hash, rotated_hash);
 
     // Verify old hash no longer resolves active session
-    let old_lookup = SessionService::get_session_by_token_hash(&mut tx, "initial_token_hash_12345")
+    let old_lookup = SessionService::get_session_by_handle_hash(&mut tx, &initial_hash)
         .await
         .unwrap();
     assert!(old_lookup.is_none());
 
     // Verify new hash resolves updated session
-    let new_lookup = SessionService::get_session_by_token_hash(&mut tx, "rotated_token_hash_67890")
+    let new_lookup = SessionService::get_session_by_handle_hash(&mut tx, &rotated_hash)
         .await
         .unwrap()
         .expect("new token resolves");
-    assert_eq!(new_lookup.id, session.id);
+    assert_eq!(new_lookup.session_id, session.session_id);
 
     // 3. Revoke session
-    SessionService::revoke_session(&mut tx, session.id)
+    SessionService::revoke_session(&mut tx, session.session_id)
         .await
         .unwrap();
 
-    let revoked = SessionRepository::get_by_id(&mut tx, session.id)
+    let revoked = SessionRepository::get_by_id(&mut tx, session.session_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(revoked.status, w014_authn::session::SessionStatus::Revoked);
+    assert!(revoked.revoked_at.is_some());
+    assert!(!revoked.is_active_at(Utc::now()));
 
     tx.commit().await.unwrap();
     test_db.close().await.expect("drop test db");
