@@ -78,17 +78,18 @@ mod tests {
     #[test]
     fn test_cookie_construction_and_extraction() {
         let config = SessionConfig {
-            absolute_ttl_secs: 3600,
-            idle_ttl_secs: 1800,
-            cookie_name: "__Host-session".to_string(),
+            absolute_ttl_secs: 86400,
+            idle_ttl_secs: 7200,
+            cookie_name: "__Host-w014_session".to_string(),
             cookie_secure: true,
             cookie_path: "/".to_string(),
+            hmac_secret: b"test-secret-cookie-key-32-bytes!".to_vec(),
         };
 
         let raw_token = "raw_opaque_token_12345";
         let cookie_str = SessionCookieBuilder::build_set_cookie(&config, raw_token);
 
-        assert!(cookie_str.contains("__Host-session=raw_opaque_token_12345"));
+        assert!(cookie_str.contains("__Host-w014_session=raw_opaque_token_12345"));
         assert!(cookie_str.contains("HttpOnly"));
         assert!(cookie_str.contains("SameSite=Lax"));
         assert!(cookie_str.contains("Path=/"));
@@ -97,7 +98,8 @@ mod tests {
 
         // Extraction
         let extracted =
-            SessionCookieBuilder::extract_token_from_str(&cookie_str, "__Host-session").unwrap();
+            SessionCookieBuilder::extract_token_from_str(&cookie_str, "__Host-w014_session")
+                .unwrap();
         assert_eq!(extracted, raw_token);
     }
 

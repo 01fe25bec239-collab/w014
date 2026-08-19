@@ -6,18 +6,18 @@
 //! 3. STATE_VALIDATION: Strong entropy, bounded validity, single-use state consumption, replay rejection.
 //! 4. NONCE_VALIDATION: ID token nonce binding and mismatch rejection.
 //! 5. CALLBACK_VALIDATION: E02 callback exchange, token validation, principal resolution, session creation.
-//! 6. OPAQUE_SERVER_SIDE_SESSION: Raw token never stored (SHA-256 hash in DB), authoritative lookup on E03.
+//! 6. OPAQUE_SERVER_SIDE_SESSION: Raw token never stored (keyed HMAC-SHA256 in DB), authoritative lookup on E03.
 //! 7. SESSION_ROTATION: Distinct hashes, rotation audit append, old token invalidation.
 //! 8. SESSION_EXPIRY: Absolute and idle expiration policies, touch updates.
 //! 9. SESSION_REPLAY_REVOCATION: E04 logout revocation, cookie clearing, revoked token rejection.
-//! 10. CSRF_SESSION_BEHAVIOR: Exact Origin validation on unsafe methods, referer fallback, fail closed.
+//! 10. CSRF_SESSION_BEHAVIOR: Exact Origin validation on unsafe methods, X-W014-CSRF header enforcement, NO referer fallback, fail closed.
 //! 11. E01_E04_CONTRACT_BEHAVIOR: Strict adherence to frozen endpoints, HTTP statuses, and ProblemDetails.
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Form;
-use axum::http::header::{COOKIE, LOCATION, ORIGIN, SET_COOKIE};
-use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use axum::http::header::{COOKIE, LOCATION, ORIGIN, REFERER, SET_COOKIE};
+use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
 use chrono::{Duration, Utc};
 use http_body_util::BodyExt;
@@ -34,7 +34,7 @@ use w014_application::persistence::{
     OidcIdentityRepository, OidcTransactionRepository, PrincipalRepository, SessionRepository,
 };
 use w014_application::services::OidcPersistenceService;
-use w014_authn::csrf::CsrfConfig;
+use w014_authn::csrf::{CSRF_HEADER_NAME, CsrfConfig, derive_csrf_token};
 use w014_authn::oidc::token::{AudienceClaim, RawIdTokenClaims};
 use w014_authn::oidc::{OidcClient, OidcConfig};
 use w014_authn::session::{
@@ -122,7 +122,8 @@ impl MockIdp {
                         let c_id = c_id.clone();
                         async move {
                             let code = params.get("code").cloned().unwrap_or_default();
-                            let verifier = params.get("code_verifier").cloned().unwrap_or_default();
+                            let verifier =
+                                params.get("code_verifier").cloned().unwrap_or_default();
 
                             // Generate valid signed ID token
                             let now = Utc::now();
@@ -143,7 +144,8 @@ impl MockIdp {
 
                             let mut header = Header::new(Algorithm::RS256);
                             header.kid = Some("mock-rsa-key-1".to_string());
-                            let id_token = jsonwebtoken::encode(&header, &claims, &enc_key).unwrap();
+                            let id_token =
+                                jsonwebtoken::encode(&header, &claims, &enc_key).unwrap();
 
                             let token_resp = serde_json::json!({
                                 "access_token": "mock_access_token",
@@ -339,7 +341,7 @@ async fn test_state_single_use_and_replay_rejection() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. FULL OIDC CALLBACK, PRINCIPAL PROVISIONING & SERVER-SIDE SESSIONS (E02)
+// 3. FULL OIDC CALLBACK, PRINCIPAL PROVISIONING & SERVER-SIDE SESSIONS (E02, E03)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -419,19 +421,30 @@ async fn test_e02_callback_flow_creates_opaque_session_and_cookie() {
         SessionCookieBuilder::extract_token_from_str(set_cookie_hdr, "__Host-w014_session")
             .expect("Raw session token must be extractable from Set-Cookie");
 
-    // 4. Verify Authoritative DB state: Raw token is NEVER stored in database, only SHA-256 hash
-    let token_hash = hash_session_token(&raw_token);
+    // 4. Verify Authoritative DB state: Raw token is NEVER stored in database, only keyed HMAC-SHA256
+    let token_hash = config.session.hash_token(&raw_token);
     let mut check_tx = pool.begin().await.unwrap();
     let db_session = SessionRepository::get_by_token_hash(&mut check_tx, &token_hash)
         .await
         .unwrap()
-        .expect("Session must exist in DB by token hash");
+        .expect("Session must exist in DB by keyed HMAC token hash");
 
     assert_eq!(db_session.status, SessionStatus::Active);
     assert_eq!(db_session.session_token_hash, token_hash);
 
-    // Raw token does NOT exist as a plain hash
+    // Raw token is NEVER equal to the stored hash
     assert_ne!(db_session.session_token_hash, raw_token);
+
+    // Keyed property: A different HMAC key produces a completely different hash that does NOT match DB
+    let other_key_hash = hash_session_token(&raw_token, b"different-secret-key-material-32b");
+    assert_ne!(other_key_hash, token_hash);
+    let wrong_key_lookup = SessionRepository::get_by_token_hash(&mut check_tx, &other_key_hash)
+        .await
+        .unwrap();
+    assert!(
+        wrong_key_lookup.is_none(),
+        "Lookup with different HMAC key must find nothing"
+    );
 
     // Verify OIDC Identity linkage
     let identity = OidcIdentityRepository::get_by_issuer_subject(
@@ -447,12 +460,6 @@ async fn test_e02_callback_flow_creates_opaque_session_and_cookie() {
     assert_eq!(identity.email.as_deref(), Some("user-code123@example.com"));
 
     // 5. Test E03: GET /api/v1/session using the session cookie
-    let mut session_req_headers = HeaderMap::new();
-    session_req_headers.insert(
-        COOKIE,
-        HeaderValue::from_str(&format!("__Host-w014_session={raw_token}")).unwrap(),
-    );
-
     let session_req = Request::builder()
         .uri("/api/v1/session")
         .method("GET")
@@ -471,6 +478,10 @@ async fn test_e02_callback_flow_creates_opaque_session_and_cookie() {
         db_session.principal_id.to_string()
     );
     assert_eq!(session_data.status, "active");
+    assert!(
+        session_data.csrf_token.is_some(),
+        "Active session response must include derived CSRF token"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -491,11 +502,10 @@ async fn test_session_lifecycle_expiry_idle_and_touch() {
 
     // 1. Create active session in DB
     let raw_token = generate_session_token();
-    let token_hash = hash_session_token(&raw_token);
+    let token_hash = config.session.hash_token(&raw_token);
     let now = Utc::now();
 
     let mut tx = pool.begin().await.unwrap();
-    // Ensure default organization exists
     let org = w014_domain::organization::Organization::new("Default Org", "default").unwrap();
     w014_application::persistence::OrganizationRepository::insert(&mut tx, &org)
         .await
@@ -587,7 +597,7 @@ async fn test_session_rotation_invalidation_and_audit() {
         .unwrap();
 
     let old_raw = generate_session_token();
-    let old_hash = hash_session_token(&old_raw);
+    let old_hash = config.session.hash_token(&old_raw);
     let session = Session::new(
         principal.id,
         None,
@@ -610,7 +620,7 @@ async fn test_session_rotation_invalidation_and_audit() {
 
     assert_ne!(old_raw, new_raw);
     assert_eq!(rotation.old_token_hash, old_hash);
-    assert_eq!(rotation.new_token_hash, hash_session_token(&new_raw));
+    assert_eq!(rotation.new_token_hash, config.session.hash_token(&new_raw));
 
     // 3. Old token is rejected
     let mut tx_check1 = pool.begin().await.unwrap();
@@ -659,7 +669,7 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
         .unwrap();
 
     let raw_token = generate_session_token();
-    let token_hash = hash_session_token(&raw_token);
+    let token_hash = config.session.hash_token(&raw_token);
     let session = Session::new(
         principal.id,
         None,
@@ -672,40 +682,63 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
     SessionRepository::insert(&mut tx, &session).await.unwrap();
     tx.commit().await.unwrap();
 
-    // 2. CSRF Violation: Logout without Origin or Referer fails with 403 Forbidden
-    let bad_csrf_req = Request::builder()
+    let valid_csrf = derive_csrf_token(&raw_token, &config.csrf.hmac_secret);
+
+    // 2. CSRF Defect 1 Test A: Origin missing + valid Referer => MUST FAIL CLOSED (No Referer Fallback)
+    let missing_origin_req = Request::builder()
         .uri("/api/v1/session/logout")
         .method("POST")
         .header(COOKIE, format!("test_session={raw_token}"))
+        .header(REFERER, "http://localhost:8080/dashboard")
+        .header(CSRF_HEADER_NAME, &valid_csrf)
         .body(Body::empty())
         .unwrap();
 
-    let bad_csrf_resp = app.clone().oneshot(bad_csrf_req).await.unwrap();
-    assert_eq!(bad_csrf_resp.status(), StatusCode::FORBIDDEN);
+    let missing_origin_resp = app.clone().oneshot(missing_origin_req).await.unwrap();
+    assert_eq!(
+        missing_origin_resp.status(),
+        StatusCode::FORBIDDEN,
+        "Missing Origin must fail closed even with valid Referer"
+    );
 
-    let bad_body = bad_csrf_resp
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
-    let problem: Value = serde_json::from_slice(&bad_body).unwrap();
-    assert_eq!(problem["type"], "urn:w014:error:forbidden");
+    // 3. CSRF Defect 1 Test B: Malformed Origin + valid Referer => MUST FAIL CLOSED
+    let malformed_origin_req = Request::builder()
+        .uri("/api/v1/session/logout")
+        .method("POST")
+        .header(COOKIE, format!("test_session={raw_token}"))
+        .header(ORIGIN, "malformed-origin-not-url")
+        .header(REFERER, "http://localhost:8080/dashboard")
+        .header(CSRF_HEADER_NAME, &valid_csrf)
+        .body(Body::empty())
+        .unwrap();
 
-    // 3. CSRF Violation: Logout with mismatched Origin fails with 403 Forbidden
+    let malformed_origin_resp = app.clone().oneshot(malformed_origin_req).await.unwrap();
+    assert_eq!(
+        malformed_origin_resp.status(),
+        StatusCode::FORBIDDEN,
+        "Malformed Origin must fail closed"
+    );
+
+    // 4. CSRF Defect 1 Test C: Wrong / Mismatched Origin + valid Referer => MUST FAIL CLOSED
     let attacker_csrf_req = Request::builder()
         .uri("/api/v1/session/logout")
         .method("POST")
         .header(COOKIE, format!("test_session={raw_token}"))
         .header(ORIGIN, "http://evil-attacker.com")
+        .header(REFERER, "http://localhost:8080/dashboard")
+        .header(CSRF_HEADER_NAME, &valid_csrf)
         .body(Body::empty())
         .unwrap();
 
     let attacker_resp = app.clone().oneshot(attacker_csrf_req).await.unwrap();
-    assert_eq!(attacker_resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        attacker_resp.status(),
+        StatusCode::FORBIDDEN,
+        "Wrong Origin must fail closed"
+    );
 
-    // 4. Valid CSRF: Logout with matching Origin succeeds with 200 OK and clears cookie
-    let valid_logout_req = Request::builder()
+    // 5. CSRF Defect 1 Test D: Missing X-W014-CSRF Header => MUST FAIL CLOSED
+    let missing_header_req = Request::builder()
         .uri("/api/v1/session/logout")
         .method("POST")
         .header(COOKIE, format!("test_session={raw_token}"))
@@ -713,8 +746,46 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
         .body(Body::empty())
         .unwrap();
 
+    let missing_header_resp = app.clone().oneshot(missing_header_req).await.unwrap();
+    assert_eq!(
+        missing_header_resp.status(),
+        StatusCode::FORBIDDEN,
+        "Missing X-W014-CSRF header must fail closed"
+    );
+
+    // 6. CSRF Defect 1 Test E: Wrong X-W014-CSRF Header => MUST FAIL CLOSED
+    let wrong_header_req = Request::builder()
+        .uri("/api/v1/session/logout")
+        .method("POST")
+        .header(COOKIE, format!("test_session={raw_token}"))
+        .header(ORIGIN, "http://localhost:8080")
+        .header(CSRF_HEADER_NAME, "wrong-csrf-token-12345")
+        .body(Body::empty())
+        .unwrap();
+
+    let wrong_header_resp = app.clone().oneshot(wrong_header_req).await.unwrap();
+    assert_eq!(
+        wrong_header_resp.status(),
+        StatusCode::FORBIDDEN,
+        "Wrong X-W014-CSRF header must fail closed"
+    );
+
+    // 7. Valid CSRF: Exact Allowed Origin + Valid X-W014-CSRF => MUST SUCCEED (200 OK & clear cookie)
+    let valid_logout_req = Request::builder()
+        .uri("/api/v1/session/logout")
+        .method("POST")
+        .header(COOKIE, format!("test_session={raw_token}"))
+        .header(ORIGIN, "http://localhost:8080")
+        .header(CSRF_HEADER_NAME, &valid_csrf)
+        .body(Body::empty())
+        .unwrap();
+
     let valid_logout_resp = app.clone().oneshot(valid_logout_req).await.unwrap();
-    assert_eq!(valid_logout_resp.status(), StatusCode::OK);
+    assert_eq!(
+        valid_logout_resp.status(),
+        StatusCode::OK,
+        "Valid Origin + Valid CSRF header must succeed"
+    );
 
     let clear_cookie_hdr = valid_logout_resp
         .headers()
@@ -726,7 +797,7 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
     assert!(clear_cookie_hdr.contains("test_session="));
     assert!(clear_cookie_hdr.contains("Max-Age=0"));
 
-    // 5. Verify Session in DB is marked as Revoked
+    // 8. Verify Session in DB is marked as Revoked
     let mut check_tx = pool.begin().await.unwrap();
     let revoked_session = SessionRepository::get_by_id(&mut check_tx, session.id)
         .await
@@ -734,7 +805,7 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
         .unwrap();
     assert_eq!(revoked_session.status, SessionStatus::Revoked);
 
-    // 6. Replay of revoked session on E03 GET /api/v1/session fails with 401 Unauthorized
+    // 9. Replay of revoked session on E03 GET /api/v1/session fails with 401 Unauthorized
     let replay_req = Request::builder()
         .uri("/api/v1/session")
         .method("GET")

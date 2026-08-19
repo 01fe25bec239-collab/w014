@@ -25,6 +25,8 @@ pub struct SessionResponse {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub csrf_token: Option<String>,
 }
 
 /// Logout Response payload (E04).
@@ -73,6 +75,8 @@ pub async fn get_session_handler(
         .await
         .map_err(|_| ProblemDetails::internal_server_error(Some("/api/v1/session".into())))?;
 
+    let csrf_token = state.csrf_protector.derive_token(&raw_token);
+
     let payload = SessionResponse {
         session_id: session.id.to_string(),
         principal_id: session.principal_id.to_string(),
@@ -81,6 +85,7 @@ pub async fn get_session_handler(
         created_at: session.created_at,
         expires_at: session.expires_at,
         last_seen_at: session.last_seen_at,
+        csrf_token: Some(csrf_token),
     };
 
     Ok((StatusCode::OK, axum::Json(payload)).into_response())
@@ -108,10 +113,11 @@ pub async fn logout_handler(
         SessionCookieBuilder::extract_token(&headers, &state.config.session.cookie_name)
             .ok_or(AuthnError::Unauthenticated)?;
 
-    // 2. CSRF Exact Origin validation for POST
+    // 2. CSRF Exact Origin and X-W014-CSRF token validation for POST
+    let expected_csrf = state.csrf_protector.derive_token(&raw_token);
     state
         .csrf_protector
-        .validate_request(&Method::POST, &headers, true)
+        .validate_request(&Method::POST, &headers, true, Some(&expected_csrf))
         .map_err(ProblemDetails::from)?;
 
     let pool = state.pool.as_ref().ok_or_else(|| {
@@ -122,8 +128,8 @@ pub async fn logout_handler(
         ProblemDetails::internal_server_error(Some("/api/v1/session/logout".into()))
     })?;
 
-    // 3. Look up and revoke session
-    let token_hash = w014_authn::session::hash_session_token(&raw_token);
+    // 3. Look up and revoke session by keyed HMAC-SHA256 hash
+    let token_hash = state.config.session.hash_token(&raw_token);
     if let Some(session) =
         w014_application::persistence::SessionRepository::get_by_token_hash(&mut tx, &token_hash)
             .await

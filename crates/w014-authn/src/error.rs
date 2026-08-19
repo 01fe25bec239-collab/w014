@@ -118,13 +118,21 @@ pub enum AuthnError {
     #[error("Invalid PKCE: {0}")]
     InvalidPkce(String),
 
-    /// CSRF origin mismatch.
-    #[error("CSRF check failed: Origin '{0}' does not match allowed origin")]
+    /// CSRF origin mismatch, malformed origin, or non-allowlisted origin.
+    #[error("CSRF check failed: Origin '{0}' does not match allowed origin or is invalid")]
     CsrfOriginMismatch(String),
 
-    /// CSRF missing origin / referer on unsafe request.
-    #[error("CSRF check failed: missing Origin and Referer headers on unsafe request")]
+    /// CSRF missing Origin header on unsafe request.
+    #[error("CSRF check failed: missing required Origin header on unsafe request")]
     CsrfMissingOrigin,
+
+    /// CSRF missing required X-W014-CSRF header on unsafe request.
+    #[error("CSRF check failed: missing required X-W014-CSRF header")]
+    CsrfMissingHeader,
+
+    /// CSRF token mismatch on X-W014-CSRF header.
+    #[error("CSRF check failed: X-W014-CSRF token does not match expected session CSRF token")]
+    CsrfTokenMismatch,
 
     /// Request is unauthenticated.
     #[error("Unauthenticated: valid session cookie required")]

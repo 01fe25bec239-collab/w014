@@ -1,11 +1,4 @@
-//! Application-level OIDC protocol execution and session coordination.
-//!
-//! Orchestrates:
-//! - Authorization request generation and transient transaction storage
-//! - Callback validation, state consumption (single-use), and code exchange
-//! - ID token cryptographic verification and (issuer, subject) identity resolution
-//! - Principal provisioning (no automatic email relinking)
-//! - Opaque server-side session creation, rotation, touch, and revocation
+//! OIDC authentication and server-side session orchestration services.
 
 use chrono::{Duration, Utc};
 use sqlx::PgConnection;
@@ -14,7 +7,6 @@ use w014_authn::oidc::{AuthorizationParameters, IdTokenClaims, OidcClient};
 use w014_authn::rotation::SessionRotation;
 use w014_authn::session::{
     Session, SessionConfig, SessionEvaluator, SessionId, SessionStatus, generate_session_token,
-    hash_session_token,
 };
 use w014_domain::ids::{OrganizationId, PrincipalId};
 use w014_domain::organization::Organization;
@@ -93,7 +85,7 @@ impl OidcFlowService {
 
         // 6. Create authoritative server-side session with fresh opaque handle
         let raw_token = generate_session_token();
-        let token_hash = hash_session_token(&raw_token);
+        let token_hash = session_config.hash_token(&raw_token);
         let expires_at = now + Duration::seconds(session_config.absolute_ttl_secs);
 
         let session = SessionService::create_session(
@@ -181,7 +173,7 @@ impl SessionAuthnService {
         raw_token: &str,
         session_config: &SessionConfig,
     ) -> Result<Session, ApplicationError> {
-        let token_hash = hash_session_token(raw_token);
+        let token_hash = session_config.hash_token(raw_token);
 
         let mut session = SessionRepository::get_by_token_hash(tx, &token_hash)
             .await?
@@ -216,7 +208,7 @@ impl SessionAuthnService {
         ip_address: Option<&str>,
     ) -> Result<(SessionRotation, String), ApplicationError> {
         let new_raw_token = generate_session_token();
-        let new_token_hash = hash_session_token(&new_raw_token);
+        let new_token_hash = session_config.hash_token(&new_raw_token);
         let new_expires_at = Utc::now() + Duration::seconds(session_config.absolute_ttl_secs);
 
         let rotation = SessionService::rotate_session(

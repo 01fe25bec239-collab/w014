@@ -1,38 +1,34 @@
-//! Strongly-typed Foundation API configuration.
+//! Configuration subsystem for Foundation Platform API server.
 //!
-//! Loads and validates environment parameters for the API composition root.
-//! Strictly avoids storing or logging business credentials or non-sanitized data.
+//! Provides strongly-typed configuration loaded from environment variables
+//! with safe defaults for local development and testing.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use w014_authn::csrf::CsrfConfig;
+use w014_authn::oidc::OidcConfig;
+use w014_authn::session::SessionConfig;
 use w014_observability::{LogFormat, ObservabilityConfig};
 
-/// Deployment environment profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Runtime deployment environment profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEnvironment {
-    #[default]
     Development,
     Test,
     Staging,
     Production,
 }
 
-impl AppEnvironment {
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Development => "development",
-            Self::Test => "test",
-            Self::Staging => "staging",
-            Self::Production => "production",
-        }
-    }
-}
-
 impl fmt::Display for AppEnvironment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        match self {
+            Self::Development => write!(f, "development"),
+            Self::Test => write!(f, "test"),
+            Self::Staging => write!(f, "staging"),
+            Self::Production => write!(f, "production"),
+        }
     }
 }
 
@@ -40,22 +36,20 @@ impl FromStr for AppEnvironment {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().trim() {
+        match s.trim().to_lowercase().as_str() {
             "development" | "dev" | "local" => Ok(Self::Development),
             "test" | "testing" => Ok(Self::Test),
             "staging" | "stage" => Ok(Self::Staging),
             "production" | "prod" => Ok(Self::Production),
-            other => Err(format!(
-                "invalid APP_ENV '{other}'; expected 'development', 'test', 'staging', or 'production'"
-            )),
+            other => Err(format!("unknown environment: {other}")),
         }
     }
 }
 
-/// HTTP server network configuration.
+/// HTTP network server listener configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Host interface to bind on (e.g., "0.0.0.0" or "127.0.0.1").
+    /// Host interface address to bind (default 0.0.0.0).
     pub host: String,
     /// TCP port to bind on (default 8080).
     pub port: u16,
@@ -83,10 +77,6 @@ impl ServerConfig {
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], self.port)))
     }
 }
-
-use w014_authn::csrf::CsrfConfig;
-use w014_authn::oidc::OidcConfig;
-use w014_authn::session::SessionConfig;
 
 /// Top-level Foundation API configuration.
 #[derive(Clone)]
@@ -224,6 +214,11 @@ impl ApiConfig {
             }
         };
 
+        let session_hmac_secret = std::env::var("SESSION_SECRET")
+            .or_else(|_| std::env::var("SESSION_HMAC_KEY"))
+            .map(|s| s.into_bytes())
+            .unwrap_or_else(|_| b"w014-default-dev-session-secret-key-32b!".to_vec());
+
         let session = SessionConfig {
             absolute_ttl_secs: 7 * 24 * 3600,
             idle_ttl_secs: 24 * 3600,
@@ -231,9 +226,33 @@ impl ApiConfig {
                 .unwrap_or_else(|_| "w014_session".to_string()),
             cookie_secure: session_secure,
             cookie_path: "/".to_string(),
+            hmac_secret: session_hmac_secret,
         };
 
-        let csrf = CsrfConfig::default();
+        let csrf_allowed_origins = if let Ok(origins_str) = std::env::var("CSRF_ALLOWED_ORIGINS") {
+            origins_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<HashSet<_>>()
+        } else {
+            let mut origins = HashSet::new();
+            origins.insert("http://localhost:8080".to_string());
+            origins.insert("http://127.0.0.1:8080".to_string());
+            origins.insert("http://localhost:3000".to_string());
+            origins.insert("http://127.0.0.1:3000".to_string());
+            origins
+        };
+
+        let csrf_hmac_secret = std::env::var("CSRF_SECRET")
+            .or_else(|_| std::env::var("CSRF_HMAC_KEY"))
+            .map(|s| s.into_bytes())
+            .unwrap_or_else(|_| b"w014-default-dev-csrf-secret-key-32b!".to_vec());
+
+        let csrf = CsrfConfig {
+            allowed_origins: csrf_allowed_origins,
+            hmac_secret: csrf_hmac_secret,
+        };
 
         Ok(Self {
             env,

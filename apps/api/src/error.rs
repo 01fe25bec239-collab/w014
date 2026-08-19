@@ -232,7 +232,9 @@ impl From<w014_authn::error::AuthnError> for ProblemDetails {
                 ProblemDetails::unauthorized(err.to_string(), None)
             }
             w014_authn::error::AuthnError::CsrfOriginMismatch(_)
-            | w014_authn::error::AuthnError::CsrfMissingOrigin => {
+            | w014_authn::error::AuthnError::CsrfMissingOrigin
+            | w014_authn::error::AuthnError::CsrfMissingHeader
+            | w014_authn::error::AuthnError::CsrfTokenMismatch => {
                 ProblemDetails::forbidden(err.to_string(), None)
             }
             w014_authn::error::AuthnError::StateMismatch

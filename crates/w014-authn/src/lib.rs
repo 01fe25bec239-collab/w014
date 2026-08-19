@@ -3,9 +3,9 @@
 //! Provides:
 //! - Authoritative OIDC Authorization Code + S256 PKCE protocol execution
 //! - Key allowlist, exact issuer binding, audience/azp, nonce, and clock-skew validation
-//! - Rust authoritative server-side opaque sessions with SHA-256 token hashing
+//! - Rust authoritative server-side opaque sessions with keyed HMAC-SHA256 token hashing
 //! - Append-style session rotation and revocation lifecycle
-//! - __Host- cookie semantics and CSRF Exact Origin validation
+//! - __Host- cookie semantics and CSRF Exact Origin and X-W014-CSRF token validation
 
 pub mod csrf;
 pub mod error;
@@ -16,7 +16,7 @@ pub mod rotation;
 pub mod session;
 pub mod transaction;
 
-pub use csrf::{CsrfConfig, CsrfProtector};
+pub use csrf::{CSRF_HEADER_NAME, CsrfConfig, CsrfProtector, constant_time_eq, derive_csrf_token};
 pub use error::AuthnError;
 pub use identity::{OidcIdentity, OidcIdentityId};
 pub use middleware::AuthenticatedSession;

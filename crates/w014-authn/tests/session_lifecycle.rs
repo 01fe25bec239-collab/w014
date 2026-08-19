@@ -1,4 +1,4 @@
-//! Integration tests for server-side opaque session lifecycle, rotation, and cookies.
+//! Integration tests for server-side opaque session lifecycle, keyed HMAC hashing, rotation, and cookies.
 
 use chrono::{Duration, Utc};
 use http::HeaderMap;
@@ -12,18 +12,39 @@ use w014_authn::session::{
 use w014_domain::ids::PrincipalId;
 
 #[test]
-fn test_opaque_session_token_hashing_and_uniqueness() {
+fn test_keyed_hmac_sha256_session_token_hashing_and_uniqueness() {
+    let key1 = b"w014-session-key-primary-1234567";
+    let key2 = b"w014-session-key-secondary-98765";
+
     let raw1 = generate_session_token();
     let raw2 = generate_session_token();
     assert_ne!(raw1, raw2);
 
-    let hash1 = hash_session_token(&raw1);
-    let hash2 = hash_session_token(&raw2);
-    assert_ne!(hash1, hash2);
-    assert_eq!(hash1.len(), 64);
+    let hash1_k1 = hash_session_token(&raw1, key1);
+    let hash2_k1 = hash_session_token(&raw2, key1);
+    assert_ne!(hash1_k1, hash2_k1);
+    assert_eq!(hash1_k1.len(), 64);
 
-    // Hash is consistent and deterministic
-    assert_eq!(hash_session_token(&raw1), hash1);
+    // 1. Same token under different HMAC keys produces DIFFERENT hashes (keyed HMAC property)
+    let hash1_k2 = hash_session_token(&raw1, key2);
+    assert_ne!(
+        hash1_k1, hash1_k2,
+        "Same token under different keys must produce distinct HMAC digests"
+    );
+
+    // 2. Hash is deterministic under the same key
+    assert_eq!(hash_session_token(&raw1, key1), hash1_k1);
+
+    // 3. Raw token is never equal to the hash
+    assert_ne!(raw1, hash1_k1);
+}
+
+#[test]
+fn test_session_config_redacts_hmac_secret_in_debug() {
+    let config = SessionConfig::default();
+    let debug_repr = format!("{:?}", config);
+    assert!(debug_repr.contains("[REDACTED_SESSION_HMAC_SECRET]"));
+    assert!(!debug_repr.contains("w014-default-dev-session-secret"));
 }
 
 #[test]
@@ -73,11 +94,13 @@ fn test_session_lifecycle_expiry_and_idle_policies() {
 #[test]
 fn test_session_rotation_semantics() {
     let s_id = SessionId::new();
+    let key = b"w014-rotation-key-12345678901234";
+
     let old_raw = generate_session_token();
-    let old_hash = hash_session_token(&old_raw);
+    let old_hash = hash_session_token(&old_raw, key);
 
     let new_raw = generate_session_token();
-    let new_hash = hash_session_token(&new_raw);
+    let new_hash = hash_session_token(&new_raw, key);
 
     // 1. Distinct rotation succeeds
     let rotation = SessionRotation::new(s_id, &old_hash, &new_hash, Some("10.0.0.1")).unwrap();
@@ -98,6 +121,7 @@ fn test_session_cookie_attributes_and_extraction() {
         cookie_name: "__Host-w014_session".to_string(),
         cookie_secure: true,
         cookie_path: "/".to_string(),
+        hmac_secret: b"secret-for-cookie-test-key-32b!".to_vec(),
     };
 
     let raw_token = generate_session_token();

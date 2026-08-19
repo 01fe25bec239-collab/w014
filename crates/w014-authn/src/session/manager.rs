@@ -1,18 +1,20 @@
 //! Server-side opaque session token utilities and lifecycle validation.
 //!
-//! Generates cryptographically secure opaque tokens, hashes them using SHA-256,
+//! Generates cryptographically secure opaque tokens, hashes them using keyed HMAC-SHA256,
 //! and evaluates absolute and idle expiration policies.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use rand::rngs::OsRng;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use crate::error::AuthnError;
 use crate::session::{Session, SessionStatus};
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Generates a 256-bit cryptographically secure opaque session token.
 pub fn generate_session_token() -> String {
@@ -21,21 +23,36 @@ pub fn generate_session_token() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Computes the SHA-256 hex digest of a raw opaque session token.
-pub fn hash_session_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.trim().as_bytes());
-    hex::encode(hasher.finalize())
+/// Computes the keyed HMAC-SHA256 hex digest of a raw opaque session token.
+pub fn hash_session_token(token: &str, secret_key: &[u8]) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret_key).expect("HMAC-SHA256 can accept any key length");
+    mac.update(token.trim().as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
-/// Session configuration governing TTL, idle timeouts, and cookie parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Session configuration governing TTL, idle timeouts, cookie parameters, and HMAC secret.
+#[derive(Clone)]
 pub struct SessionConfig {
     pub absolute_ttl_secs: i64,
     pub idle_ttl_secs: i64,
     pub cookie_name: String,
     pub cookie_secure: bool,
     pub cookie_path: String,
+    pub hmac_secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for SessionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionConfig")
+            .field("absolute_ttl_secs", &self.absolute_ttl_secs)
+            .field("idle_ttl_secs", &self.idle_ttl_secs)
+            .field("cookie_name", &self.cookie_name)
+            .field("cookie_secure", &self.cookie_secure)
+            .field("cookie_path", &self.cookie_path)
+            .field("hmac_secret", &"[REDACTED_SESSION_HMAC_SECRET]")
+            .finish()
+    }
 }
 
 impl Default for SessionConfig {
@@ -46,6 +63,7 @@ impl Default for SessionConfig {
             cookie_name: "w014_session".to_string(),
             cookie_secure: true,
             cookie_path: "/".to_string(),
+            hmac_secret: b"w014-default-dev-session-secret-key-32b!".to_vec(),
         }
     }
 }
@@ -58,7 +76,18 @@ impl SessionConfig {
             cookie_name: "w014_session_test".to_string(),
             cookie_secure: false, // Permit HTTP in local mock tests
             cookie_path: "/".to_string(),
+            hmac_secret: b"w014-test-session-hmac-secret-32b!!".to_vec(),
         }
+    }
+
+    pub fn with_hmac_secret(mut self, secret: Vec<u8>) -> Self {
+        self.hmac_secret = secret;
+        self
+    }
+
+    /// Computes the authoritative HMAC-SHA256 hash of a session token under this configuration's secret.
+    pub fn hash_token(&self, token: &str) -> String {
+        hash_session_token(token, &self.hmac_secret)
     }
 }
 
@@ -88,50 +117,5 @@ impl SessionEvaluator {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use w014_domain::ids::PrincipalId;
-
-    #[test]
-    fn test_token_generation_and_hashing() {
-        let token1 = generate_session_token();
-        let token2 = generate_session_token();
-        assert_ne!(token1, token2);
-        assert!(token1.len() >= 40);
-
-        let hash1 = hash_session_token(&token1);
-        let hash2 = hash_session_token(&token2);
-        assert_eq!(hash1.len(), 64);
-        assert_ne!(hash1, hash2);
-
-        // Deterministic hashing
-        assert_eq!(hash_session_token(&token1), hash1);
-    }
-
-    #[test]
-    fn test_idle_timeout_evaluation() {
-        let p_id = PrincipalId::new();
-        let now = Utc::now();
-        let expires = now + Duration::days(7);
-        let session =
-            Session::new(p_id, None, "hash123", expires, None::<&str>, None::<&str>).unwrap();
-
-        let idle_ttl = Duration::hours(1);
-
-        // Active within idle window
-        assert!(
-            SessionEvaluator::evaluate_active(&session, idle_ttl, now + Duration::minutes(30))
-                .is_ok()
-        );
-
-        // Expired after idle window
-        assert!(
-            SessionEvaluator::evaluate_active(&session, idle_ttl, now + Duration::hours(2))
-                .is_err()
-        );
     }
 }
