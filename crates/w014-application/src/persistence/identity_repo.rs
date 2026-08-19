@@ -235,6 +235,87 @@ impl ProgramRepository {
             None => Ok(None),
         }
     }
+
+    pub async fn get_by_organization_and_slug(
+        tx: &mut PgConnection,
+        org_id: OrganizationId,
+        slug: &str,
+    ) -> Result<Option<Program>, PersistenceError> {
+        let row_opt = sqlx::query(
+            "SELECT id, organization_id, name, slug, description, created_at, updated_at
+             FROM programs
+             WHERE organization_id = $1 AND slug = $2",
+        )
+        .bind(org_id.as_uuid())
+        .bind(slug)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let p = Program::reconstruct(
+                    ProgramId::from_uuid(row.get("id")),
+                    OrganizationId::from_uuid(row.get("organization_id")),
+                    row.get("name"),
+                    row.get("slug"),
+                    row.get("description"),
+                    row.get("created_at"),
+                    row.get("updated_at"),
+                )
+                .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(p))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_by_organization(
+        tx: &mut PgConnection,
+        org_id: OrganizationId,
+        cursor: Option<uuid::Uuid>,
+        limit: i64,
+    ) -> Result<(Vec<Program>, Option<String>, bool), PersistenceError> {
+        let fetch_limit = limit + 1;
+        let rows = sqlx::query(
+            "SELECT id, organization_id, name, slug, description, created_at, updated_at
+             FROM programs
+             WHERE organization_id = $1
+               AND ($2::uuid IS NULL OR id > $2)
+             ORDER BY id ASC
+             LIMIT $3",
+        )
+        .bind(org_id.as_uuid())
+        .bind(cursor)
+        .bind(fetch_limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        let has_more = rows.len() as i64 > limit;
+        let mut programs = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.into_iter().take(limit as usize) {
+            let p = Program::reconstruct(
+                ProgramId::from_uuid(row.get("id")),
+                OrganizationId::from_uuid(row.get("organization_id")),
+                row.get("name"),
+                row.get("slug"),
+                row.get("description"),
+                row.get("created_at"),
+                row.get("updated_at"),
+            )
+            .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+            programs.push(p);
+        }
+
+        let next_cursor = if has_more {
+            programs.last().map(|p| p.id.to_string())
+        } else {
+            None
+        };
+
+        Ok((programs, next_cursor, has_more))
+    }
 }
 
 /// Repository operations for Workspaces.
@@ -293,6 +374,89 @@ impl WorkspaceRepository {
             None => Ok(None),
         }
     }
+
+    pub async fn get_by_program_and_slug(
+        tx: &mut PgConnection,
+        program_id: ProgramId,
+        slug: &str,
+    ) -> Result<Option<Workspace>, PersistenceError> {
+        let row_opt = sqlx::query(
+            "SELECT id, program_id, organization_id, name, slug, current_source_state_id, created_at, updated_at
+             FROM workspaces
+             WHERE program_id = $1 AND slug = $2",
+        )
+        .bind(program_id.as_uuid())
+        .bind(slug)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let ws = Workspace::reconstruct(
+                    WorkspaceId::from_uuid(row.get("id")),
+                    ProgramId::from_uuid(row.get("program_id")),
+                    OrganizationId::from_uuid(row.get("organization_id")),
+                    row.get("name"),
+                    row.get("slug"),
+                    row.get("current_source_state_id"),
+                    row.get("created_at"),
+                    row.get("updated_at"),
+                )
+                .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(ws))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_by_program(
+        tx: &mut PgConnection,
+        program_id: ProgramId,
+        cursor: Option<uuid::Uuid>,
+        limit: i64,
+    ) -> Result<(Vec<Workspace>, Option<String>, bool), PersistenceError> {
+        let fetch_limit = limit + 1;
+        let rows = sqlx::query(
+            "SELECT id, program_id, organization_id, name, slug, current_source_state_id, created_at, updated_at
+             FROM workspaces
+             WHERE program_id = $1
+               AND ($2::uuid IS NULL OR id > $2)
+             ORDER BY id ASC
+             LIMIT $3",
+        )
+        .bind(program_id.as_uuid())
+        .bind(cursor)
+        .bind(fetch_limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        let has_more = rows.len() as i64 > limit;
+        let mut workspaces = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.into_iter().take(limit as usize) {
+            let ws = Workspace::reconstruct(
+                WorkspaceId::from_uuid(row.get("id")),
+                ProgramId::from_uuid(row.get("program_id")),
+                OrganizationId::from_uuid(row.get("organization_id")),
+                row.get("name"),
+                row.get("slug"),
+                row.get("current_source_state_id"),
+                row.get("created_at"),
+                row.get("updated_at"),
+            )
+            .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+            workspaces.push(ws);
+        }
+
+        let next_cursor = if has_more {
+            workspaces.last().map(|w| w.id.to_string())
+        } else {
+            None
+        };
+
+        Ok((workspaces, next_cursor, has_more))
+    }
 }
 
 /// Repository operations for Memberships.
@@ -318,6 +482,43 @@ impl MembershipRepository {
         .map_err(PersistenceError::Connection)?;
 
         Ok(())
+    }
+
+    pub async fn get_by_id(
+        tx: &mut PgConnection,
+        id: w014_domain::ids::MembershipId,
+    ) -> Result<Option<Membership>, PersistenceError> {
+        let row_opt = sqlx::query(
+            "SELECT id, workspace_id, principal_id, role, created_at, updated_at
+             FROM memberships
+             WHERE id = $1",
+        )
+        .bind(id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let role_str: String = row.get("role");
+                let role: MembershipRole =
+                    role_str
+                        .parse()
+                        .map_err(|e: w014_domain::error::DomainError| {
+                            PersistenceError::Operation(e.to_string())
+                        })?;
+
+                Ok(Some(Membership::reconstruct(
+                    w014_domain::ids::MembershipId::from_uuid(row.get("id")),
+                    WorkspaceId::from_uuid(row.get("workspace_id")),
+                    PrincipalId::from_uuid(row.get("principal_id")),
+                    role,
+                    row.get("created_at"),
+                    row.get("updated_at"),
+                )))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn get_by_workspace_and_principal(
@@ -357,6 +558,58 @@ impl MembershipRepository {
             }
             None => Ok(None),
         }
+    }
+
+    pub async fn list_by_workspace(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        cursor: Option<uuid::Uuid>,
+        limit: i64,
+    ) -> Result<(Vec<Membership>, Option<String>, bool), PersistenceError> {
+        let fetch_limit = limit + 1;
+        let rows = sqlx::query(
+            "SELECT id, workspace_id, principal_id, role, created_at, updated_at
+             FROM memberships
+             WHERE workspace_id = $1
+               AND ($2::uuid IS NULL OR id > $2)
+             ORDER BY id ASC
+             LIMIT $3",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(cursor)
+        .bind(fetch_limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        let has_more = rows.len() as i64 > limit;
+        let mut memberships = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.into_iter().take(limit as usize) {
+            let role_str: String = row.get("role");
+            let role: MembershipRole =
+                role_str
+                    .parse()
+                    .map_err(|e: w014_domain::error::DomainError| {
+                        PersistenceError::Operation(e.to_string())
+                    })?;
+
+            memberships.push(Membership::reconstruct(
+                w014_domain::ids::MembershipId::from_uuid(row.get("id")),
+                WorkspaceId::from_uuid(row.get("workspace_id")),
+                PrincipalId::from_uuid(row.get("principal_id")),
+                role,
+                row.get("created_at"),
+                row.get("updated_at"),
+            ));
+        }
+
+        let next_cursor = if has_more {
+            memberships.last().map(|m| m.id.to_string())
+        } else {
+            None
+        };
+
+        Ok((memberships, next_cursor, has_more))
     }
 
     pub async fn update_role(

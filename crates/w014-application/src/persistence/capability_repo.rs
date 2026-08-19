@@ -179,4 +179,58 @@ impl CapabilityGrantRepository {
 
         Ok(())
     }
+
+    pub async fn list_by_workspace(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        cursor: Option<uuid::Uuid>,
+        limit: i64,
+    ) -> Result<(Vec<CapabilityGrant>, Option<String>, bool), PersistenceError> {
+        let fetch_limit = limit + 1;
+        let rows = sqlx::query(
+            "SELECT id, workspace_id, principal_id, capability, granted_by, granted_at, expires_at
+             FROM capability_grants
+             WHERE workspace_id = $1
+               AND ($2::uuid IS NULL OR id > $2)
+             ORDER BY id ASC
+             LIMIT $3",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(cursor)
+        .bind(fetch_limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        let has_more = rows.len() as i64 > limit;
+        let mut grants = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.into_iter().take(limit as usize) {
+            let cap_str: String = row.get("capability");
+            let capability: Capability =
+                cap_str
+                    .parse()
+                    .map_err(|e: w014_authz::error::AuthzError| {
+                        PersistenceError::Operation(e.to_string())
+                    })?;
+            let granted_by_uuid: Option<Uuid> = row.get("granted_by");
+
+            grants.push(CapabilityGrant::reconstruct(
+                CapabilityGrantId::from_uuid(row.get("id")),
+                WorkspaceId::from_uuid(row.get("workspace_id")),
+                PrincipalId::from_uuid(row.get("principal_id")),
+                capability,
+                granted_by_uuid.map(PrincipalId::from_uuid),
+                row.get("granted_at"),
+                row.get("expires_at"),
+            ));
+        }
+
+        let next_cursor = if has_more {
+            grants.last().map(|g| g.id.to_string())
+        } else {
+            None
+        };
+
+        Ok((grants, next_cursor, has_more))
+    }
 }

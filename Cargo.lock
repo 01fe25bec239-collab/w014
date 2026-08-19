@@ -2663,6 +2663,7 @@ dependencies = [
  "uuid",
  "w014-application",
  "w014-authn",
+ "w014-authz",
  "w014-domain",
  "w014-observability",
  "w014-persistence",

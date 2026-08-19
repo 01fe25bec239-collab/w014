@@ -107,6 +107,20 @@ impl ProblemDetails {
         }
     }
 
+    /// Creates a ProblemDetails payload for a Conflict (409) error.
+    #[must_use]
+    pub fn conflict(detail: impl Into<String>, instance: Option<String>) -> Self {
+        Self {
+            type_uri: "urn:w014:error:conflict".to_string(),
+            title: "Conflict".to_string(),
+            status: StatusCode::CONFLICT.as_u16(),
+            detail: Some(detail.into()),
+            instance,
+            code: Some("CONFLICT".to_string()),
+            correlation_id: None,
+        }
+    }
+
     /// Creates a ProblemDetails payload for an Internal Server Error (500).
     /// Always masks internal details to prevent leaking internal state.
     #[must_use]
@@ -153,6 +167,11 @@ pub enum ApiError {
         detail: String,
         instance: Option<String>,
     },
+    #[error("Conflict: {detail}")]
+    Conflict {
+        detail: String,
+        instance: Option<String>,
+    },
     #[error("Method Not Allowed: {detail}")]
     MethodNotAllowed {
         detail: String,
@@ -177,6 +196,9 @@ impl ApiError {
             }
             Self::BadRequest { detail, instance } => {
                 ProblemDetails::bad_request(detail.clone(), instance.clone())
+            }
+            Self::Conflict { detail, instance } => {
+                ProblemDetails::conflict(detail.clone(), instance.clone())
             }
             Self::MethodNotAllowed { detail, instance } => {
                 ProblemDetails::method_not_allowed(detail.clone(), instance.clone())
@@ -288,7 +310,7 @@ impl From<w014_application::error::ApplicationError> for ProblemDetails {
                 ProblemDetails::forbidden(authz_err.to_string(), None)
             }
             w014_application::error::ApplicationError::Conflict(msg) => {
-                ProblemDetails::bad_request(msg, None)
+                ProblemDetails::conflict(msg, None)
             }
             w014_application::error::ApplicationError::IdempotencyMismatch { .. } => {
                 ProblemDetails::bad_request(err.to_string(), None)

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 w014-domain = { path = "../../crates/w014-domain" }
 w014-authn = { path = "../../crates/w014-authn" }
+w014-authz = { path = "../../crates/w014-authz" }
 w014-application = { path = "../../crates/w014-application" }
 w014-persistence = { path = "../../crates/w014-persistence" }
 w014-observability = { path = "../../crates/w014-observability" }

@@ -299,15 +299,20 @@ async fn test_openapi_endpoint_exposes_health_surface_only() {
     assert!(schemas.get("HealthResponse").is_some());
     assert!(schemas.get("ProblemDetails").is_some());
 
-    // Strictly verify no business domain endpoints or models are leaked
+    // Verify WI-0105 endpoints and schemas are present
+    assert!(paths.get("/api/v1/programs").is_some());
+    assert!(paths.get("/api/v1/workspaces/{workspace_id}").is_some());
+    assert!(schemas.get("ProgramDto").is_some());
+    assert!(schemas.get("WorkspaceDto").is_some());
+    assert!(schemas.get("MembershipDto").is_some());
+    assert!(schemas.get("CapabilityGrantDto").is_some());
+
+    // Strictly verify forbidden/deferred domain endpoints or models are NOT present
     let json_str = json.to_string();
-    assert!(!json_str.contains("/api/v1/programs"));
-    assert!(!json_str.contains("/api/v1/workspaces"));
+    assert!(!json_str.contains("source-state"));
     assert!(!json_str.contains("/api/v1/documents"));
     assert!(!json_str.contains("/api/v1/requirements"));
     assert!(!json_str.contains("/api/v1/findings"));
-    assert!(!json_str.contains("ProgramDto"));
-    assert!(!json_str.contains("WorkspaceDto"));
     assert!(!json_str.contains("DocumentDto"));
 }
 
