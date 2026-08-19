@@ -15,7 +15,7 @@ pub async fn set_session_workspace_id(
     tx: &mut PgConnection,
     workspace_id: Uuid,
 ) -> Result<(), PersistenceError> {
-    sqlx::query("SELECT set_config('app.current_workspace_id', $1, true)")
+    sqlx::query("SELECT set_config('app.workspace_id', $1, true)")
         .bind(workspace_id.to_string())
         .execute(tx)
         .await
@@ -26,7 +26,7 @@ pub async fn set_session_workspace_id(
 
 /// Clears the session-level workspace identifier, resetting RLS evaluation to default (restricted) state.
 pub async fn clear_session_workspace_id(tx: &mut PgConnection) -> Result<(), PersistenceError> {
-    sqlx::query("SELECT set_config('app.current_workspace_id', '', true)")
+    sqlx::query("SELECT set_config('app.workspace_id', '', true)")
         .execute(tx)
         .await
         .map_err(|e| {
@@ -41,7 +41,7 @@ pub async fn get_session_workspace_id(
     tx: &mut PgConnection,
 ) -> Result<Option<Uuid>, PersistenceError> {
     let row: Option<String> =
-        sqlx::query_scalar("SELECT NULLIF(current_setting('app.current_workspace_id', true), '')")
+        sqlx::query_scalar("SELECT NULLIF(current_setting('app.workspace_id', true), '')")
             .fetch_optional(tx)
             .await
             .map_err(|e| {

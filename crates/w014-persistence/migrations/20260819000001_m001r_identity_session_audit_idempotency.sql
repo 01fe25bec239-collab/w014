@@ -286,18 +286,18 @@ ALTER TABLE idempotency_records FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY rls_workspaces_isolation ON workspaces
     FOR ALL
-    USING (id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid)
-    WITH CHECK (id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid);
+    USING (id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
+    WITH CHECK (id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
 
 CREATE POLICY rls_memberships_isolation ON memberships
     FOR ALL
-    USING (workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid)
-    WITH CHECK (workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid);
+    USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
+    WITH CHECK (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
 
 CREATE POLICY rls_capability_grants_isolation ON capability_grants
     FOR ALL
-    USING (workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid)
-    WITH CHECK (workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid);
+    USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
+    WITH CHECK (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
 
 CREATE POLICY rls_sessions_isolation ON sessions
     FOR ALL
@@ -306,18 +306,18 @@ CREATE POLICY rls_sessions_isolation ON sessions
 
 CREATE POLICY rls_audit_chain_heads_isolation ON audit_chain_heads
     FOR ALL
-    USING (workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid)
-    WITH CHECK (workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid);
+    USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
+    WITH CHECK (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
 
 CREATE POLICY rls_audit_events_isolation ON audit_events
     FOR ALL
-    USING (workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid)
-    WITH CHECK (workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid);
+    USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
+    WITH CHECK (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
 
 CREATE POLICY rls_idempotency_records_isolation ON idempotency_records
     FOR ALL
-    USING (workspace_id IS NULL OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid)
-    WITH CHECK (workspace_id IS NULL OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid);
+    USING (workspace_id IS NULL OR workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
+    WITH CHECK (workspace_id IS NULL OR workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
 
 -- ============================================================================
 -- 5. Database Roles & Grants for Application & Readonly Access
