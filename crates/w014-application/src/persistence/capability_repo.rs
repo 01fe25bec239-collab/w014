@@ -118,6 +118,49 @@ impl CapabilityGrantRepository {
         }
     }
 
+    pub async fn get_by_workspace_and_principal(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+    ) -> Result<Vec<CapabilityGrant>, PersistenceError> {
+        let rows = sqlx::query(
+            "SELECT id, workspace_id, principal_id, capability, granted_by, granted_at, expires_at
+             FROM capability_grants
+             WHERE workspace_id = $1 AND principal_id = $2
+             ORDER BY granted_at ASC",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(principal_id.as_uuid())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        let mut grants = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cap_str: String = row.get("capability");
+            let capability: Capability =
+                cap_str
+                    .parse()
+                    .map_err(|e: w014_authz::error::AuthzError| {
+                        PersistenceError::Operation(e.to_string())
+                    })?;
+
+            let granted_by_uuid: Option<Uuid> = row.get("granted_by");
+
+            grants.push(CapabilityGrant::reconstruct(
+                CapabilityGrantId::from_uuid(row.get("id")),
+                WorkspaceId::from_uuid(row.get("workspace_id")),
+                PrincipalId::from_uuid(row.get("principal_id")),
+                capability,
+                granted_by_uuid.map(PrincipalId::from_uuid),
+                row.get("granted_at"),
+                row.get("expires_at"),
+            ));
+        }
+
+        Ok(grants)
+    }
+
     pub async fn update_expiry(
         tx: &mut PgConnection,
         grant_id: CapabilityGrantId,

@@ -11,6 +11,7 @@ use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
+use crate::authority::SpecialAuthority;
 use crate::error::AuthzError;
 
 /// Authoritative identifier for a Capability Grant.
@@ -73,7 +74,7 @@ impl FromStr for CapabilityGrantId {
 }
 
 /// Closed semantic representation of system and workspace capabilities.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Capability {
     // Special authorities (frozen as distinct)
@@ -104,6 +105,35 @@ impl Capability {
     pub const WORKSPACE_WRITE: &'static str = "WORKSPACE_WRITE";
     pub const AUDIT_READ: &'static str = "AUDIT_READ";
 
+    /// Returns all standard (non-special) workspace capabilities.
+    pub const fn standard_capabilities() -> &'static [Capability] {
+        &[
+            Self::WorkspaceAdmin,
+            Self::WorkspaceRead,
+            Self::WorkspaceWrite,
+            Self::AuditRead,
+        ]
+    }
+
+    /// Returns all special authorities as capabilities.
+    pub const fn special_authorities() -> &'static [Capability] {
+        &[
+            Self::OverrideBlock,
+            Self::RightsReview,
+            Self::RuleActivation,
+            Self::GrantAuthority,
+        ]
+    }
+
+    /// Creates a validated named capability.
+    pub fn named(name: impl AsRef<str>) -> Result<Self, AuthzError> {
+        let trimmed = name.as_ref().trim();
+        if trimmed.is_empty() {
+            return Err(AuthzError::EmptyCapability);
+        }
+        trimmed.parse()
+    }
+
     /// Returns the canonical string representation for persistence and tokens.
     pub fn as_str(&self) -> &str {
         match self {
@@ -125,6 +155,11 @@ impl Capability {
             self,
             Self::OverrideBlock | Self::RightsReview | Self::RuleActivation | Self::GrantAuthority
         )
+    }
+
+    /// Converts to `SpecialAuthority` if this capability represents one.
+    pub fn as_special_authority(&self) -> Option<SpecialAuthority> {
+        SpecialAuthority::from_capability(self)
     }
 }
 
@@ -153,10 +188,10 @@ impl FromStr for Capability {
             Self::WORKSPACE_WRITE => Ok(Self::WorkspaceWrite),
             Self::AUDIT_READ => Ok(Self::AuditRead),
             other => {
-                // Ensure valid identifier format: uppercase alphanumeric and underscores
+                // Ensure valid identifier format: uppercase alphanumeric, colons, underscores, hyphens
                 if other
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '-')
                 {
                     Ok(Self::Named(other.to_string()))
                 } else {
@@ -201,5 +236,18 @@ mod tests {
 
         let custom: Capability = "custom_tool:execute".parse().unwrap();
         assert_eq!(custom, Capability::Named("CUSTOM_TOOL:EXECUTE".to_string()));
+    }
+
+    #[test]
+    fn test_capability_ordering_and_btree_support() {
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        set.insert(Capability::WorkspaceRead);
+        set.insert(Capability::WorkspaceWrite);
+        set.insert(Capability::OverrideBlock);
+
+        assert!(set.contains(&Capability::WorkspaceRead));
+        assert!(set.contains(&Capability::WorkspaceWrite));
+        assert!(set.contains(&Capability::OverrideBlock));
     }
 }
