@@ -25,6 +25,7 @@ use chrono::{Duration, Utc};
 use http_body_util::BodyExt;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 use w014_api::config::ApiConfig;
@@ -245,15 +246,16 @@ async fn test_e01_login_initiates_oidc_pkce_and_stores_transaction() {
         .to_string();
 
     // 2. Verify transient transaction is stored in PostgreSQL database
+    let state_hash = Sha256::digest(state_param.as_bytes()).to_vec();
     let mut tx = pool.begin().await.unwrap();
-    let stored_tx = OidcTransactionRepository::get_by_state_token(&mut tx, &state_param)
+    let stored_tx = OidcTransactionRepository::get_by_state_hash(&mut tx, &state_hash)
         .await
         .unwrap()
         .expect("Transaction record must be persisted in database");
 
-    assert_eq!(stored_tx.state_token, state_param);
-    assert!(!stored_tx.nonce.is_empty());
-    assert!(stored_tx.pkce_verifier.is_some());
+    assert_eq!(stored_tx.state_hash, state_hash);
+    assert!(!stored_tx.nonce_hash.is_empty());
+    assert!(stored_tx.pkce_verifier_ciphertext.is_some());
     assert!(stored_tx.is_valid_at(Utc::now()));
 
     // 3. JSON requested login (format=json) returns 200 OK with LoginResponse
@@ -291,15 +293,17 @@ async fn test_state_single_use_and_replay_rejection() {
     // 1. Manually insert an OIDC transaction
     let state_token = "single_use_state_12345";
     let nonce = "nonce_12345";
+    let state_hash = Sha256::digest(state_token.as_bytes()).to_vec();
+    let nonce_hash = Sha256::digest(nonce.as_bytes()).to_vec();
     let expires = Utc::now() + Duration::minutes(5);
 
     let mut tx = pool.begin().await.unwrap();
     OidcPersistenceService::store_transaction(
         &mut tx,
-        state_token,
-        nonce,
-        Some("pkce_verifier_string_43_chars_long_and_valid_url_safe"),
-        "http://localhost:8080/api/v1/auth/callback",
+        state_hash.clone(),
+        nonce_hash,
+        Some(b"pkce_verifier_string_43_chars_long_and_valid_url_safe".to_vec()),
+        "http://localhost:8080/api/v1/auth/callback".to_string(),
         expires,
     )
     .await
@@ -308,15 +312,15 @@ async fn test_state_single_use_and_replay_rejection() {
 
     // 2. First consumption succeeds
     let mut tx2 = pool.begin().await.unwrap();
-    let consumed = OidcPersistenceService::consume_transaction(&mut tx2, state_token)
+    let consumed = OidcPersistenceService::consume_transaction(&mut tx2, &state_hash)
         .await
         .unwrap();
     assert!(consumed.is_some());
     tx2.commit().await.unwrap();
 
-    // 3. Second consumption fails (single-use enforced: deleted from DB)
+    // 3. Second consumption fails (single-use enforced: deleted/consumed)
     let mut tx3 = pool.begin().await.unwrap();
-    let second_attempt = OidcPersistenceService::consume_transaction(&mut tx3, state_token)
+    let second_attempt = OidcPersistenceService::consume_transaction(&mut tx3, &state_hash)
         .await
         .unwrap();
     assert!(second_attempt.is_none());
@@ -376,12 +380,13 @@ async fn test_e02_callback_flow_creates_opaque_session_and_cookie() {
     let state_token = login_data.state;
 
     // Update the stored transaction's nonce to match mock IdP's deterministic nonce format for code 'code123'
+    let state_hash = Sha256::digest(state_token.as_bytes()).to_vec();
     let mut tx = pool.begin().await.unwrap();
-    let mut stored_tx = OidcTransactionRepository::get_by_state_token(&mut tx, &state_token)
+    let mut stored_tx = OidcTransactionRepository::get_by_state_hash(&mut tx, &state_hash)
         .await
         .unwrap()
         .unwrap();
-    stored_tx.nonce = "nonce-for-code123".to_string();
+    stored_tx.nonce_hash = Sha256::digest(b"nonce-for-code123").to_vec();
     // Re-insert with updated nonce
     OidcTransactionRepository::delete_by_id(&mut tx, stored_tx.id)
         .await
@@ -458,7 +463,7 @@ async fn test_e02_callback_flow_creates_opaque_session_and_cookie() {
     .expect("OIDC Identity linkage record must exist");
 
     assert_eq!(identity.principal_id, db_session.principal_id);
-    assert_eq!(identity.email.as_deref(), Some("user-code123@example.com"));
+    assert_eq!(identity.email(), Some("user-code123@example.com"));
 
     // 5. Test E03: GET /api/v1/session using the session cookie
     let session_req = Request::builder()
@@ -514,13 +519,9 @@ async fn test_active_and_previous_hmac_key_rollover_rotates_session() {
     w014_application::persistence::OrganizationRepository::insert(&mut tx, &org)
         .await
         .unwrap();
-    let principal = w014_domain::principal::Principal::new(
-        org.id,
-        w014_domain::principal::PrincipalType::User,
-        Some("rollover@example.com"),
-        "Rollover User",
-    )
-    .unwrap();
+    let principal =
+        w014_domain::principal::Principal::new("Rollover User", Some("rollover@example.com"))
+            .unwrap();
     PrincipalRepository::insert(&mut tx, &principal)
         .await
         .unwrap();
@@ -594,13 +595,8 @@ async fn test_max_concurrent_sessions_limit_revokes_oldest() {
     w014_application::persistence::OrganizationRepository::insert(&mut tx, &org)
         .await
         .unwrap();
-    let principal = w014_domain::principal::Principal::new(
-        org.id,
-        w014_domain::principal::PrincipalType::User,
-        Some("limit@example.com"),
-        "Limit User",
-    )
-    .unwrap();
+    let principal =
+        w014_domain::principal::Principal::new("Limit User", Some("limit@example.com")).unwrap();
     PrincipalRepository::insert(&mut tx, &principal)
         .await
         .unwrap();
@@ -703,13 +699,8 @@ async fn test_session_lifecycle_expiry_idle_and_touch() {
     w014_application::persistence::OrganizationRepository::insert(&mut tx, &org)
         .await
         .unwrap();
-    let principal = w014_domain::principal::Principal::new(
-        org.id,
-        w014_domain::principal::PrincipalType::User,
-        Some("test@example.com"),
-        "Test User",
-    )
-    .unwrap();
+    let principal =
+        w014_domain::principal::Principal::new("Test User", Some("test@example.com")).unwrap();
     PrincipalRepository::insert(&mut tx, &principal)
         .await
         .unwrap();
@@ -778,13 +769,8 @@ async fn test_session_rotation_invalidation_and_audit() {
     w014_application::persistence::OrganizationRepository::insert(&mut tx, &org)
         .await
         .unwrap();
-    let principal = w014_domain::principal::Principal::new(
-        org.id,
-        w014_domain::principal::PrincipalType::User,
-        Some("test@example.com"),
-        "Test User",
-    )
-    .unwrap();
+    let principal =
+        w014_domain::principal::Principal::new("Test User", Some("test@example.com")).unwrap();
     PrincipalRepository::insert(&mut tx, &principal)
         .await
         .unwrap();
@@ -809,7 +795,7 @@ async fn test_session_rotation_invalidation_and_audit() {
         &mut tx_rot,
         session.session_id,
         &config.session,
-        Some("10.0.0.50"),
+        Some("manual_refresh"),
     )
     .await
     .unwrap();
@@ -863,13 +849,8 @@ async fn test_e04_logout_csrf_defense_and_revocation() {
     w014_application::persistence::OrganizationRepository::insert(&mut tx, &org)
         .await
         .unwrap();
-    let principal = w014_domain::principal::Principal::new(
-        org.id,
-        w014_domain::principal::PrincipalType::User,
-        Some("test@example.com"),
-        "Test User",
-    )
-    .unwrap();
+    let principal =
+        w014_domain::principal::Principal::new("Test User", Some("test@example.com")).unwrap();
     PrincipalRepository::insert(&mut tx, &principal)
         .await
         .unwrap();

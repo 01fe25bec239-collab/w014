@@ -70,37 +70,37 @@ impl FromStr for OidcTransactionId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OidcTransaction {
     pub id: OidcTransactionId,
-    pub state_token: String,
-    pub nonce: String,
-    pub pkce_verifier: Option<String>,
-    pub redirect_uri: String,
+    pub state_hash: Vec<u8>,
+    pub nonce_hash: Vec<u8>,
+    pub pkce_verifier_ciphertext: Option<Vec<u8>>,
+    pub return_path: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
 }
 
 impl OidcTransaction {
     /// Creates a new OidcTransaction domain entity enforcing token invariants.
     pub fn new(
-        state_token: impl AsRef<str>,
-        nonce: impl AsRef<str>,
-        pkce_verifier: Option<impl AsRef<str>>,
-        redirect_uri: impl AsRef<str>,
+        state_hash: Vec<u8>,
+        nonce_hash: Vec<u8>,
+        pkce_verifier_ciphertext: Option<Vec<u8>>,
+        return_path: impl AsRef<str>,
         expires_at: DateTime<Utc>,
     ) -> Result<Self, AuthnError> {
-        let trimmed_state = state_token.as_ref().trim();
-        if trimmed_state.is_empty() {
-            return Err(AuthnError::EmptyField("state_token"));
+        if state_hash.is_empty() {
+            return Err(AuthnError::EmptyField("state_hash"));
+        }
+        if nonce_hash.is_empty() {
+            return Err(AuthnError::EmptyField("nonce_hash"));
         }
 
-        let trimmed_nonce = nonce.as_ref().trim();
-        if trimmed_nonce.is_empty() {
-            return Err(AuthnError::EmptyField("nonce"));
-        }
-
-        let trimmed_redirect = redirect_uri.as_ref().trim();
-        if trimmed_redirect.is_empty() {
-            return Err(AuthnError::EmptyField("redirect_uri"));
-        }
+        let trimmed_path = return_path.as_ref().trim();
+        let path = if trimmed_path.is_empty() {
+            "/".to_string()
+        } else {
+            trimmed_path.to_string()
+        };
 
         let now = Utc::now();
         if expires_at <= now {
@@ -111,54 +111,55 @@ impl OidcTransaction {
 
         Ok(Self {
             id: OidcTransactionId::new(),
-            state_token: trimmed_state.to_string(),
-            nonce: trimmed_nonce.to_string(),
-            pkce_verifier: pkce_verifier.map(|v| v.as_ref().trim().to_string()),
-            redirect_uri: trimmed_redirect.to_string(),
+            state_hash,
+            nonce_hash,
+            pkce_verifier_ciphertext,
+            return_path: path,
             created_at: now,
             expires_at,
+            consumed_at: None,
         })
     }
 
     /// Reconstructs an existing OidcTransaction from persistent storage.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconstruct(
         id: OidcTransactionId,
-        state_token: String,
-        nonce: String,
-        pkce_verifier: Option<String>,
-        redirect_uri: String,
+        state_hash: Vec<u8>,
+        nonce_hash: Vec<u8>,
+        pkce_verifier_ciphertext: Option<Vec<u8>>,
+        return_path: String,
         created_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,
+        consumed_at: Option<DateTime<Utc>>,
     ) -> Result<Self, AuthnError> {
-        let trimmed_state = state_token.trim();
-        if trimmed_state.is_empty() {
-            return Err(AuthnError::EmptyField("state_token"));
+        if state_hash.is_empty() {
+            return Err(AuthnError::EmptyField("state_hash"));
         }
-
-        let trimmed_nonce = nonce.trim();
-        if trimmed_nonce.is_empty() {
-            return Err(AuthnError::EmptyField("nonce"));
-        }
-
-        let trimmed_redirect = redirect_uri.trim();
-        if trimmed_redirect.is_empty() {
-            return Err(AuthnError::EmptyField("redirect_uri"));
+        if nonce_hash.is_empty() {
+            return Err(AuthnError::EmptyField("nonce_hash"));
         }
 
         Ok(Self {
             id,
-            state_token: trimmed_state.to_string(),
-            nonce: trimmed_nonce.to_string(),
-            pkce_verifier,
-            redirect_uri: trimmed_redirect.to_string(),
+            state_hash,
+            nonce_hash,
+            pkce_verifier_ciphertext,
+            return_path,
             created_at,
             expires_at,
+            consumed_at,
         })
     }
 
-    /// Evaluates if the transaction is currently valid (non-expired) at `now`.
+    /// Evaluates if the transaction is currently valid (non-consumed, non-expired) at `now`.
     pub fn is_valid_at(&self, now: DateTime<Utc>) -> bool {
-        now < self.expires_at
+        self.consumed_at.is_none() && now < self.expires_at
+    }
+
+    /// Consumes the transaction (single-use semantics).
+    pub fn consume(&mut self, now: DateTime<Utc>) {
+        self.consumed_at = Some(now);
     }
 }
 
@@ -170,11 +171,11 @@ mod tests {
     #[test]
     fn test_transaction_validity() {
         let expires = Utc::now() + Duration::minutes(10);
-        let tx = OidcTransaction::new(
-            "state_abc",
-            "nonce_123",
-            Some("verifier_xyz"),
-            "https://app.example.com/auth/callback",
+        let mut tx = OidcTransaction::new(
+            b"state_hash_bytes".to_vec(),
+            b"nonce_hash_bytes".to_vec(),
+            Some(b"pkce_cipher_bytes".to_vec()),
+            "/auth/callback",
             expires,
         )
         .unwrap();
@@ -182,5 +183,8 @@ mod tests {
         let now = Utc::now();
         assert!(tx.is_valid_at(now));
         assert!(!tx.is_valid_at(expires + Duration::seconds(1)));
+
+        tx.consume(now);
+        assert!(!tx.is_valid_at(now));
     }
 }

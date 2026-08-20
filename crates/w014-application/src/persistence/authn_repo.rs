@@ -1,5 +1,6 @@
 //! PostgreSQL repository operations for OIDC Identities, Sessions, Session Rotations, and OIDC Transactions.
 
+use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, Row};
 use w014_authn::identity::{OidcIdentity, OidcIdentityId};
 use w014_authn::rotation::SessionRotation;
@@ -17,17 +18,16 @@ impl OidcIdentityRepository {
         identity: &OidcIdentity,
     ) -> Result<(), PersistenceError> {
         sqlx::query(
-            "INSERT INTO oidc_identities (id, principal_id, issuer, subject, email, claims, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO oidc_identities (oidc_identity_id, principal_id, issuer, subject, email_at_link, linked_at, last_login_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(identity.id.as_uuid())
         .bind(identity.principal_id.as_uuid())
         .bind(&identity.issuer)
         .bind(&identity.subject)
-        .bind(&identity.email)
-        .bind(&identity.claims)
-        .bind(identity.created_at)
-        .bind(identity.updated_at)
+        .bind(identity.email_at_link.as_deref())
+        .bind(identity.linked_at)
+        .bind(identity.last_login_at)
         .execute(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
@@ -41,7 +41,7 @@ impl OidcIdentityRepository {
         subject: &str,
     ) -> Result<Option<OidcIdentity>, PersistenceError> {
         let row_opt = sqlx::query(
-            "SELECT id, principal_id, issuer, subject, email, claims, created_at, updated_at
+            "SELECT oidc_identity_id, principal_id, issuer, subject, email_at_link, linked_at, last_login_at
              FROM oidc_identities
              WHERE issuer = $1 AND subject = $2",
         )
@@ -54,14 +54,13 @@ impl OidcIdentityRepository {
         match row_opt {
             Some(row) => {
                 let id = OidcIdentity::reconstruct(
-                    OidcIdentityId::from_uuid(row.get("id")),
+                    OidcIdentityId::from_uuid(row.get("oidc_identity_id")),
                     PrincipalId::from_uuid(row.get("principal_id")),
                     row.get("issuer"),
                     row.get("subject"),
-                    row.get("email"),
-                    row.get("claims"),
-                    row.get("created_at"),
-                    row.get("updated_at"),
+                    row.get("email_at_link"),
+                    row.get("linked_at"),
+                    row.get("last_login_at"),
                 )
                 .map_err(|e| PersistenceError::Operation(e.to_string()))?;
 
@@ -69,6 +68,25 @@ impl OidcIdentityRepository {
             }
             None => Ok(None),
         }
+    }
+
+    pub async fn update_last_login(
+        tx: &mut PgConnection,
+        id: OidcIdentityId,
+        last_login_at: DateTime<Utc>,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            "UPDATE oidc_identities
+             SET last_login_at = $2
+             WHERE oidc_identity_id = $1",
+        )
+        .bind(id.as_uuid())
+        .bind(last_login_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        Ok(())
     }
 }
 
@@ -236,15 +254,16 @@ impl SessionRotationRepository {
         rotation: &SessionRotation,
     ) -> Result<(), PersistenceError> {
         sqlx::query(
-            "INSERT INTO session_rotations (id, session_id, old_handle_hash, new_handle_hash, rotated_at, ip_address)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO session_rotations (session_rotation_id, session_id, rotation_number, old_handle_hash, new_handle_hash, reason, rotated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(rotation.id.as_uuid())
         .bind(rotation.session_id.as_uuid())
+        .bind(rotation.rotation_number)
         .bind(&rotation.old_handle_hash[..])
         .bind(&rotation.new_handle_hash[..])
+        .bind(&rotation.reason)
         .bind(rotation.rotated_at)
-        .bind(&rotation.ip_address)
         .execute(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
@@ -262,16 +281,17 @@ impl OidcTransactionRepository {
         transaction: &OidcTransaction,
     ) -> Result<(), PersistenceError> {
         sqlx::query(
-            "INSERT INTO oidc_transactions (id, state_token, nonce, pkce_verifier, redirect_uri, created_at, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO oidc_transactions (oidc_transaction_id, state_hash, nonce_hash, pkce_verifier_ciphertext, return_path, created_at, expires_at, consumed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(transaction.id.as_uuid())
-        .bind(&transaction.state_token)
-        .bind(&transaction.nonce)
-        .bind(&transaction.pkce_verifier)
-        .bind(&transaction.redirect_uri)
+        .bind(&transaction.state_hash[..])
+        .bind(&transaction.nonce_hash[..])
+        .bind(transaction.pkce_verifier_ciphertext.as_deref())
+        .bind(&transaction.return_path)
         .bind(transaction.created_at)
         .bind(transaction.expires_at)
+        .bind(transaction.consumed_at)
         .execute(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
@@ -279,16 +299,16 @@ impl OidcTransactionRepository {
         Ok(())
     }
 
-    pub async fn get_by_state_token(
+    pub async fn get_by_state_hash(
         tx: &mut PgConnection,
-        state_token: &str,
+        state_hash: &[u8],
     ) -> Result<Option<OidcTransaction>, PersistenceError> {
         let row_opt = sqlx::query(
-            "SELECT id, state_token, nonce, pkce_verifier, redirect_uri, created_at, expires_at
+            "SELECT oidc_transaction_id, state_hash, nonce_hash, pkce_verifier_ciphertext, return_path, created_at, expires_at, consumed_at
              FROM oidc_transactions
-             WHERE state_token = $1",
+             WHERE state_hash = $1",
         )
-        .bind(state_token)
+        .bind(state_hash)
         .fetch_optional(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
@@ -296,13 +316,14 @@ impl OidcTransactionRepository {
         match row_opt {
             Some(row) => {
                 let tx_rec = OidcTransaction::reconstruct(
-                    OidcTransactionId::from_uuid(row.get("id")),
-                    row.get("state_token"),
-                    row.get("nonce"),
-                    row.get("pkce_verifier"),
-                    row.get("redirect_uri"),
+                    OidcTransactionId::from_uuid(row.get("oidc_transaction_id")),
+                    row.get("state_hash"),
+                    row.get("nonce_hash"),
+                    row.get("pkce_verifier_ciphertext"),
+                    row.get("return_path"),
                     row.get("created_at"),
                     row.get("expires_at"),
+                    row.get("consumed_at"),
                 )
                 .map_err(|e| PersistenceError::Operation(e.to_string()))?;
 
@@ -312,11 +333,30 @@ impl OidcTransactionRepository {
         }
     }
 
+    pub async fn consume(
+        tx: &mut PgConnection,
+        id: OidcTransactionId,
+        consumed_at: DateTime<Utc>,
+    ) -> Result<bool, PersistenceError> {
+        let result = sqlx::query(
+            "UPDATE oidc_transactions
+             SET consumed_at = $2
+             WHERE oidc_transaction_id = $1 AND consumed_at IS NULL",
+        )
+        .bind(id.as_uuid())
+        .bind(consumed_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn delete_by_id(
         tx: &mut PgConnection,
         id: OidcTransactionId,
     ) -> Result<(), PersistenceError> {
-        sqlx::query("DELETE FROM oidc_transactions WHERE id = $1")
+        sqlx::query("DELETE FROM oidc_transactions WHERE oidc_transaction_id = $1")
             .bind(id.as_uuid())
             .execute(&mut *tx)
             .await

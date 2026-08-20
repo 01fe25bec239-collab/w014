@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 use w014_application::authn::SessionAuthnService;
-use w014_application::persistence::{PrincipalRepository, ProgramRepository};
+use w014_application::persistence::{
+    OrganizationRepository, PrincipalRepository, ProgramRepository,
+};
 use w014_application::services::IdempotencyCoordinator;
 use w014_authn::error::AuthnError;
 use w014_authn::session::SessionCookieBuilder;
-use w014_domain::ids::ProgramId;
+use w014_domain::ids::{OrganizationId, ProgramId};
 use w014_domain::principal::Principal;
 use w014_domain::program::Program;
 use w014_persistence::idempotency::{IdempotencyCheckResult, PostgresIdempotencyStore};
@@ -24,6 +26,7 @@ use crate::error::ProblemDetails;
 /// Query parameters for cursor-based pagination.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct PaginationQuery {
+    pub organization_id: Option<String>,
     pub cursor: Option<String>,
     pub limit: Option<u32>,
 }
@@ -31,6 +34,8 @@ pub struct PaginationQuery {
 /// Request payload for creating a program (E06).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateProgramDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
     pub name: String,
     pub slug: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,10 +61,10 @@ impl From<&Program> for ProgramDto {
             id: p.id.to_string(),
             organization_id: p.organization_id.to_string(),
             name: p.name.clone(),
-            slug: p.slug.clone(),
-            description: p.description.clone(),
+            slug: p.slug().to_string(),
+            description: None,
             created_at: p.created_at,
-            updated_at: p.updated_at,
+            updated_at: p.created_at,
         }
     }
 }
@@ -102,7 +107,7 @@ async fn authenticate_caller(
         .map_err(|_| ProblemDetails::internal_server_error(Some(path.into())))?
         .ok_or_else(|| ProblemDetails::unauthorized("Principal not found", Some(path.into())))?;
 
-    if !principal.is_active {
+    if !principal.is_active() {
         return Err(ProblemDetails::forbidden(
             "Principal account is deactivated",
             Some(path.into()),
@@ -135,7 +140,7 @@ pub async fn list_programs_handler(
     Query(pagination): Query<PaginationQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ProblemDetails> {
-    let (_session, principal) = authenticate_caller(&state, &headers, "/api/v1/programs").await?;
+    let (_session, _principal) = authenticate_caller(&state, &headers, "/api/v1/programs").await?;
 
     let pool = state
         .pool
@@ -153,14 +158,26 @@ pub async fn list_programs_handler(
         .and_then(|c| Uuid::parse_str(c).ok());
     let limit = pagination.limit.unwrap_or(50).clamp(1, 100) as i64;
 
-    let (programs, next_cursor, has_more) = ProgramRepository::list_by_organization(
-        &mut tx,
-        principal.organization_id,
-        cursor_uuid,
-        limit,
-    )
-    .await
-    .map_err(|_| ProblemDetails::internal_server_error(Some("/api/v1/programs".into())))?;
+    let (programs, next_cursor, has_more) = if let Some(ref org_str) = pagination.organization_id {
+        let org_uuid = Uuid::parse_str(org_str).map_err(|_| {
+            ProblemDetails::bad_request(
+                format!("Invalid organization_id: '{org_str}'"),
+                Some("/api/v1/programs".into()),
+            )
+        })?;
+        ProgramRepository::list_by_organization(
+            &mut tx,
+            OrganizationId::from_uuid(org_uuid),
+            cursor_uuid,
+            limit,
+        )
+        .await
+        .map_err(|_| ProblemDetails::internal_server_error(Some("/api/v1/programs".into())))?
+    } else {
+        ProgramRepository::list_all(&mut tx, cursor_uuid, limit)
+            .await
+            .map_err(|_| ProblemDetails::internal_server_error(Some("/api/v1/programs".into())))?
+    };
 
     tx.commit()
         .await
@@ -221,6 +238,39 @@ pub async fn create_program_handler(
         .await
         .map_err(|_| ProblemDetails::internal_server_error(Some("/api/v1/programs".into())))?;
 
+    // Determine target organization
+    let org_id = if let Some(ref org_str) = payload.organization_id {
+        let org_uuid = Uuid::parse_str(org_str).map_err(|_| {
+            ProblemDetails::bad_request(
+                format!("Invalid organization_id: '{org_str}'"),
+                Some("/api/v1/programs".into()),
+            )
+        })?;
+        OrganizationId::from_uuid(org_uuid)
+    } else if let Some(def_org) = OrganizationRepository::get_by_slug(&mut tx, "default")
+        .await
+        .map_err(|_| ProblemDetails::internal_server_error(Some("/api/v1/programs".into())))?
+    {
+        def_org.id
+    } else {
+        let first_org_opt: Option<Uuid> =
+            sqlx::query_scalar("SELECT organization_id FROM organizations LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| {
+                    ProblemDetails::internal_server_error(Some("/api/v1/programs".into()))
+                })?;
+        match first_org_opt {
+            Some(u) => OrganizationId::from_uuid(u),
+            None => {
+                return Err(ProblemDetails::bad_request(
+                    "No organization exists or organization_id is required",
+                    Some("/api/v1/programs".into()),
+                ));
+            }
+        }
+    };
+
     let idemp_key = headers
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
@@ -233,11 +283,15 @@ pub async fn create_program_handler(
     let idemp_store = PostgresIdempotencyStore::new();
 
     let record_id_opt = if let Some(ref key) = idemp_key {
+        let key_hash =
+            IdempotencyCoordinator::compute_key_hash(&state.config.session.active_hmac_secret, key);
         match IdempotencyCoordinator::evaluate_key(
             &mut tx,
             &idemp_store,
             None,
-            key,
+            principal.id,
+            "PROGRAM_CREATE",
+            &key_hash,
             &req_hash,
             86400,
         )
@@ -277,13 +331,10 @@ pub async fn create_program_handler(
     };
 
     // 3. Domain validation & Conflict check
-    if let Some(_existing) = ProgramRepository::get_by_organization_and_slug(
-        &mut tx,
-        principal.organization_id,
-        &payload.slug,
-    )
-    .await
-    .map_err(|_| ProblemDetails::internal_server_error(Some("/api/v1/programs".into())))?
+    if let Some(_existing) =
+        ProgramRepository::get_by_organization_and_slug(&mut tx, org_id, &payload.slug)
+            .await
+            .map_err(|_| ProblemDetails::internal_server_error(Some("/api/v1/programs".into())))?
     {
         return Err(ProblemDetails::conflict(
             format!(
@@ -294,13 +345,8 @@ pub async fn create_program_handler(
         ));
     }
 
-    let program = Program::new(
-        principal.organization_id,
-        payload.name,
-        payload.slug,
-        payload.description,
-    )
-    .map_err(|e| ProblemDetails::bad_request(e.to_string(), Some("/api/v1/programs".into())))?;
+    let program = Program::new(org_id, payload.name, payload.slug)
+        .map_err(|e| ProblemDetails::bad_request(e.to_string(), Some("/api/v1/programs".into())))?;
 
     ProgramRepository::insert(&mut tx, &program)
         .await
@@ -326,7 +372,6 @@ pub async fn create_program_handler(
             &idemp_store,
             record_id,
             StatusCode::CREATED.as_u16(),
-            None,
             resp_body,
         )
         .await
@@ -397,12 +442,38 @@ pub async fn get_program_handler(
             )
         })?;
 
-    // Privacy-safe tenant boundary isolation: foreign program returns 404 Not Found
-    if program.organization_id != principal.organization_id {
-        return Err(ProblemDetails::not_found(
-            format!("Program '{}' was not found", program_id_str),
-            Some(format!("/api/v1/programs/{program_id_str}")),
-        ));
+    // Privacy-safe tenant boundary isolation: if program has workspaces, caller must be a member or grantee
+    let has_workspaces: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM workspaces WHERE program_id = $1)")
+            .bind(program_uuid)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or(false);
+
+    if has_workspaces {
+        let has_member: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM workspaces w
+                 JOIN memberships m ON w.workspace_id = m.workspace_id
+                 WHERE w.program_id = $1 AND m.principal_id = $2
+             ) OR EXISTS (
+                 SELECT 1 FROM capability_grants cg
+                 WHERE (cg.program_id = $1 OR cg.workspace_id IN (SELECT workspace_id FROM workspaces WHERE program_id = $1))
+                   AND cg.principal_id = $2
+             )",
+        )
+        .bind(program_uuid)
+        .bind(principal.id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap_or(false);
+
+        if !has_member {
+            return Err(ProblemDetails::not_found(
+                format!("Program '{}' was not found", program_id_str),
+                Some(format!("/api/v1/programs/{program_id_str}")),
+            ));
+        }
     }
 
     tx.commit().await.map_err(|_| {

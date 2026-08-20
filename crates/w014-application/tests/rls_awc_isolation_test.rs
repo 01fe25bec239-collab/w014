@@ -34,7 +34,7 @@ use w014_authz::capability::Capability;
 use w014_authz::error::AuthzError;
 use w014_domain::membership::MembershipRole;
 use w014_domain::organization::Organization;
-use w014_domain::principal::{Principal, PrincipalType};
+use w014_domain::principal::Principal;
 use w014_domain::program::Program;
 use w014_domain::workspace::Workspace;
 use w014_persistence::audit::{AppendAuditParams, AuditAppendContract, PostgresAuditStore};
@@ -76,27 +76,9 @@ async fn setup_test_fixture() -> TestFixture {
         .unwrap();
 
     // Principals
-    let alice_admin = Principal::new(
-        org_a.id,
-        PrincipalType::User,
-        Some("alice@org-a.com"),
-        "Alice Admin",
-    )
-    .unwrap();
-    let bob_viewer = Principal::new(
-        org_a.id,
-        PrincipalType::User,
-        Some("bob@org-a.com"),
-        "Bob Viewer",
-    )
-    .unwrap();
-    let charlie_foreign = Principal::new(
-        org_b.id,
-        PrincipalType::User,
-        Some("charlie@org-b.com"),
-        "Charlie Foreign",
-    )
-    .unwrap();
+    let alice_admin = Principal::new("Alice Admin", Some("alice@org-a.com")).unwrap();
+    let bob_viewer = Principal::new("Bob Viewer", Some("bob@org-a.com")).unwrap();
+    let charlie_foreign = Principal::new("Charlie Foreign", Some("charlie@org-b.com")).unwrap();
 
     PrincipalRepository::insert(&mut tx, &alice_admin)
         .await
@@ -109,8 +91,8 @@ async fn setup_test_fixture() -> TestFixture {
         .unwrap();
 
     // Programs
-    let prog_a = Program::new(org_a.id, "Prog A", "prog-a", None::<&str>).unwrap();
-    let prog_b = Program::new(org_b.id, "Prog B", "prog-b", None::<&str>).unwrap();
+    let prog_a = Program::new(org_a.id, "Prog A", "prog-a").unwrap();
+    let prog_b = Program::new(org_b.id, "Prog B", "prog-b").unwrap();
     ProgramRepository::insert(&mut tx, &prog_a).await.unwrap();
     ProgramRepository::insert(&mut tx, &prog_b).await.unwrap();
 
@@ -138,7 +120,7 @@ async fn setup_test_fixture() -> TestFixture {
         &audit_store,
         ws_a.id,
         bob_viewer.id,
-        MembershipRole::Viewer,
+        MembershipRole::Reader,
         Some(alice_admin.id),
         Some("setup-bob".to_string()),
     )
@@ -150,7 +132,7 @@ async fn setup_test_fixture() -> TestFixture {
         &audit_store,
         ws_b.id,
         charlie_foreign.id,
-        MembershipRole::Owner,
+        MembershipRole::Admin,
         Some(charlie_foreign.id),
         Some("setup-charlie".to_string()),
     )
@@ -188,13 +170,20 @@ async fn setup_test_fixture() -> TestFixture {
             &mut tx,
             AppendAuditParams {
                 workspace_id: ws_a.id.into_uuid(),
-                event_type: "ws.init".to_string(),
-                actor_principal_id: Some(alice_admin.id.into_uuid()),
-                action: "INIT".to_string(),
-                resource_type: "workspace".to_string(),
-                resource_id: ws_a.id.to_string(),
-                payload: json!({"name": "ws_a"}),
+                actor_type: "principal".to_string(),
+                actor_id: Some(alice_admin.id.into_uuid()),
+                authority_snapshot: json!({}),
+                action_code: "INIT".to_string(),
+                entity_type: "workspace".to_string(),
+                entity_id: ws_a.id.to_string(),
+                entity_version: Some(1),
+                request_id: None,
                 correlation_id: Some("corr-a".to_string()),
+                job_id: None,
+                source_state_hash: None,
+                before_ref: None,
+                after_ref: Some(json!({"name": "ws_a"})),
+                metadata: json!({}),
             },
         )
         .await
@@ -205,13 +194,20 @@ async fn setup_test_fixture() -> TestFixture {
             &mut tx,
             AppendAuditParams {
                 workspace_id: ws_b.id.into_uuid(),
-                event_type: "ws.init".to_string(),
-                actor_principal_id: Some(charlie_foreign.id.into_uuid()),
-                action: "INIT".to_string(),
-                resource_type: "workspace".to_string(),
-                resource_id: ws_b.id.to_string(),
-                payload: json!({"name": "ws_b"}),
+                actor_type: "principal".to_string(),
+                actor_id: Some(charlie_foreign.id.into_uuid()),
+                authority_snapshot: json!({}),
+                action_code: "INIT".to_string(),
+                entity_type: "workspace".to_string(),
+                entity_id: ws_b.id.to_string(),
+                entity_version: Some(1),
+                request_id: None,
                 correlation_id: Some("corr-b".to_string()),
+                job_id: None,
+                source_state_hash: None,
+                before_ref: None,
+                after_ref: Some(json!({"name": "ws_b"})),
+                metadata: json!({}),
             },
         )
         .await
@@ -219,14 +215,16 @@ async fn setup_test_fixture() -> TestFixture {
 
     // Insert Idempotency records in WS A & WS B
     sqlx::query(
-        "INSERT INTO idempotency_records (id, workspace_id, idempotency_key, request_hash, status, expires_at)
-         VALUES ($1, $2, 'idemp-a', '1111111111111111111111111111111111111111111111111111111111111111', 'completed', CURRENT_TIMESTAMP + INTERVAL '1 hour'),
-                ($3, $4, 'idemp-b', '2222222222222222222222222222222222222222222222222222222222222222', 'completed', CURRENT_TIMESTAMP + INTERVAL '1 hour')"
+        "INSERT INTO idempotency_records (idempotency_record_id, workspace_id, principal_id, route_code, key_hash, request_hash, expires_at)
+         VALUES ($1, $2, $3, 'test_route', '\\x1111111111111111111111111111111111111111111111111111111111111111'::bytea, '\\x1111111111111111111111111111111111111111111111111111111111111111'::bytea, CURRENT_TIMESTAMP + INTERVAL '1 hour'),
+                ($4, $5, $6, 'test_route', '\\x2222222222222222222222222222222222222222222222222222222222222222'::bytea, '\\x2222222222222222222222222222222222222222222222222222222222222222'::bytea, CURRENT_TIMESTAMP + INTERVAL '1 hour')"
     )
     .bind(Uuid::new_v4())
     .bind(ws_a.id.as_uuid())
+    .bind(alice_admin.id.as_uuid())
     .bind(Uuid::new_v4())
     .bind(ws_b.id.as_uuid())
+    .bind(charlie_foreign.id.as_uuid())
     .execute(&mut *tx)
     .await
     .unwrap();
@@ -300,16 +298,16 @@ async fn test_rust_authz_before_rls_context_prevents_db_access() {
     let pool = f.test_db.pool();
     let now = Utc::now();
 
-    // Resolve AWC for Bob (Viewer in WS A)
+    // Resolve AWC for Bob (Reader in WS A)
     let mut setup_tx = pool.begin().await.unwrap();
     let awc_bob = WorkspaceAuthzResolver::resolve(&mut setup_tx, f.ws_a.id, f.bob_viewer.id, now)
         .await
         .unwrap();
     setup_tx.commit().await.unwrap();
 
-    assert_eq!(awc_bob.membership_role(), MembershipRole::Viewer);
+    assert_eq!(awc_bob.membership_role(), MembershipRole::Reader);
     assert!(awc_bob.can_read_workspace());
-    assert!(!awc_bob.can_write_workspace()); // Viewer lacks write
+    assert!(!awc_bob.can_write_workspace()); // Reader lacks write
 
     // 1. Attempt to execute an operation requiring WORKSPACE_WRITE
     let options = WorkspaceTxOptions::new()
@@ -442,7 +440,7 @@ async fn test_missing_context_fail_closed() {
         .await
         .unwrap();
 
-    let ws_rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+    let ws_rows: Vec<Uuid> = sqlx::query_scalar("SELECT workspace_id FROM workspaces")
         .fetch_all(&mut *tx)
         .await
         .unwrap();
@@ -451,7 +449,7 @@ async fn test_missing_context_fail_closed() {
         "workspaces query must return 0 rows when context is unset"
     );
 
-    let member_rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM memberships")
+    let member_rows: Vec<Uuid> = sqlx::query_scalar("SELECT membership_id FROM memberships")
         .fetch_all(&mut *tx)
         .await
         .unwrap();
@@ -460,10 +458,11 @@ async fn test_missing_context_fail_closed() {
         "memberships query must return 0 rows when context is unset"
     );
 
-    let grant_rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM capability_grants")
-        .fetch_all(&mut *tx)
-        .await
-        .unwrap();
+    let grant_rows: Vec<Uuid> =
+        sqlx::query_scalar("SELECT capability_grant_id FROM capability_grants")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
     assert!(
         grant_rows.is_empty(),
         "capability_grants query must return 0 rows when context is unset"
@@ -478,7 +477,7 @@ async fn test_missing_context_fail_closed() {
         "audit_chain_heads query must return 0 rows when context is unset"
     );
 
-    let audit_events: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM audit_events")
+    let audit_events: Vec<Uuid> = sqlx::query_scalar("SELECT audit_event_id FROM audit_events")
         .fetch_all(&mut *tx)
         .await
         .unwrap();
@@ -489,7 +488,7 @@ async fn test_missing_context_fail_closed() {
 
     // 2. Inserting under w014_app without context fails RLS WITH CHECK policy
     let bad_insert = sqlx::query(
-        "INSERT INTO memberships (id, workspace_id, principal_id, role) VALUES ($1, $2, $3, 'viewer')"
+        "INSERT INTO memberships (membership_id, workspace_id, principal_id, role_code) VALUES ($1, $2, $3, 'reader')"
     )
     .bind(Uuid::new_v4())
     .bind(f.ws_a.id.as_uuid())
@@ -630,10 +629,11 @@ async fn test_pool_context_isolation_across_connection_reuse() {
         let ctx2 = get_current_workspace_id(&mut tx2).await.unwrap();
         assert_eq!(ctx2, None, "Reused connection must NOT retain WS A context");
 
-        let visible_workspaces: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
-            .fetch_all(&mut *tx2)
-            .await
-            .unwrap();
+        let visible_workspaces: Vec<Uuid> =
+            sqlx::query_scalar("SELECT workspace_id FROM workspaces")
+                .fetch_all(&mut *tx2)
+                .await
+                .unwrap();
         assert!(
             visible_workspaces.is_empty(),
             "Reused connection without context must NOT see WS A rows"
@@ -666,10 +666,11 @@ async fn test_pool_context_isolation_across_connection_reuse() {
             "Reused connection after rollback must NOT retain context"
         );
 
-        let visible_memberships: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM memberships")
-            .fetch_all(&mut *tx4)
-            .await
-            .unwrap();
+        let visible_memberships: Vec<Uuid> =
+            sqlx::query_scalar("SELECT membership_id FROM memberships")
+                .fetch_all(&mut *tx4)
+                .await
+                .unwrap();
         assert!(
             visible_memberships.is_empty(),
             "Reused connection after rollback must NOT see rows"
@@ -706,11 +707,12 @@ async fn test_cross_workspace_idor_read_mutation_inference_denied() {
     let tx = ws_tx.conn();
 
     // 1.1 Direct lookup of WS B workspace record
-    let ws_b_lookup: Option<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces WHERE id = $1")
-        .bind(f.ws_b.id.as_uuid())
-        .fetch_optional(&mut *tx)
-        .await
-        .unwrap();
+    let ws_b_lookup: Option<Uuid> =
+        sqlx::query_scalar("SELECT workspace_id FROM workspaces WHERE workspace_id = $1")
+            .bind(f.ws_b.id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .unwrap();
     assert!(
         ws_b_lookup.is_none(),
         "CROSS_WORKSPACE_READ: WS B record must be hidden from WS A"
@@ -718,7 +720,7 @@ async fn test_cross_workspace_idor_read_mutation_inference_denied() {
 
     // 1.2 Direct lookup of WS B memberships
     let member_b_lookup: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM memberships WHERE workspace_id = $1")
+        sqlx::query_scalar("SELECT membership_id FROM memberships WHERE workspace_id = $1")
             .bind(f.ws_b.id.as_uuid())
             .fetch_optional(&mut *tx)
             .await
@@ -729,12 +731,13 @@ async fn test_cross_workspace_idor_read_mutation_inference_denied() {
     );
 
     // 1.3 Direct lookup of WS B capability grants
-    let grant_b_lookup: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM capability_grants WHERE workspace_id = $1")
-            .bind(f.ws_b.id.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await
-            .unwrap();
+    let grant_b_lookup: Option<Uuid> = sqlx::query_scalar(
+        "SELECT capability_grant_id FROM capability_grants WHERE workspace_id = $1",
+    )
+    .bind(f.ws_b.id.as_uuid())
+    .fetch_optional(&mut *tx)
+    .await
+    .unwrap();
     assert!(
         grant_b_lookup.is_none(),
         "CROSS_WORKSPACE_READ: WS B capability grants must be hidden"
@@ -754,7 +757,7 @@ async fn test_cross_workspace_idor_read_mutation_inference_denied() {
 
     // 1.5 Direct lookup of WS B audit events
     let event_b_lookup: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM audit_events WHERE workspace_id = $1")
+        sqlx::query_scalar("SELECT audit_event_id FROM audit_events WHERE workspace_id = $1")
             .bind(f.ws_b.id.as_uuid())
             .fetch_optional(&mut *tx)
             .await
@@ -765,12 +768,13 @@ async fn test_cross_workspace_idor_read_mutation_inference_denied() {
     );
 
     // 1.6 Direct lookup of WS B idempotency records
-    let idemp_b_lookup: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM idempotency_records WHERE workspace_id = $1")
-            .bind(f.ws_b.id.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await
-            .unwrap();
+    let idemp_b_lookup: Option<Uuid> = sqlx::query_scalar(
+        "SELECT idempotency_record_id FROM idempotency_records WHERE workspace_id = $1",
+    )
+    .bind(f.ws_b.id.as_uuid())
+    .fetch_optional(&mut *tx)
+    .await
+    .unwrap();
     assert!(
         idemp_b_lookup.is_none(),
         "CROSS_WORKSPACE_READ: WS B idempotency records must be hidden"
@@ -829,7 +833,7 @@ async fn test_cross_workspace_idor_read_mutation_inference_denied() {
         .unwrap();
 
         let bad_mem_insert = sqlx::query(
-            "INSERT INTO memberships (id, workspace_id, principal_id, role) VALUES ($1, $2, $3, 'member')"
+            "INSERT INTO memberships (membership_id, workspace_id, principal_id, role_code) VALUES ($1, $2, $3, 'operator')"
         )
         .bind(Uuid::new_v4())
         .bind(f.ws_b.id.as_uuid())
@@ -857,7 +861,7 @@ async fn test_cross_workspace_idor_read_mutation_inference_denied() {
         .unwrap();
 
         let bad_grant_insert = sqlx::query(
-            "INSERT INTO capability_grants (id, workspace_id, principal_id, capability) VALUES ($1, $2, $3, 'WORKSPACE_ADMIN')"
+            "INSERT INTO capability_grants (capability_grant_id, workspace_id, principal_id, capability) VALUES ($1, $2, $3, 'WORKSPACE_ADMIN')"
         )
         .bind(Uuid::new_v4())
         .bind(f.ws_b.id.as_uuid())
@@ -885,8 +889,8 @@ async fn test_cross_workspace_idor_read_mutation_inference_denied() {
         .unwrap();
 
         let bad_event_insert = sqlx::query(
-            "INSERT INTO audit_events (id, workspace_id, sequence_num, previous_event_hash, event_hash, event_type, action, resource_type, resource_id)
-             VALUES ($1, $2, 99, '0000000000000000000000000000000000000000000000000000000000000000', '0000000000000000000000000000000000000000000000000000000000000000', 'fake', 'fake', 'fake', 'fake')"
+            "INSERT INTO audit_events (audit_event_id, workspace_id, sequence, previous_event_hash, event_hash, actor_type, authority_snapshot, action_code, entity_type, entity_id, metadata)
+             VALUES ($1, $2, 99, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 'principal', '{}'::jsonb, 'FAKE_ACTION', 'fake', 'fake', '{}'::jsonb)"
         )
         .bind(Uuid::new_v4())
         .bind(f.ws_b.id.as_uuid())
@@ -907,20 +911,18 @@ async fn test_privacy_safe_unauthorized_behavior() {
     let pool = f.test_db.pool();
     let now = Utc::now();
 
-    // Alice (in Org A) attempts to resolve AWC for Workspace B (in Org B)
+    // Alice attempts to resolve AWC for Workspace B (Alice is not a member of Workspace B)
     let mut tx = pool.begin().await.unwrap();
     let resolve_foreign =
         WorkspaceAuthzResolver::resolve(&mut tx, f.ws_b.id, f.alice_admin.id, now).await;
 
-    // Must fail closed with TenantBoundaryMismatch or NoMembership without revealing Org B details
+    // Must fail closed with NoMembership without revealing Org B details
     assert!(
         matches!(
             resolve_foreign,
-            Err(ApplicationError::Authz(AuthzError::TenantBoundaryMismatch(
-                _
-            ))) | Err(ApplicationError::Authz(AuthzError::NoMembership { .. }))
+            Err(ApplicationError::Authz(AuthzError::NoMembership { .. }))
         ),
-        "Resolving foreign workspace must fail closed"
+        "Resolving foreign workspace without membership must fail closed"
     );
 
     tx.rollback().await.unwrap();
@@ -935,7 +937,7 @@ async fn test_composite_fk_rejection_at_database_boundary() {
 
     // Attempt to create a workspace pointing to Program A but Organization B
     let bad_ws = sqlx::query(
-        "INSERT INTO workspaces (id, program_id, organization_id, name, slug) VALUES ($1, $2, $3, 'Bad WS', 'bad-ws')"
+        "INSERT INTO workspaces (workspace_id, program_id, organization_id, workspace_code, name) VALUES ($1, $2, $3, 'bad-ws', 'Bad WS')"
     )
     .bind(Uuid::new_v4())
     .bind(f.prog_a.id.as_uuid()) // Org A
@@ -961,8 +963,8 @@ async fn test_staged_fk_and_boundaries_preserved() {
     // 1. Verify workspaces.current_source_state_id is nullable and has NO FK constraint to effective_contract_states
     let random_state_id = Uuid::new_v4();
     let ws_with_random_state = sqlx::query(
-        "INSERT INTO workspaces (id, program_id, organization_id, name, slug, current_source_state_id)
-         VALUES ($1, $2, $3, 'Staged WS', 'staged-ws', $4)"
+        "INSERT INTO workspaces (workspace_id, program_id, organization_id, workspace_code, name, current_source_state_id)
+         VALUES ($1, $2, $3, 'staged-ws', 'Staged WS', $4)"
     )
     .bind(Uuid::new_v4())
     .bind(f.prog_a.id.as_uuid())
@@ -979,8 +981,8 @@ async fn test_staged_fk_and_boundaries_preserved() {
     // 2. Verify audit_events.job_id is nullable and has NO FK constraint to jobs
     let random_job_id = Uuid::new_v4();
     let event_with_random_job = sqlx::query(
-        "INSERT INTO audit_events (id, workspace_id, sequence_num, previous_event_hash, event_hash, event_type, action, resource_type, resource_id, job_id)
-         VALUES ($1, $2, 9999, '0000000000000000000000000000000000000000000000000000000000000000', '0000000000000000000000000000000000000000000000000000000000000000', 'staged.test', 'CREATE', 'test', 'test-1', $3)"
+        "INSERT INTO audit_events (audit_event_id, workspace_id, sequence, previous_event_hash, event_hash, actor_type, authority_snapshot, action_code, entity_type, entity_id, metadata, job_id)
+         VALUES ($1, $2, 9999, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 'principal', '{}'::jsonb, 'STAGED_TEST', 'test', 'test-1', '{}'::jsonb, $3)"
     )
     .bind(Uuid::new_v4())
     .bind(f.ws_a.id.as_uuid())

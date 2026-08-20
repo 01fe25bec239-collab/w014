@@ -23,6 +23,7 @@ use chrono::{Duration, Utc};
 use http_body_util::BodyExt;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -48,7 +49,7 @@ use w014_authz::grant::CapabilityGrant;
 use w014_domain::ids::{OrganizationId, PrincipalId, WorkspaceId};
 use w014_domain::membership::{Membership, MembershipRole};
 use w014_domain::organization::Organization;
-use w014_domain::principal::{Principal, PrincipalType};
+use w014_domain::principal::Principal;
 use w014_domain::program::Program;
 use w014_domain::workspace::Workspace;
 use w014_persistence::harness::TestDatabase;
@@ -202,12 +203,12 @@ async fn create_org(db: &TestDatabase, name: &str, slug: &str) -> Organization {
 
 async fn create_principal(
     db: &TestDatabase,
-    org_id: OrganizationId,
+    _org_id: OrganizationId,
     email: &str,
     display_name: &str,
 ) -> Principal {
     let mut tx = db.pool().begin().await.unwrap();
-    let principal = Principal::new(org_id, PrincipalType::User, Some(email), display_name).unwrap();
+    let principal = Principal::new(display_name, Some(email)).unwrap();
     PrincipalRepository::insert(&mut tx, &principal)
         .await
         .unwrap();
@@ -296,12 +297,13 @@ async fn test_security_gate_oidc_pkce_state_nonce_and_callback() {
 
     // Update the stored transaction's nonce to match mock IdP's deterministic nonce for code 'code1'
     {
+        let state_hash = Sha256::digest(state.as_bytes()).to_vec();
         let mut tx = db.pool().begin().await.unwrap();
-        let mut stored_tx = OidcTransactionRepository::get_by_state_token(&mut tx, &state)
+        let mut stored_tx = OidcTransactionRepository::get_by_state_hash(&mut tx, &state_hash)
             .await
             .unwrap()
             .unwrap();
-        stored_tx.nonce = "nonce-for-code1".to_string();
+        stored_tx.nonce_hash = Sha256::digest(b"nonce-for-code1").to_vec();
         OidcTransactionRepository::delete_by_id(&mut tx, stored_tx.id)
             .await
             .unwrap();
@@ -446,10 +448,12 @@ async fn test_security_gate_csrf_exhaustive_negative_matrix_and_fail_closed() {
     });
 
     let count_programs = || async {
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM programs WHERE slug = 'target-program'")
-            .fetch_one(db.pool())
-            .await
-            .unwrap()
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM programs WHERE program_code = 'target-program'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
     };
 
     let count_audit_events = || async {
@@ -605,7 +609,7 @@ async fn test_security_gate_capability_authorization_and_special_authority_separ
     // Create Program and Workspace
     let program = {
         let mut tx = db.pool().begin().await.unwrap();
-        let p = Program::new(org.id, "Authz Program", "authz-prog", None::<&str>).unwrap();
+        let p = Program::new(org.id, "Authz Program", "authz-prog").unwrap();
         ProgramRepository::insert(&mut tx, &p).await.unwrap();
         tx.commit().await.unwrap();
         p
@@ -635,7 +639,7 @@ async fn test_security_gate_capability_authorization_and_special_authority_separ
             .await
             .unwrap();
 
-        let m_reg = Membership::new(workspace.id, regular_user.id, MembershipRole::Member);
+        let m_reg = Membership::new(workspace.id, regular_user.id, MembershipRole::Operator);
         MembershipRepository::insert(&mut tx, &m_reg).await.unwrap();
 
         // Grant GRANT_AUTHORITY to granter_user
@@ -762,7 +766,7 @@ async fn test_security_gate_forced_rls_awc_context_and_pool_isolation() {
     // Create Workspace A and Workspace B
     let ws_a = {
         let mut tx = db.pool().begin().await.unwrap();
-        let p = Program::new(org_a.id, "Prog A", "prog-a", None::<&str>).unwrap();
+        let p = Program::new(org_a.id, "Prog A", "prog-a").unwrap();
         ProgramRepository::insert(&mut tx, &p).await.unwrap();
         let w = Workspace::new(p.id, org_a.id, "Workspace A", "ws-a").unwrap();
         WorkspaceRepository::insert(&mut tx, &w).await.unwrap();
@@ -774,7 +778,7 @@ async fn test_security_gate_forced_rls_awc_context_and_pool_isolation() {
 
     let ws_b = {
         let mut tx = db.pool().begin().await.unwrap();
-        let p = Program::new(org_b.id, "Prog B", "prog-b", None::<&str>).unwrap();
+        let p = Program::new(org_b.id, "Prog B", "prog-b").unwrap();
         ProgramRepository::insert(&mut tx, &p).await.unwrap();
         let w = Workspace::new(p.id, org_b.id, "Workspace B", "ws-b").unwrap();
         WorkspaceRepository::insert(&mut tx, &w).await.unwrap();
@@ -876,7 +880,7 @@ async fn test_security_gate_composite_fk_and_db_boundary_isolation() {
 
     let ws_a = {
         let mut tx = db.pool().begin().await.unwrap();
-        let p = Program::new(org_a.id, "Prog FK A", "prog-fk-a", None::<&str>).unwrap();
+        let p = Program::new(org_a.id, "Prog FK A", "prog-fk-a").unwrap();
         ProgramRepository::insert(&mut tx, &p).await.unwrap();
         let w = Workspace::new(p.id, org_a.id, "Workspace FK A", "ws-fk-a").unwrap();
         WorkspaceRepository::insert(&mut tx, &w).await.unwrap();
@@ -886,7 +890,7 @@ async fn test_security_gate_composite_fk_and_db_boundary_isolation() {
 
     let ws_b = {
         let mut tx = db.pool().begin().await.unwrap();
-        let p = Program::new(org_b.id, "Prog FK B", "prog-fk-b", None::<&str>).unwrap();
+        let p = Program::new(org_b.id, "Prog FK B", "prog-fk-b").unwrap();
         ProgramRepository::insert(&mut tx, &p).await.unwrap();
         let w = Workspace::new(p.id, org_b.id, "Workspace FK B", "ws-fk-b").unwrap();
         WorkspaceRepository::insert(&mut tx, &w).await.unwrap();
@@ -903,7 +907,7 @@ async fn test_security_gate_composite_fk_and_db_boundary_isolation() {
     set_session_workspace_id(&mut tx, ws_a.id.0).await.unwrap();
 
     let invalid_grant_result = sqlx::query(
-        "INSERT INTO capability_grants (id, workspace_id, principal_id, capability, granted_by_principal_id)
+        "INSERT INTO capability_grants (capability_grant_id, workspace_id, principal_id, capability_code, granted_by_principal_id)
          VALUES ($1, $2, $3, 'OVERRIDE_BLOCK', $4)",
     )
     .bind(Uuid::new_v4())
@@ -940,13 +944,7 @@ async fn test_security_gate_sec003_idor_and_privacy_safe_responses() {
 
     let (prog_b, ws_b) = {
         let mut tx = db.pool().begin().await.unwrap();
-        let p = Program::new(
-            org_b.id,
-            "Top Secret Beta Project",
-            "top-secret-beta",
-            Some("Highly confidential"),
-        )
-        .unwrap();
+        let p = Program::new(org_b.id, "Top Secret Beta Project", "top-secret-beta").unwrap();
         ProgramRepository::insert(&mut tx, &p).await.unwrap();
         let w = Workspace::new(
             p.id,
@@ -1210,7 +1208,7 @@ async fn test_security_gate_privileged_command_atomicity_idempotency_and_audit_i
     // 4. Privileged Command E13: CreateMembership
     let mem_payload = json!({
         "principal_id": target_user.id.to_string(),
-        "role": "member",
+        "role": "operator",
     });
     let idemp_mem = "idemp-audit-mem-001";
 
@@ -1274,10 +1272,10 @@ async fn test_security_gate_privileged_command_atomicity_idempotency_and_audit_i
     // 7. Verify Authoritative Cryptographic Audit Hash Chain Integrity
     let mut conn = db.pool().acquire().await.unwrap();
     let rows = sqlx::query(
-        "SELECT sequence_num, event_type, previous_event_hash, event_hash
+        "SELECT sequence, action_code, previous_event_hash, event_hash
          FROM audit_events
          WHERE workspace_id = $1
-         ORDER BY sequence_num ASC",
+         ORDER BY sequence ASC",
     )
     .bind(ws_id)
     .fetch_all(&mut *conn)
@@ -1286,22 +1284,22 @@ async fn test_security_gate_privileged_command_atomicity_idempotency_and_audit_i
 
     assert!(!rows.is_empty(), "Audit events must be recorded");
 
-    let mut expected_prev_hash: Option<String> = None;
+    let mut expected_prev_hash: Option<Vec<u8>> = None;
 
     for (idx, row) in rows.iter().enumerate() {
-        let seq: i64 = row.get("sequence_num");
+        let seq: i64 = row.get("sequence");
         assert_eq!(
             seq,
             (idx + 1) as i64,
             "Sequence numbers must be strictly sequential 1, 2, 3..."
         );
 
-        let prev_hash: Option<String> = row.get("previous_event_hash");
-        let event_hash: String = row.get("event_hash");
+        let prev_hash: Option<Vec<u8>> = row.get("previous_event_hash");
+        let event_hash: Vec<u8> = row.get("event_hash");
 
         if idx == 0 {
             // Genesis event
-            assert!(prev_hash.is_some());
+            assert!(prev_hash.is_none() || prev_hash.as_deref() == Some(&[0u8; 32]));
         } else {
             assert_eq!(
                 prev_hash, expected_prev_hash,
@@ -1314,15 +1312,15 @@ async fn test_security_gate_privileged_command_atomicity_idempotency_and_audit_i
 
     // Verify Chain Head consistency
     let head = sqlx::query(
-        "SELECT head_sequence_num, head_event_hash FROM audit_chain_heads WHERE workspace_id = $1",
+        "SELECT last_sequence, last_event_hash FROM audit_chain_heads WHERE workspace_id = $1",
     )
     .bind(ws_id)
     .fetch_one(&mut *conn)
     .await
     .unwrap();
 
-    let head_seq: i64 = head.get("head_sequence_num");
-    let head_hash: String = head.get("head_event_hash");
+    let head_seq: i64 = head.get("last_sequence");
+    let head_hash: Vec<u8> = head.get("last_event_hash");
 
     assert_eq!(head_seq, rows.len() as i64);
     assert_eq!(Some(head_hash), expected_prev_hash);
@@ -1344,7 +1342,7 @@ async fn test_security_gate_staged_fk_boundaries_and_absence_of_w2_w3_surfaces()
 
     let ws = {
         let mut tx = db.pool().begin().await.unwrap();
-        let p = Program::new(org.id, "Prog Boundary", "prog-b", None::<&str>).unwrap();
+        let p = Program::new(org.id, "Prog Boundary", "prog-b").unwrap();
         ProgramRepository::insert(&mut tx, &p).await.unwrap();
         let w = Workspace::new(p.id, org.id, "WS Boundary", "ws-b").unwrap();
         WorkspaceRepository::insert(&mut tx, &w).await.unwrap();

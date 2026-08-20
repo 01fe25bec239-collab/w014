@@ -20,11 +20,10 @@ use w014_domain::membership::MembershipRole;
 #[test]
 fn test_base_role_capability_matrix() {
     let roles = [
-        MembershipRole::Owner,
         MembershipRole::Admin,
-        MembershipRole::Member,
-        MembershipRole::Viewer,
-        MembershipRole::Auditor,
+        MembershipRole::Operator,
+        MembershipRole::Reviewer,
+        MembershipRole::Reader,
     ];
 
     // Standard capabilities
@@ -73,35 +72,29 @@ fn test_base_role_capability_matrix() {
         );
 
         match role {
-            MembershipRole::Owner => {
-                assert!(caps.contains(&ws_admin));
-                assert!(caps.contains(&ws_read));
-                assert!(caps.contains(&ws_write));
-                assert!(caps.contains(&audit_read));
-            }
             MembershipRole::Admin => {
                 assert!(caps.contains(&ws_admin));
                 assert!(caps.contains(&ws_read));
                 assert!(caps.contains(&ws_write));
                 assert!(caps.contains(&audit_read));
             }
-            MembershipRole::Member => {
+            MembershipRole::Operator => {
                 assert!(!caps.contains(&ws_admin));
                 assert!(caps.contains(&ws_read));
                 assert!(caps.contains(&ws_write));
                 assert!(!caps.contains(&audit_read));
             }
-            MembershipRole::Viewer => {
-                assert!(!caps.contains(&ws_admin));
-                assert!(caps.contains(&ws_read));
-                assert!(!caps.contains(&ws_write));
-                assert!(!caps.contains(&audit_read));
-            }
-            MembershipRole::Auditor => {
+            MembershipRole::Reviewer => {
                 assert!(!caps.contains(&ws_admin));
                 assert!(caps.contains(&ws_read));
                 assert!(!caps.contains(&ws_write));
                 assert!(caps.contains(&audit_read));
+            }
+            MembershipRole::Reader => {
+                assert!(!caps.contains(&ws_admin));
+                assert!(caps.contains(&ws_read));
+                assert!(!caps.contains(&ws_write));
+                assert!(!caps.contains(&audit_read));
             }
         }
     }
@@ -115,7 +108,7 @@ fn test_matrix_with_dynamic_grants() {
     let ws_id = WorkspaceId::new();
     let now = Utc::now();
 
-    // 1. Viewer with explicit WorkspaceWrite grant
+    // 1. Reader with explicit WorkspaceWrite grant
     let grant_write = CapabilityGrant::new(
         ws_id,
         p_id,
@@ -130,7 +123,7 @@ fn test_matrix_with_dynamic_grants() {
         org_id,
         prog_id,
         ws_id,
-        MembershipRole::Viewer,
+        MembershipRole::Reader,
         vec![grant_write],
         now,
     );
@@ -140,7 +133,7 @@ fn test_matrix_with_dynamic_grants() {
     assert!(!ctx.can_admin_workspace()); // not granted
     assert!(!ctx.can_read_audit()); // not granted
 
-    // 2. Member with explicit AuditRead grant
+    // 2. Operator with explicit AuditRead grant
     let grant_audit = CapabilityGrant::new(
         ws_id,
         p_id,
@@ -155,7 +148,7 @@ fn test_matrix_with_dynamic_grants() {
         org_id,
         prog_id,
         ws_id,
-        MembershipRole::Member,
+        MembershipRole::Operator,
         vec![grant_audit],
         now,
     );
@@ -165,7 +158,7 @@ fn test_matrix_with_dynamic_grants() {
     assert!(ctx2.can_read_audit()); // granted
     assert!(!ctx2.can_admin_workspace());
 
-    // 3. Auditor with custom named capability grant
+    // 3. Reviewer with custom named capability grant
     let custom_cap = Capability::Named("REPORTS:EXPORT".to_string());
     let grant_custom = CapabilityGrant::new(
         ws_id,
@@ -181,7 +174,7 @@ fn test_matrix_with_dynamic_grants() {
         org_id,
         prog_id,
         ws_id,
-        MembershipRole::Auditor,
+        MembershipRole::Reviewer,
         vec![grant_custom],
         now,
     );
@@ -203,12 +196,16 @@ fn test_matrix_expired_and_revoked_grants_deny() {
     // Expired grant
     let expired_grant = CapabilityGrant::reconstruct(
         w014_authz::CapabilityGrantId::new(),
-        ws_id,
+        Some(ws_id),
+        None,
         p_id,
         Capability::WorkspaceWrite,
         None,
         now - Duration::hours(3),
         Some(now - Duration::hours(1)),
+        None,
+        None,
+        None,
     );
 
     let ctx = AuthorizedWorkspaceContext::resolve(
@@ -216,7 +213,7 @@ fn test_matrix_expired_and_revoked_grants_deny() {
         org_id,
         prog_id,
         ws_id,
-        MembershipRole::Viewer,
+        MembershipRole::Reader,
         vec![expired_grant],
         now,
     );
@@ -236,14 +233,16 @@ fn test_matrix_expired_and_revoked_grants_deny() {
         Some(now + Duration::hours(2)),
     )
     .unwrap();
-    revoked_grant.revoke(now - Duration::minutes(5)).unwrap();
+    revoked_grant
+        .revoke(now - Duration::minutes(5), None, None)
+        .unwrap();
 
     let ctx2 = AuthorizedWorkspaceContext::resolve(
         p_id,
         org_id,
         prog_id,
         ws_id,
-        MembershipRole::Member,
+        MembershipRole::Operator,
         vec![revoked_grant],
         now,
     );
@@ -290,7 +289,7 @@ fn test_matrix_cross_workspace_and_principal_isolation() {
         org_id,
         prog_id,
         ws1,
-        MembershipRole::Viewer,
+        MembershipRole::Reader,
         vec![grant_ws2, grant_p2],
         now,
     );
@@ -320,7 +319,7 @@ fn test_matrix_policy_rule_combinations() {
         org_id,
         prog_id,
         ws_id,
-        MembershipRole::Member, // has Read, Write
+        MembershipRole::Operator, // has Read, Write
         vec![],
         now,
     );

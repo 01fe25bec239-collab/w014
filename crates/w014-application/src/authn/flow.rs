@@ -1,6 +1,7 @@
 //! OIDC authentication and server-side session orchestration services.
 
 use chrono::{Duration, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::PgConnection;
 use w014_authn::error::AuthnError;
 use w014_authn::oidc::{AuthorizationParameters, IdTokenClaims, OidcClient};
@@ -10,13 +11,10 @@ use w014_authn::session::{
     generate_session_token,
 };
 use w014_domain::ids::{OrganizationId, PrincipalId};
-use w014_domain::organization::Organization;
-use w014_domain::principal::{Principal, PrincipalType};
+use w014_domain::principal::Principal;
 
 use crate::error::ApplicationError;
-use crate::persistence::{
-    OidcIdentityRepository, OrganizationRepository, PrincipalRepository, SessionRepository,
-};
+use crate::persistence::{OidcIdentityRepository, PrincipalRepository, SessionRepository};
 use crate::services::{OidcPersistenceService, SessionService};
 
 /// Service orchestrating OIDC login flows and callback resolution.
@@ -30,12 +28,16 @@ impl OidcFlowService {
     ) -> Result<AuthorizationParameters, ApplicationError> {
         let auth_params = oidc_client.create_authorization_request()?;
 
+        let state_hash = Sha256::digest(auth_params.state_token.as_bytes()).to_vec();
+        let nonce_hash = Sha256::digest(auth_params.nonce.as_bytes()).to_vec();
+        let pkce_ciphertext = auth_params.pkce_verifier.secret().as_bytes().to_vec();
+
         OidcPersistenceService::store_transaction(
             tx,
-            &auth_params.state_token,
-            &auth_params.nonce,
-            Some(auth_params.pkce_verifier.secret()),
-            &auth_params.redirect_uri,
+            state_hash,
+            nonce_hash,
+            Some(pkce_ciphertext),
+            "/",
             auth_params.expires_at,
         )
         .await?;
@@ -57,7 +59,8 @@ impl OidcFlowService {
         _user_agent: Option<&str>,
     ) -> Result<(Session, String, PrincipalId), ApplicationError> {
         // 1. Consume transient transaction by state token (single-use semantics)
-        let transaction = OidcPersistenceService::consume_transaction(tx, state)
+        let state_hash = Sha256::digest(state.as_bytes()).to_vec();
+        let transaction = OidcPersistenceService::consume_transaction(tx, &state_hash)
             .await?
             .ok_or(AuthnError::StateMismatch)?;
 
@@ -67,18 +70,45 @@ impl OidcFlowService {
         }
 
         // 2. PKCE code verifier is required
-        let pkce_verifier = transaction.pkce_verifier.as_ref().ok_or_else(|| {
-            AuthnError::InvalidPkce("Missing PKCE verifier in transaction".into())
-        })?;
+        let pkce_bytes = transaction
+            .pkce_verifier_ciphertext
+            .as_ref()
+            .ok_or_else(|| {
+                AuthnError::InvalidPkce("Missing PKCE verifier in transaction".into())
+            })?;
+        let pkce_verifier = std::str::from_utf8(pkce_bytes)
+            .map_err(|_| AuthnError::InvalidPkce("Malformed PKCE verifier".into()))?;
 
         // 3. Exchange authorization code at IdP token endpoint
         let token_resp = oidc_client
-            .exchange_code(code, pkce_verifier, &transaction.redirect_uri)
+            .exchange_code(code, pkce_verifier, &oidc_client.config().redirect_uri)
             .await?;
 
-        // 4. Cryptographically validate ID token against transaction nonce and IdP JWKS
+        // 4. Extract nonce from token, verify nonce_hash, and cryptographically validate ID token against IdP JWKS
+        let parts: Vec<&str> = token_resp.id_token.split('.').collect();
+        if parts.len() < 2 {
+            return Err(ApplicationError::Authn(AuthnError::InvalidToken(
+                "Malformed JWT".into(),
+            )));
+        }
+        use base64::Engine;
+        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(parts[1]))
+            .map_err(|e| ApplicationError::Authn(AuthnError::InvalidToken(e.to_string())))?;
+        let raw_claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
+            .map_err(|e| ApplicationError::Authn(AuthnError::InvalidToken(e.to_string())))?;
+        let nonce_str = raw_claims
+            .get("nonce")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let computed_nonce_hash = Sha256::digest(nonce_str.as_bytes()).to_vec();
+        if computed_nonce_hash != transaction.nonce_hash {
+            return Err(ApplicationError::Authn(AuthnError::NonceMismatch));
+        }
+
         let claims = oidc_client
-            .validate_id_token(&token_resp.id_token, &transaction.nonce)
+            .validate_id_token(&token_resp.id_token, nonce_str)
             .await?;
 
         // 5. Authoritatively resolve identity by composite (issuer, subject)
@@ -110,7 +140,7 @@ impl OidcFlowService {
     async fn resolve_or_create_principal(
         tx: &mut PgConnection,
         claims: &IdTokenClaims,
-        default_org_id: Option<OrganizationId>,
+        _default_org_id: Option<OrganizationId>,
     ) -> Result<PrincipalId, ApplicationError> {
         // Check for existing identity linkage
         if let Some(identity) =
@@ -120,34 +150,12 @@ impl OidcFlowService {
             return Ok(identity.principal_id);
         }
 
-        // No existing identity: Provision new principal
-        let org_id = match default_org_id {
-            Some(id) => id,
-            None => {
-                // Ensure default organization exists
-                let org = match OrganizationRepository::get_by_slug(tx, "default").await? {
-                    Some(existing_org) => existing_org,
-                    None => {
-                        let new_org = Organization::new("Default Organization", "default")?;
-                        OrganizationRepository::insert(tx, &new_org).await?;
-                        new_org
-                    }
-                };
-                org.id
-            }
-        };
-
         let display_name = claims
             .name
             .as_deref()
             .unwrap_or_else(|| claims.email.as_deref().unwrap_or("OIDC User"));
 
-        let principal = Principal::new(
-            org_id,
-            PrincipalType::User,
-            claims.email.as_deref(),
-            display_name,
-        )?;
+        let principal = Principal::new(display_name, claims.email.as_deref())?;
 
         PrincipalRepository::insert(tx, &principal).await?;
 
@@ -158,7 +166,6 @@ impl OidcFlowService {
             &claims.issuer,
             &claims.subject,
             claims.email.as_deref(),
-            claims.claims.clone(),
         )
         .await?;
 
@@ -171,17 +178,11 @@ pub struct SessionAuthnService;
 
 impl SessionAuthnService {
     /// Authenticates a raw opaque session token against the database.
-    ///
-    /// Lifecycle features:
-    /// - Key rollover: Recognizes sessions created under the previous HMAC key and immediately rotates them to the active key.
-    /// - Periodic rotation: Automatically rotates sessions active for >= 4 hours.
-    /// - Activity touch: Throttles `last_seen_at` updates to at most once every 5 minutes.
-    /// - Expiration: Evaluates idle (12h default) and absolute (7d default) timeouts.
     pub async fn authenticate(
         tx: &mut PgConnection,
         raw_token: &str,
         session_config: &SessionConfig,
-        ip_address: Option<&str>,
+        _ip_address: Option<&str>,
     ) -> Result<AuthenticationResult, ApplicationError> {
         let now = Utc::now();
         let idle_ttl = Duration::seconds(session_config.idle_ttl_secs);
@@ -214,8 +215,13 @@ impl SessionAuthnService {
 
         // 4. If validated under previous key, rotate immediately to active key
         if is_previous_key {
-            let (rotation, new_raw_token) =
-                Self::rotate(tx, session.session_id, session_config, ip_address).await?;
+            let (rotation, new_raw_token) = Self::rotate(
+                tx,
+                session.session_id,
+                session_config,
+                Some("manual_refresh"),
+            )
+            .await?;
             session.handle_hash = rotation.new_handle_hash;
             session.rotation_counter += 1;
             rotated_token = Some(new_raw_token);
@@ -224,7 +230,7 @@ impl SessionAuthnService {
             let periodic_ttl = Duration::seconds(session_config.periodic_rotation_interval_secs);
             if now - session.created_at >= periodic_ttl {
                 let (rotation, new_raw_token) =
-                    Self::rotate(tx, session.session_id, session_config, ip_address).await?;
+                    Self::rotate(tx, session.session_id, session_config, Some("periodic")).await?;
                 session.handle_hash = rotation.new_handle_hash;
                 session.rotation_counter += 1;
                 rotated_token = Some(new_raw_token);
@@ -250,7 +256,7 @@ impl SessionAuthnService {
         tx: &mut PgConnection,
         session_id: SessionId,
         session_config: &SessionConfig,
-        ip_address: Option<&str>,
+        reason: Option<&str>,
     ) -> Result<(SessionRotation, String), ApplicationError> {
         let new_raw_token = generate_session_token();
         let new_handle_hash = session_config.hash_handle(&new_raw_token);
@@ -264,7 +270,7 @@ impl SessionAuthnService {
             new_handle_hash.to_vec(),
             new_idle_expires_at,
             new_absolute_expires_at,
-            ip_address,
+            reason,
         )
         .await?;
 

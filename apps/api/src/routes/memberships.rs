@@ -51,9 +51,9 @@ impl From<&Membership> for MembershipDto {
             id: m.id.to_string(),
             workspace_id: m.workspace_id.to_string(),
             principal_id: m.principal_id.to_string(),
-            role: m.role.as_str().to_string(),
+            role: m.role().as_str().to_string(),
             created_at: m.created_at,
-            updated_at: m.updated_at,
+            updated_at: m.created_at,
         }
     }
 }
@@ -96,7 +96,7 @@ async fn authenticate_caller(
         .map_err(|_| ProblemDetails::internal_server_error(Some(path.into())))?
         .ok_or_else(|| ProblemDetails::unauthorized("Principal not found", Some(path.into())))?;
 
-    if !principal.is_active {
+    if !principal.is_active() {
         return Err(ProblemDetails::forbidden(
             "Principal account is deactivated",
             Some(path.into()),
@@ -285,7 +285,7 @@ pub async fn create_membership_handler(
     let role: MembershipRole = payload.role.parse().map_err(|_| {
         ProblemDetails::bad_request(
             format!(
-                "Invalid role '{}'. Valid roles: owner, admin, member, viewer, auditor",
+                "Invalid role '{}'. Valid roles: admin, operator, reviewer, reader",
                 payload.role
             ),
             Some(req_path.clone()),
@@ -338,7 +338,7 @@ pub async fn create_membership_handler(
         ));
     }
 
-    // 5. Verify target principal exists, is active, and belongs to the SAME organization
+    // 5. Verify target principal exists and is active
     let target_principal = PrincipalRepository::get_by_id(
         &mut setup_tx,
         PrincipalId::from_uuid(target_principal_uuid),
@@ -352,17 +352,10 @@ pub async fn create_membership_handler(
         )
     })?;
 
-    if !target_principal.is_active {
+    if !target_principal.is_active() {
         return Err(ProblemDetails::bad_request(
             "Target principal is deactivated",
             Some(req_path.clone()),
-        ));
-    }
-
-    if target_principal.organization_id != awc.organization_id() {
-        return Err(ProblemDetails::forbidden(
-            "Cross-tenant membership creation is prohibited",
-            Some(req_path),
         ));
     }
 
@@ -394,11 +387,15 @@ pub async fn create_membership_handler(
     let idemp_store = PostgresIdempotencyStore::new();
 
     let record_id_opt = if let Some(ref key) = idemp_key {
+        let key_hash =
+            IdempotencyCoordinator::compute_key_hash(&state.config.session.active_hmac_secret, key);
         match IdempotencyCoordinator::evaluate_key(
             ws_tx.conn(),
             &idemp_store,
             Some(awc.workspace_id()),
-            key,
+            principal.id,
+            "MEMBERSHIP_CREATE",
+            &key_hash,
             &req_hash,
             86400,
         )
@@ -474,18 +471,25 @@ pub async fn create_membership_handler(
         "membership_id": membership.id.to_string(),
         "workspace_id": awc.workspace_id().to_string(),
         "principal_id": target_principal.id.to_string(),
-        "role": role.as_str(),
+        "role_code": role.as_str(),
     });
 
     let mem_audit_params = AppendAuditParams {
         workspace_id: awc.workspace_id().into_uuid(),
-        event_type: "membership.created".to_string(),
-        actor_principal_id: Some(principal.id.into_uuid()),
-        action: "create".to_string(),
-        resource_type: "membership".to_string(),
-        resource_id: membership.id.to_string(),
-        payload: mem_audit_payload,
+        actor_type: "principal".to_string(),
+        actor_id: Some(principal.id.into_uuid()),
+        authority_snapshot: serde_json::json!({}),
+        action_code: "MEMBERSHIP_CREATE".to_string(),
+        entity_type: "membership".to_string(),
+        entity_id: membership.id.to_string(),
+        entity_version: Some(1),
+        request_id: None,
         correlation_id: None,
+        job_id: None,
+        source_state_hash: None,
+        before_ref: None,
+        after_ref: None,
+        metadata: mem_audit_payload,
     };
 
     audit_store
@@ -502,7 +506,6 @@ pub async fn create_membership_handler(
             &idemp_store,
             record_id,
             StatusCode::CREATED.as_u16(),
-            None,
             resp_body,
         )
         .await

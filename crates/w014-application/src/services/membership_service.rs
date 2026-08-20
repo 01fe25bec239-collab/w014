@@ -34,13 +34,24 @@ impl MembershipService {
 
         let audit_params = AppendAuditParams {
             workspace_id: workspace_id.into_uuid(),
-            event_type: "membership.created".to_string(),
-            actor_principal_id: actor_principal_id.map(|p| p.into_uuid()),
-            action: "create".to_string(),
-            resource_type: "membership".to_string(),
-            resource_id: membership.id.to_string(),
-            payload: audit_payload,
+            actor_type: if actor_principal_id.is_some() {
+                "principal".to_string()
+            } else {
+                "system".to_string()
+            },
+            actor_id: actor_principal_id.map(|p| p.into_uuid()),
+            authority_snapshot: serde_json::json!({}),
+            action_code: "MEMBERSHIP_CREATE".to_string(),
+            entity_type: "membership".to_string(),
+            entity_id: membership.id.to_string(),
+            entity_version: Some(membership.row_version),
+            request_id: None,
             correlation_id,
+            job_id: None,
+            source_state_hash: None,
+            before_ref: None,
+            after_ref: Some(audit_payload),
+            metadata: serde_json::json!({}),
         };
 
         audit_store.append_audit_event(tx, audit_params).await?;
@@ -68,7 +79,7 @@ impl MembershipService {
                     ))
                 })?;
 
-        let old_role = membership.role;
+        let old_role = membership.role();
         membership.change_role(new_role);
         MembershipRepository::update_role(tx, &membership).await?;
 
@@ -82,13 +93,24 @@ impl MembershipService {
 
         let audit_params = AppendAuditParams {
             workspace_id: workspace_id.into_uuid(),
-            event_type: "membership.role_updated".to_string(),
-            actor_principal_id: actor_principal_id.map(|p| p.into_uuid()),
-            action: "update".to_string(),
-            resource_type: "membership".to_string(),
-            resource_id: membership.id.to_string(),
-            payload: audit_payload,
+            actor_type: if actor_principal_id.is_some() {
+                "principal".to_string()
+            } else {
+                "system".to_string()
+            },
+            actor_id: actor_principal_id.map(|p| p.into_uuid()),
+            authority_snapshot: serde_json::json!({}),
+            action_code: "MEMBERSHIP_UPDATE_ROLE".to_string(),
+            entity_type: "membership".to_string(),
+            entity_id: membership.id.to_string(),
+            entity_version: Some(membership.row_version),
+            request_id: None,
             correlation_id,
+            job_id: None,
+            source_state_hash: None,
+            before_ref: Some(serde_json::json!({ "role": old_role.as_str() })),
+            after_ref: Some(audit_payload),
+            metadata: serde_json::json!({}),
         };
 
         audit_store.append_audit_event(tx, audit_params).await?;

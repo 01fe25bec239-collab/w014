@@ -61,7 +61,8 @@ fn test_capability_grant_lifecycle_and_one_way_revocation() {
     )
     .unwrap();
 
-    assert_eq!(grant.workspace_id, ws_id);
+    assert_eq!(grant.workspace_id, Some(ws_id));
+    assert_eq!(grant.program_id, None);
     assert_eq!(grant.principal_id, p_id);
     assert_eq!(grant.capability, Capability::RightsReview);
     assert_eq!(grant.granted_by, Some(grantor));
@@ -70,14 +71,14 @@ fn test_capability_grant_lifecycle_and_one_way_revocation() {
 
     // One-way revocation
     let revoke_time = now + Duration::minutes(30);
-    grant.revoke(revoke_time).unwrap();
+    grant.revoke(revoke_time, None, None).unwrap();
     assert!(grant.is_active_at(now + Duration::minutes(10)));
     assert!(!grant.is_active_at(revoke_time + Duration::seconds(1)));
     assert!(grant.is_expired_at(revoke_time + Duration::seconds(1)));
 
     // Second revocation attempt fails
     let err = grant
-        .revoke(revoke_time + Duration::minutes(10))
+        .revoke(revoke_time + Duration::minutes(10), None, None)
         .unwrap_err();
     assert_eq!(err, AuthzError::AlreadyRevoked(grant.id.to_string()));
 }

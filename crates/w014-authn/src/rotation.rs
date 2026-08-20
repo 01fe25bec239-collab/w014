@@ -71,19 +71,21 @@ impl FromStr for SessionRotationId {
 pub struct SessionRotation {
     pub id: SessionRotationId,
     pub session_id: SessionId,
+    pub rotation_number: i32,
     pub old_handle_hash: Vec<u8>,
     pub new_handle_hash: Vec<u8>,
+    pub reason: String,
     pub rotated_at: DateTime<Utc>,
-    pub ip_address: Option<String>,
 }
 
 impl SessionRotation {
     /// Creates a new SessionRotation record validating hash distinctness.
     pub fn new(
         session_id: SessionId,
+        rotation_number: i32,
         old_handle_hash: impl Into<Vec<u8>>,
         new_handle_hash: impl Into<Vec<u8>>,
-        ip_address: Option<impl AsRef<str>>,
+        reason: impl AsRef<str>,
     ) -> Result<Self, AuthnError> {
         let old_bytes = old_handle_hash.into();
         if old_bytes.is_empty() {
@@ -99,13 +101,21 @@ impl SessionRotation {
             return Err(AuthnError::IdenticalRotationHashes);
         }
 
+        let trimmed_reason = reason.as_ref().trim();
+        let valid_reason = if trimmed_reason.is_empty() {
+            "periodic".to_string()
+        } else {
+            trimmed_reason.to_string()
+        };
+
         Ok(Self {
             id: SessionRotationId::new(),
             session_id,
+            rotation_number,
             old_handle_hash: old_bytes,
             new_handle_hash: new_bytes,
+            reason: valid_reason,
             rotated_at: Utc::now(),
-            ip_address: ip_address.map(|s| s.as_ref().trim().to_string()),
         })
     }
 
@@ -113,10 +123,11 @@ impl SessionRotation {
     pub fn reconstruct(
         id: SessionRotationId,
         session_id: SessionId,
+        rotation_number: i32,
         old_handle_hash: Vec<u8>,
         new_handle_hash: Vec<u8>,
+        reason: String,
         rotated_at: DateTime<Utc>,
-        ip_address: Option<String>,
     ) -> Result<Self, AuthnError> {
         if old_handle_hash.is_empty() {
             return Err(AuthnError::EmptyField("old_handle_hash"));
@@ -133,10 +144,11 @@ impl SessionRotation {
         Ok(Self {
             id,
             session_id,
+            rotation_number,
             old_handle_hash,
             new_handle_hash,
+            reason,
             rotated_at,
-            ip_address,
         })
     }
 }
@@ -150,20 +162,24 @@ mod tests {
         let s_id = SessionId::new();
         let rot = SessionRotation::new(
             s_id,
+            1,
             b"old_hash".to_vec(),
             b"new_hash".to_vec(),
-            Some("127.0.0.1"),
+            "periodic",
         )
         .unwrap();
         assert_eq!(rot.session_id, s_id);
+        assert_eq!(rot.rotation_number, 1);
         assert_eq!(rot.old_handle_hash, b"old_hash".to_vec());
         assert_eq!(rot.new_handle_hash, b"new_hash".to_vec());
+        assert_eq!(rot.reason, "periodic");
 
         let err = SessionRotation::new(
             s_id,
+            1,
             b"same_hash".to_vec(),
             b"same_hash".to_vec(),
-            None::<&str>,
+            "periodic",
         )
         .unwrap_err();
         assert_eq!(err, AuthnError::IdenticalRotationHashes);

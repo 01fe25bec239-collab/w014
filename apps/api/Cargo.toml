@@ -32,3 +32,4 @@ url = "2"
 tower = { workspace = true, features = ["util"] }
 tempfile = "3"
 jsonwebtoken = "9"
+sha2 = "0.10"

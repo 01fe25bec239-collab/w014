@@ -55,7 +55,7 @@ fn test_context_fail_closed_checks() {
         org_id,
         prog_id,
         ws_id,
-        MembershipRole::Viewer,
+        MembershipRole::Reader,
         vec![],
         now,
     );
@@ -146,12 +146,16 @@ fn test_context_grant_filtering_invariants() {
     // 4. Expired grant for (ws1, p1)
     let grant_expired = CapabilityGrant::reconstruct(
         w014_authz::CapabilityGrantId::new(),
-        ws1,
+        Some(ws1),
+        None,
         p1,
         Capability::RightsReview,
         None,
         now - Duration::hours(2),
         Some(now - Duration::minutes(10)),
+        None,
+        None,
+        None,
     );
 
     let ctx = AuthorizedWorkspaceContext::resolve(
@@ -159,7 +163,7 @@ fn test_context_grant_filtering_invariants() {
         org_id,
         prog_id,
         ws1,
-        MembershipRole::Viewer,
+        MembershipRole::Reader,
         vec![grant_valid, grant_wrong_ws, grant_wrong_p, grant_expired],
         now,
     );
@@ -168,7 +172,7 @@ fn test_context_grant_filtering_invariants() {
     assert_eq!(ctx.active_grants().len(), 1);
     assert_eq!(ctx.active_grants()[0].capability, Capability::AuditRead);
 
-    assert!(ctx.can_read_workspace()); // Viewer base
+    assert!(ctx.can_read_workspace()); // Reader base
     assert!(ctx.can_read_audit()); // from grant_valid
     assert!(!ctx.can_admin_workspace()); // grant_wrong_ws ignored
     assert!(!ctx.can_override_block()); // grant_wrong_p ignored
@@ -197,7 +201,7 @@ fn test_context_serde_roundtrip() {
         org_id,
         prog_id,
         ws_id,
-        MembershipRole::Member,
+        MembershipRole::Operator,
         vec![grant],
         now,
     );
@@ -224,7 +228,7 @@ fn test_context_policy_rule_evaluation() {
         org_id,
         prog_id,
         ws_id,
-        MembershipRole::Member,
+        MembershipRole::Operator,
         vec![],
         now,
     );

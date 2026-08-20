@@ -12,6 +12,7 @@
 //! - Verification that staged FKs (current_source_state_id, job_id) remain deferred.
 
 use chrono::{Duration, Utc};
+use sha2::{Digest, Sha256};
 use w014_application::persistence::{
     CapabilityGrantRepository, OrganizationRepository, PrincipalRepository, ProgramRepository,
     SessionRepository, WorkspaceRepository,
@@ -23,7 +24,7 @@ use w014_application::services::{
 use w014_authz::capability::Capability;
 use w014_domain::membership::MembershipRole;
 use w014_domain::organization::Organization;
-use w014_domain::principal::{Principal, PrincipalType};
+use w014_domain::principal::Principal;
 use w014_domain::program::Program;
 use w014_domain::workspace::Workspace;
 use w014_persistence::audit::{
@@ -62,17 +63,11 @@ async fn test_organization_principal_program_workspace_persistence() {
         .expect("get org")
         .expect("org exists");
     assert_eq!(fetched_org.id, org.id);
-    assert_eq!(fetched_org.name, "Acme Corp");
+    assert_eq!(fetched_org.name(), "Acme Corp");
     assert_eq!(fetched_org.slug, "acme-corp");
 
     // 2. Create Principal (email is informational snapshot)
-    let principal = Principal::new(
-        org.id,
-        PrincipalType::User,
-        Some("alice@acme.com"),
-        "Alice Smith",
-    )
-    .expect("valid principal");
+    let principal = Principal::new("Alice Smith", Some("alice@acme.com")).expect("valid principal");
     PrincipalRepository::insert(&mut tx, &principal)
         .await
         .expect("insert principal");
@@ -82,20 +77,12 @@ async fn test_organization_principal_program_workspace_persistence() {
         .expect("get principal")
         .expect("principal exists");
     assert_eq!(fetched_principal.id, principal.id);
-    assert_eq!(fetched_principal.organization_id, org.id);
-    assert_eq!(fetched_principal.principal_type, PrincipalType::User);
     assert_eq!(fetched_principal.email.as_deref(), Some("alice@acme.com"));
     assert_eq!(fetched_principal.display_name, "Alice Smith");
-    assert!(fetched_principal.is_active);
+    assert!(fetched_principal.is_active());
 
     // 3. Create Program
-    let program = Program::new(
-        org.id,
-        "Engineering",
-        "engineering",
-        Some("Core engineering program"),
-    )
-    .expect("valid program");
+    let program = Program::new(org.id, "Engineering", "engineering").expect("valid program");
     ProgramRepository::insert(&mut tx, &program)
         .await
         .expect("insert program");
@@ -140,22 +127,15 @@ async fn test_workspace_head_initialization_and_audit_atomicity() {
             .expect("create org");
     let principal = WorkspaceInitializationService::create_principal(
         &mut tx,
-        org.id,
-        PrincipalType::User,
-        Some("bob@global.com"),
         "Bob Builder",
+        Some("bob@global.com"),
     )
     .await
     .expect("create principal");
-    let program = WorkspaceInitializationService::create_program(
-        &mut tx,
-        org.id,
-        "Logistics",
-        "logistics",
-        None::<&str>,
-    )
-    .await
-    .expect("create program");
+    let program =
+        WorkspaceInitializationService::create_program(&mut tx, org.id, "Logistics", "logistics")
+            .await
+            .expect("create program");
     tx.commit().await.expect("commit setup tx");
 
     // 2. Atomically create workspace and initialize audit chain head
@@ -173,8 +153,8 @@ async fn test_workspace_head_initialization_and_audit_atomicity() {
     .await
     .expect("create ws with audit head");
 
-    // 3. Atomically assign workspace owner
-    let membership = WorkspaceInitializationService::assign_workspace_owner_with_audit(
+    // 3. Atomically assign workspace admin
+    let membership = WorkspaceInitializationService::assign_workspace_admin_with_audit(
         &mut ws_tx,
         &audit_store,
         ws.id,
@@ -183,8 +163,8 @@ async fn test_workspace_head_initialization_and_audit_atomicity() {
         Some("corr-init-002".to_string()),
     )
     .await
-    .expect("assign owner");
-    assert_eq!(membership.role, MembershipRole::Owner);
+    .expect("assign admin");
+    assert_eq!(membership.role(), MembershipRole::Admin);
 
     ws_tx.commit().await.expect("commit ws tx");
 
@@ -197,17 +177,17 @@ async fn test_workspace_head_initialization_and_audit_atomicity() {
         .expect("head exists");
 
     assert_eq!(head.workspace_id, ws.id.into_uuid());
-    assert_eq!(head.head_sequence_num, 2);
+    assert_eq!(head.last_sequence, 2);
 
     let events = audit_store
         .fetch_audit_events(&mut verify_tx, ws.id.into_uuid())
         .await
         .expect("fetch events");
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].sequence_num, 1);
-    assert_eq!(events[0].event_type, "workspace.created");
-    assert_eq!(events[1].sequence_num, 2);
-    assert_eq!(events[1].event_type, "membership.created");
+    assert_eq!(events[0].sequence, 1);
+    assert_eq!(events[0].action_code, "WORKSPACE_CREATE");
+    assert_eq!(events[1].sequence, 2);
+    assert_eq!(events[1].action_code, "MEMBERSHIP_CREATE");
 
     // Verify cryptographic hash chain integrity using AuditChainHasher
     let hasher = AuditChainHasher;
@@ -231,19 +211,17 @@ async fn test_privileged_mutation_rollback_on_audit_append_failure() {
     let org = Organization::new("Secure Bank", "secure-bank").unwrap();
     OrganizationRepository::insert(&mut tx, &org).await.unwrap();
 
-    let admin_principal =
-        Principal::new(org.id, PrincipalType::User, None::<&str>, "Admin").unwrap();
+    let admin_principal = Principal::new("Admin", None::<&str>).unwrap();
     PrincipalRepository::insert(&mut tx, &admin_principal)
         .await
         .unwrap();
 
-    let target_principal =
-        Principal::new(org.id, PrincipalType::User, None::<&str>, "Target").unwrap();
+    let target_principal = Principal::new("Target", None::<&str>).unwrap();
     PrincipalRepository::insert(&mut tx, &target_principal)
         .await
         .unwrap();
 
-    let program = Program::new(org.id, "Vault", "vault", None::<&str>).unwrap();
+    let program = Program::new(org.id, "Vault", "vault").unwrap();
     ProgramRepository::insert(&mut tx, &program).await.unwrap();
 
     let ws = WorkspaceInitializationService::create_workspace_with_audit_head(
@@ -280,13 +258,20 @@ async fn test_privileged_mutation_rollback_on_audit_append_failure() {
     // 2. Inject an invalid audit event that violates sequence or DB check (empty action triggers chk_audit_events_action_non_empty)
     let bad_audit_params = AppendAuditParams {
         workspace_id: ws.id.into_uuid(),
-        event_type: "capability.granted".to_string(),
-        actor_principal_id: Some(admin_principal.id.into_uuid()),
-        action: "   ".to_string(), // Empty action violates DB check constraint!
-        resource_type: "capability_grant".to_string(),
-        resource_id: grant.id.to_string(),
-        payload: serde_json::json!({}),
+        actor_type: "principal".to_string(),
+        actor_id: Some(admin_principal.id.into_uuid()),
+        authority_snapshot: serde_json::json!({}),
+        action_code: "   ".to_string(), // Empty action violates DB check constraint!
+        entity_type: "capability_grant".to_string(),
+        entity_id: grant.id.to_string(),
+        entity_version: Some(1),
+        request_id: None,
         correlation_id: None,
+        job_id: None,
+        source_state_hash: None,
+        before_ref: None,
+        after_ref: None,
+        metadata: serde_json::json!({}),
     };
 
     let audit_res = audit_store
@@ -323,17 +308,17 @@ async fn test_capability_grant_and_one_way_revocation_lifecycle() {
     let org = Organization::new("Gov Org", "gov-org").unwrap();
     OrganizationRepository::insert(&mut tx, &org).await.unwrap();
 
-    let grantor = Principal::new(org.id, PrincipalType::User, None::<&str>, "Grantor").unwrap();
+    let grantor = Principal::new("Grantor", None::<&str>).unwrap();
     PrincipalRepository::insert(&mut tx, &grantor)
         .await
         .unwrap();
 
-    let grantee = Principal::new(org.id, PrincipalType::User, None::<&str>, "Grantee").unwrap();
+    let grantee = Principal::new("Grantee", None::<&str>).unwrap();
     PrincipalRepository::insert(&mut tx, &grantee)
         .await
         .unwrap();
 
-    let prog = Program::new(org.id, "Security", "security", None::<&str>).unwrap();
+    let prog = Program::new(org.id, "Security", "security").unwrap();
     ProgramRepository::insert(&mut tx, &prog).await.unwrap();
 
     let ws = WorkspaceInitializationService::create_workspace_with_audit_head(
@@ -400,7 +385,7 @@ async fn test_capability_grant_and_one_way_revocation_lifecycle() {
         .await
         .unwrap()
         .unwrap();
-    assert!(fetched_grant.is_expired_at(Utc::now() + Duration::seconds(1)));
+    assert!(!fetched_grant.is_active_at(Utc::now() + Duration::seconds(1)));
 
     let events = audit_store
         .fetch_audit_events(&mut check_tx, ws.id.into_uuid())
@@ -408,7 +393,7 @@ async fn test_capability_grant_and_one_way_revocation_lifecycle() {
         .unwrap();
     // 1 workspace.created + 2 capability.granted + 1 capability.revoked = 4
     assert_eq!(events.len(), 4);
-    assert_eq!(events[3].event_type, "capability.revoked");
+    assert_eq!(events[3].action_code, "CAPABILITY_REVOKE");
     check_tx.commit().await.unwrap();
     test_db.close().await.expect("drop test db");
 }
@@ -422,17 +407,10 @@ async fn test_oidc_identity_persistence_and_lookup() {
     let org = Organization::new("Oidc Org", "oidc-org").unwrap();
     OrganizationRepository::insert(&mut tx, &org).await.unwrap();
 
-    let principal = Principal::new(org.id, PrincipalType::User, None::<&str>, "Oidc User").unwrap();
+    let principal = Principal::new("Oidc User", None::<&str>).unwrap();
     PrincipalRepository::insert(&mut tx, &principal)
         .await
         .unwrap();
-
-    let claims = serde_json::json!({
-        "iss": "https://accounts.google.com",
-        "sub": "google-sub-998877",
-        "email": "user@google.com",
-        "email_verified": true
-    });
 
     let oidc_id = OidcPersistenceService::link_identity(
         &mut tx,
@@ -440,7 +418,6 @@ async fn test_oidc_identity_persistence_and_lookup() {
         "https://accounts.google.com",
         "google-sub-998877",
         Some("user@google.com"),
-        claims.clone(),
     )
     .await
     .unwrap();
@@ -460,7 +437,7 @@ async fn test_oidc_identity_persistence_and_lookup() {
 
     assert_eq!(found.id, oidc_id.id);
     assert_eq!(found.principal_id, principal.id);
-    assert_eq!(found.email.as_deref(), Some("user@google.com"));
+    assert_eq!(found.email_at_link.as_deref(), Some("user@google.com"));
 
     tx.commit().await.unwrap();
     test_db.close().await.expect("drop test db");
@@ -475,8 +452,7 @@ async fn test_session_persistence_rotation_and_revocation() {
     let org = Organization::new("Session Org", "session-org").unwrap();
     OrganizationRepository::insert(&mut tx, &org).await.unwrap();
 
-    let principal =
-        Principal::new(org.id, PrincipalType::User, None::<&str>, "Session User").unwrap();
+    let principal = Principal::new("Session User", None::<&str>).unwrap();
     PrincipalRepository::insert(&mut tx, &principal)
         .await
         .unwrap();
@@ -518,7 +494,7 @@ async fn test_session_persistence_rotation_and_revocation() {
         rotated_hash.clone(),
         new_idle_expires,
         new_abs_expires,
-        Some("127.0.0.2"),
+        Some("periodic"),
     )
     .await
     .unwrap();
@@ -562,28 +538,30 @@ async fn test_oidc_transaction_single_use_consumption() {
     let mut tx = pool.begin().await.unwrap();
 
     let expires = Utc::now() + Duration::minutes(15);
+    let state_hash = Sha256::digest(b"state_tok_abc").to_vec();
+    let nonce_hash = Sha256::digest(b"nonce_tok_123").to_vec();
     let stored = OidcPersistenceService::store_transaction(
         &mut tx,
-        "state_tok_abc",
-        "nonce_tok_123",
-        Some("pkce_verif_xyz"),
+        state_hash.clone(),
+        nonce_hash,
+        Some(b"pkce_verif_xyz".to_vec()),
         "https://app.example.com/auth/callback",
         expires,
     )
     .await
     .unwrap();
 
-    assert_eq!(stored.state_token, "state_tok_abc");
+    assert_eq!(stored.state_hash, state_hash);
 
     // Consume transaction (single-use)
-    let consumed = OidcPersistenceService::consume_transaction(&mut tx, "state_tok_abc")
+    let consumed = OidcPersistenceService::consume_transaction(&mut tx, &state_hash)
         .await
         .unwrap()
         .expect("transaction consumed");
     assert_eq!(consumed.id, stored.id);
 
     // Second consumption must return None
-    let replay = OidcPersistenceService::consume_transaction(&mut tx, "state_tok_abc")
+    let replay = OidcPersistenceService::consume_transaction(&mut tx, &state_hash)
         .await
         .unwrap();
     assert!(replay.is_none(), "Transaction MUST be single-use only");
@@ -598,17 +576,24 @@ async fn test_idempotency_store_consumption_invariants() {
     let pool = test_db.pool();
     let idempotency_store = PostgresIdempotencyStore::new();
 
+    let mut tx = pool.begin().await.unwrap();
+    let principal = Principal::new("Idemp User", None::<&str>).unwrap();
+    PrincipalRepository::insert(&mut tx, &principal)
+        .await
+        .unwrap();
+
     let payload = serde_json::json!({"action": "create_item", "item_id": 42});
     let req_hash = IdempotencyCoordinator::compute_payload_hash(&payload);
-
-    let mut tx = pool.begin().await.unwrap();
+    let key_hash = IdempotencyCoordinator::compute_key_hash(b"test_secret", "req-idemp-001");
 
     // 1. Initial acquisition
     let check1 = IdempotencyCoordinator::evaluate_key(
         &mut tx,
         &idempotency_store,
         None,
-        "req-idemp-001",
+        principal.id,
+        "TEST_ROUTE",
+        &key_hash,
         &req_hash,
         300,
     )
@@ -627,7 +612,6 @@ async fn test_idempotency_store_consumption_invariants() {
         &idempotency_store,
         record_id,
         201,
-        None,
         Some(resp_body.clone()),
     )
     .await
@@ -638,7 +622,9 @@ async fn test_idempotency_store_consumption_invariants() {
         &mut tx,
         &idempotency_store,
         None,
-        "req-idemp-001",
+        principal.id,
+        "TEST_ROUTE",
+        &key_hash,
         &req_hash,
         300,
     )
@@ -663,7 +649,9 @@ async fn test_idempotency_store_consumption_invariants() {
         &mut tx,
         &idempotency_store,
         None,
-        "req-idemp-001",
+        principal.id,
+        "TEST_ROUTE",
+        &key_hash,
         &diff_hash,
         300,
     )
@@ -675,8 +663,8 @@ async fn test_idempotency_store_consumption_invariants() {
             expected_hash,
             actual_hash,
         } => {
-            assert_eq!(expected_hash, req_hash);
-            assert_eq!(actual_hash, diff_hash);
+            assert_eq!(expected_hash, hex::encode(&req_hash));
+            assert_eq!(actual_hash, hex::encode(&diff_hash));
         }
         other => panic!("Expected Mismatch, got {:?}", other),
     }
@@ -758,28 +746,25 @@ async fn test_workspace_authz_resolver_end_to_end() {
     let org = Organization::new("Authz Org", "authz-org").unwrap();
     OrganizationRepository::insert(&mut tx, &org).await.unwrap();
 
-    let prog = Program::new(org.id, "Core Platform", "core-platform", None::<&str>).unwrap();
+    let prog = Program::new(org.id, "Core Platform", "core-platform").unwrap();
     ProgramRepository::insert(&mut tx, &prog).await.unwrap();
 
-    let creator = Principal::new(org.id, PrincipalType::User, None::<&str>, "Creator").unwrap();
+    let creator = Principal::new("Creator", None::<&str>).unwrap();
     PrincipalRepository::insert(&mut tx, &creator)
         .await
         .unwrap();
 
-    let member_user =
-        Principal::new(org.id, PrincipalType::User, None::<&str>, "Member User").unwrap();
+    let member_user = Principal::new("Member User", None::<&str>).unwrap();
     PrincipalRepository::insert(&mut tx, &member_user)
         .await
         .unwrap();
 
-    let non_member_user =
-        Principal::new(org.id, PrincipalType::User, None::<&str>, "Non Member").unwrap();
+    let non_member_user = Principal::new("Non Member", None::<&str>).unwrap();
     PrincipalRepository::insert(&mut tx, &non_member_user)
         .await
         .unwrap();
 
-    let mut inactive_user =
-        Principal::new(org.id, PrincipalType::User, None::<&str>, "Inactive User").unwrap();
+    let mut inactive_user = Principal::new("Inactive User", None::<&str>).unwrap();
     inactive_user.deactivate();
     PrincipalRepository::insert(&mut tx, &inactive_user)
         .await
@@ -812,26 +797,26 @@ async fn test_workspace_authz_resolver_end_to_end() {
     .await
     .unwrap();
 
-    // Add member_user with Member role
+    // Add member_user with Operator role
     w014_application::services::MembershipService::add_member_with_audit(
         &mut tx,
         &audit_store,
         ws.id,
         member_user.id,
-        MembershipRole::Member,
+        MembershipRole::Operator,
         Some(creator.id),
         Some("corr-add-member".to_string()),
     )
     .await
     .unwrap();
 
-    // Add inactive_user with Viewer role
+    // Add inactive_user with Reader role
     w014_application::services::MembershipService::add_member_with_audit(
         &mut tx,
         &audit_store,
         ws.id,
         inactive_user.id,
-        MembershipRole::Viewer,
+        MembershipRole::Reader,
         Some(creator.id),
         Some("corr-add-inactive".to_string()),
     )
@@ -857,12 +842,16 @@ async fn test_workspace_authz_resolver_end_to_end() {
     // Add an expired grant for RIGHTS_REVIEW to member_user
     let expired_grant = w014_authz::grant::CapabilityGrant::reconstruct(
         w014_authz::CapabilityGrantId::new(),
-        ws.id,
+        Some(ws.id),
+        None,
         member_user.id,
         Capability::RightsReview,
         Some(creator.id),
         now - Duration::hours(3),
         Some(now - Duration::hours(1)),
+        None,
+        None,
+        None,
     );
     CapabilityGrantRepository::insert(&mut tx, &expired_grant)
         .await
@@ -883,11 +872,11 @@ async fn test_workspace_authz_resolver_end_to_end() {
     assert!(!creator_ctx.can_activate_rule());
     assert!(!creator_ctx.can_grant_authority());
 
-    // 2. Resolve context for member_user (Member + OVERRIDE_BLOCK grant)
+    // 2. Resolve context for member_user (Operator + OVERRIDE_BLOCK grant)
     let member_ctx = WorkspaceAuthzResolver::resolve(&mut tx, ws.id, member_user.id, now)
         .await
         .unwrap();
-    assert_eq!(member_ctx.membership_role(), MembershipRole::Member);
+    assert_eq!(member_ctx.membership_role(), MembershipRole::Operator);
     assert!(member_ctx.can_read_workspace());
     assert!(member_ctx.can_write_workspace());
     assert!(!member_ctx.can_admin_workspace());

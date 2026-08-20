@@ -17,11 +17,10 @@ pub struct RoleProfile;
 impl RoleProfile {
     /// Returns the slice of all defined membership roles.
     pub const ALL_ROLES: &'static [MembershipRole] = &[
-        MembershipRole::Owner,
         MembershipRole::Admin,
-        MembershipRole::Member,
-        MembershipRole::Viewer,
-        MembershipRole::Auditor,
+        MembershipRole::Operator,
+        MembershipRole::Reviewer,
+        MembershipRole::Reader,
     ];
 
     /// Returns the base capability set associated with a membership role.
@@ -31,28 +30,22 @@ impl RoleProfile {
         let mut caps = CapabilitySet::new();
 
         match role {
-            MembershipRole::Owner => {
-                caps.insert(Capability::WorkspaceAdmin);
-                caps.insert(Capability::WorkspaceRead);
-                caps.insert(Capability::WorkspaceWrite);
-                caps.insert(Capability::AuditRead);
-            }
             MembershipRole::Admin => {
                 caps.insert(Capability::WorkspaceAdmin);
                 caps.insert(Capability::WorkspaceRead);
                 caps.insert(Capability::WorkspaceWrite);
                 caps.insert(Capability::AuditRead);
             }
-            MembershipRole::Member => {
+            MembershipRole::Operator => {
                 caps.insert(Capability::WorkspaceRead);
                 caps.insert(Capability::WorkspaceWrite);
             }
-            MembershipRole::Viewer => {
-                caps.insert(Capability::WorkspaceRead);
-            }
-            MembershipRole::Auditor => {
+            MembershipRole::Reviewer => {
                 caps.insert(Capability::WorkspaceRead);
                 caps.insert(Capability::AuditRead);
+            }
+            MembershipRole::Reader => {
+                caps.insert(Capability::WorkspaceRead);
             }
         }
 
@@ -78,35 +71,29 @@ mod tests {
 
     #[test]
     fn test_role_profile_mappings() {
-        let owner_caps = RoleProfile::base_capabilities(MembershipRole::Owner);
-        assert!(owner_caps.can_admin_workspace());
-        assert!(owner_caps.can_read_workspace());
-        assert!(owner_caps.can_write_workspace());
-        assert!(owner_caps.can_read_audit());
-
         let admin_caps = RoleProfile::base_capabilities(MembershipRole::Admin);
         assert!(admin_caps.can_admin_workspace());
         assert!(admin_caps.can_read_workspace());
         assert!(admin_caps.can_write_workspace());
         assert!(admin_caps.can_read_audit());
 
-        let member_caps = RoleProfile::base_capabilities(MembershipRole::Member);
-        assert!(!member_caps.can_admin_workspace());
-        assert!(member_caps.can_read_workspace());
-        assert!(member_caps.can_write_workspace());
-        assert!(!member_caps.can_read_audit());
+        let operator_caps = RoleProfile::base_capabilities(MembershipRole::Operator);
+        assert!(!operator_caps.can_admin_workspace());
+        assert!(operator_caps.can_read_workspace());
+        assert!(operator_caps.can_write_workspace());
+        assert!(!operator_caps.can_read_audit());
 
-        let viewer_caps = RoleProfile::base_capabilities(MembershipRole::Viewer);
-        assert!(!viewer_caps.can_admin_workspace());
-        assert!(viewer_caps.can_read_workspace());
-        assert!(!viewer_caps.can_write_workspace());
-        assert!(!viewer_caps.can_read_audit());
+        let reviewer_caps = RoleProfile::base_capabilities(MembershipRole::Reviewer);
+        assert!(!reviewer_caps.can_admin_workspace());
+        assert!(reviewer_caps.can_read_workspace());
+        assert!(!reviewer_caps.can_write_workspace());
+        assert!(reviewer_caps.can_read_audit());
 
-        let auditor_caps = RoleProfile::base_capabilities(MembershipRole::Auditor);
-        assert!(!auditor_caps.can_admin_workspace());
-        assert!(auditor_caps.can_read_workspace());
-        assert!(!auditor_caps.can_write_workspace());
-        assert!(auditor_caps.can_read_audit());
+        let reader_caps = RoleProfile::base_capabilities(MembershipRole::Reader);
+        assert!(!reader_caps.can_admin_workspace());
+        assert!(reader_caps.can_read_workspace());
+        assert!(!reader_caps.can_write_workspace());
+        assert!(!reader_caps.can_read_audit());
     }
 
     #[test]

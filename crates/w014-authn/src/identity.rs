@@ -75,10 +75,9 @@ pub struct OidcIdentity {
     pub issuer: String,
     pub subject: String,
     /// Informational snapshot only; NOT the authentication identity.
-    pub email: Option<String>,
-    pub claims: serde_json::Value,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub email_at_link: Option<String>,
+    pub linked_at: DateTime<Utc>,
+    pub last_login_at: Option<DateTime<Utc>>,
 }
 
 impl OidcIdentity {
@@ -87,8 +86,7 @@ impl OidcIdentity {
         principal_id: PrincipalId,
         issuer: impl AsRef<str>,
         subject: impl AsRef<str>,
-        email: Option<impl AsRef<str>>,
-        claims: serde_json::Value,
+        email_at_link: Option<impl AsRef<str>>,
     ) -> Result<Self, AuthnError> {
         let trimmed_issuer = issuer.as_ref().trim();
         if trimmed_issuer.is_empty() {
@@ -100,7 +98,7 @@ impl OidcIdentity {
             return Err(AuthnError::EmptyField("subject"));
         }
 
-        let email_opt = email.and_then(|e| {
+        let email_opt = email_at_link.and_then(|e| {
             let t = e.as_ref().trim();
             if t.is_empty() {
                 None
@@ -115,24 +113,21 @@ impl OidcIdentity {
             principal_id,
             issuer: trimmed_issuer.to_string(),
             subject: trimmed_subject.to_string(),
-            email: email_opt,
-            claims,
-            created_at: now,
-            updated_at: now,
+            email_at_link: email_opt,
+            linked_at: now,
+            last_login_at: Some(now),
         })
     }
 
     /// Reconstructs an existing OIDC identity from persistent storage.
-    #[allow(clippy::too_many_arguments)]
     pub fn reconstruct(
         id: OidcIdentityId,
         principal_id: PrincipalId,
         issuer: String,
         subject: String,
-        email: Option<String>,
-        claims: serde_json::Value,
-        created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
+        email_at_link: Option<String>,
+        linked_at: DateTime<Utc>,
+        last_login_at: Option<DateTime<Utc>>,
     ) -> Result<Self, AuthnError> {
         let trimmed_issuer = issuer.trim();
         if trimmed_issuer.is_empty() {
@@ -149,11 +144,15 @@ impl OidcIdentity {
             principal_id,
             issuer: trimmed_issuer.to_string(),
             subject: trimmed_subject.to_string(),
-            email,
-            claims,
-            created_at,
-            updated_at,
+            email_at_link,
+            linked_at,
+            last_login_at,
         })
+    }
+
+    /// Convenience getter for informational email snapshot.
+    pub fn email(&self) -> Option<&str> {
+        self.email_at_link.as_deref()
     }
 
     /// Returns the unique composite identity key `(issuer, subject)`.
@@ -169,20 +168,19 @@ mod tests {
     #[test]
     fn test_oidc_identity_creation() {
         let p_id = PrincipalId::new();
-        let claims = serde_json::json!({"hd": "example.com"});
         let id = OidcIdentity::new(
             p_id,
             "https://accounts.google.com",
             "sub_1234567890",
             Some("alice@example.com"),
-            claims.clone(),
         )
         .unwrap();
 
         assert_eq!(id.principal_id, p_id);
         assert_eq!(id.issuer, "https://accounts.google.com");
         assert_eq!(id.subject, "sub_1234567890");
-        assert_eq!(id.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(id.email_at_link.as_deref(), Some("alice@example.com"));
+        assert_eq!(id.email(), Some("alice@example.com"));
         assert_eq!(
             id.identity_key(),
             ("https://accounts.google.com", "sub_1234567890")

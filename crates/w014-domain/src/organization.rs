@@ -11,61 +11,60 @@ use crate::validation::{validate_non_empty, validate_slug};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Organization {
     pub id: OrganizationId,
-    pub name: String,
+    pub display_name: String,
     pub slug: String,
     pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
 }
 
 impl Organization {
-    /// Creates a new Organization domain entity enforcing name and slug invariants.
-    pub fn new(name: impl AsRef<str>, slug: impl AsRef<str>) -> Result<Self, DomainError> {
-        let valid_name = validate_non_empty("name", name.as_ref())?.to_string();
+    /// Creates a new Organization domain entity enforcing display_name and slug invariants.
+    pub fn new(display_name: impl AsRef<str>, slug: impl AsRef<str>) -> Result<Self, DomainError> {
+        let valid_name = validate_non_empty("display_name", display_name.as_ref())?.to_string();
         let valid_slug = validate_slug(slug.as_ref())?;
         let now = Utc::now();
 
         Ok(Self {
             id: OrganizationId::new(),
-            name: valid_name,
+            display_name: valid_name,
             slug: valid_slug,
             created_at: now,
-            updated_at: now,
         })
     }
 
     /// Reconstructs an existing Organization from persistent storage.
     pub fn reconstruct(
         id: OrganizationId,
-        name: String,
+        display_name: String,
         slug: String,
         created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
     ) -> Result<Self, DomainError> {
-        let valid_name = validate_non_empty("name", &name)?.to_string();
+        let valid_name = validate_non_empty("display_name", &display_name)?.to_string();
         let valid_slug = validate_slug(&slug)?;
 
         Ok(Self {
             id,
-            name: valid_name,
+            display_name: valid_name,
             slug: valid_slug,
             created_at,
-            updated_at,
         })
     }
 
-    /// Renames the organization, validating the new name and advancing `updated_at`.
+    /// Convenience getter for display name.
+    pub fn name(&self) -> &str {
+        &self.display_name
+    }
+
+    /// Renames the organization, validating the new display name.
     pub fn rename(&mut self, new_name: impl AsRef<str>) -> Result<(), DomainError> {
-        let valid_name = validate_non_empty("name", new_name.as_ref())?.to_string();
-        self.name = valid_name;
-        self.updated_at = Utc::now();
+        let valid_name = validate_non_empty("display_name", new_name.as_ref())?.to_string();
+        self.display_name = valid_name;
         Ok(())
     }
 
-    /// Updates the organization slug, validating the new slug and advancing `updated_at`.
+    /// Updates the organization slug, validating the new slug.
     pub fn update_slug(&mut self, new_slug: impl AsRef<str>) -> Result<(), DomainError> {
         let valid_slug = validate_slug(new_slug.as_ref())?;
         self.slug = valid_slug;
-        self.updated_at = Utc::now();
         Ok(())
     }
 }
@@ -77,14 +76,14 @@ mod tests {
     #[test]
     fn test_organization_creation_valid() {
         let org = Organization::new("Acme Corp", "acme-corp").unwrap();
-        assert_eq!(org.name, "Acme Corp");
+        assert_eq!(org.display_name, "Acme Corp");
         assert_eq!(org.slug, "acme-corp");
     }
 
     #[test]
     fn test_organization_creation_empty_name_fails() {
         let err = Organization::new("   ", "acme-corp").unwrap_err();
-        assert_eq!(err, DomainError::EmptyField("name"));
+        assert_eq!(err, DomainError::EmptyField("display_name"));
     }
 
     #[test]

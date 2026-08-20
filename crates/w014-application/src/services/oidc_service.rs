@@ -1,6 +1,4 @@
 //! OIDC Identity and Transaction persistence application service.
-//!
-//! Note: Full protocol validation and exchange paths (WI-0102) are deferred.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
@@ -21,10 +19,9 @@ impl OidcPersistenceService {
         principal_id: PrincipalId,
         issuer: impl AsRef<str>,
         subject: impl AsRef<str>,
-        email: Option<impl AsRef<str>>,
-        claims: serde_json::Value,
+        email_at_link: Option<impl AsRef<str>>,
     ) -> Result<OidcIdentity, ApplicationError> {
-        let identity = OidcIdentity::new(principal_id, issuer, subject, email, claims)?;
+        let identity = OidcIdentity::new(principal_id, issuer, subject, email_at_link)?;
         OidcIdentityRepository::insert(tx, &identity).await?;
         Ok(identity)
     }
@@ -43,26 +40,35 @@ impl OidcPersistenceService {
     /// Stores a transient OIDC transaction state token.
     pub async fn store_transaction(
         tx: &mut PgConnection,
-        state_token: impl AsRef<str>,
-        nonce: impl AsRef<str>,
-        pkce_verifier: Option<impl AsRef<str>>,
-        redirect_uri: impl AsRef<str>,
+        state_hash: Vec<u8>,
+        nonce_hash: Vec<u8>,
+        pkce_verifier_ciphertext: Option<Vec<u8>>,
+        return_path: impl AsRef<str>,
         expires_at: DateTime<Utc>,
     ) -> Result<OidcTransaction, ApplicationError> {
-        let transaction =
-            OidcTransaction::new(state_token, nonce, pkce_verifier, redirect_uri, expires_at)?;
+        let transaction = OidcTransaction::new(
+            state_hash,
+            nonce_hash,
+            pkce_verifier_ciphertext,
+            return_path,
+            expires_at,
+        )?;
         OidcTransactionRepository::insert(tx, &transaction).await?;
         Ok(transaction)
     }
 
-    /// Consumes and deletes a transient OIDC transaction by state token (single-use semantics).
+    /// Consumes a transient OIDC transaction by state hash (single-use semantics).
     pub async fn consume_transaction(
         tx: &mut PgConnection,
-        state_token: &str,
+        state_hash: &[u8],
     ) -> Result<Option<OidcTransaction>, ApplicationError> {
-        let tx_opt = OidcTransactionRepository::get_by_state_token(tx, state_token).await?;
+        let tx_opt = OidcTransactionRepository::get_by_state_hash(tx, state_hash).await?;
         if let Some(ref transaction) = tx_opt {
-            OidcTransactionRepository::delete_by_id(tx, transaction.id).await?;
+            let now = Utc::now();
+            let consumed = OidcTransactionRepository::consume(tx, transaction.id, now).await?;
+            if !consumed {
+                return Ok(None);
+            }
         }
         Ok(tx_opt)
     }
