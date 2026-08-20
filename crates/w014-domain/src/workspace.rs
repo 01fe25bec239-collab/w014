@@ -17,12 +17,12 @@ pub struct Workspace {
     pub id: WorkspaceId,
     pub program_id: ProgramId,
     pub organization_id: OrganizationId,
+    pub workspace_code: String,
     pub name: String,
-    pub slug: String,
     /// STAGED FK: Nullable in W1, NO FK to effective_contract_states (deferred to W3).
     pub current_source_state_id: Option<Uuid>,
+    pub row_version: i32,
     pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
 }
 
 impl Workspace {
@@ -31,21 +31,21 @@ impl Workspace {
         program_id: ProgramId,
         organization_id: OrganizationId,
         name: impl AsRef<str>,
-        slug: impl AsRef<str>,
+        workspace_code: impl AsRef<str>,
     ) -> Result<Self, DomainError> {
         let valid_name = validate_non_empty("name", name.as_ref())?.to_string();
-        let valid_slug = validate_slug(slug.as_ref())?;
+        let valid_code = validate_slug(workspace_code.as_ref())?;
         let now = Utc::now();
 
         Ok(Self {
             id: WorkspaceId::new(),
             program_id,
             organization_id,
+            workspace_code: valid_code,
             name: valid_name,
-            slug: valid_slug,
             current_source_state_id: None,
+            row_version: 1,
             created_at: now,
-            updated_at: now,
         })
     }
 
@@ -55,38 +55,43 @@ impl Workspace {
         id: WorkspaceId,
         program_id: ProgramId,
         organization_id: OrganizationId,
+        workspace_code: String,
         name: String,
-        slug: String,
         current_source_state_id: Option<Uuid>,
+        row_version: i32,
         created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
     ) -> Result<Self, DomainError> {
         let valid_name = validate_non_empty("name", &name)?.to_string();
-        let valid_slug = validate_slug(&slug)?;
+        let valid_code = validate_slug(&workspace_code)?;
 
         Ok(Self {
             id,
             program_id,
             organization_id,
+            workspace_code: valid_code,
             name: valid_name,
-            slug: valid_slug,
             current_source_state_id,
+            row_version,
             created_at,
-            updated_at,
         })
     }
 
-    /// Updates workspace details, validating fields and advancing `updated_at`.
+    /// Convenience getter for slug / workspace code.
+    pub fn slug(&self) -> &str {
+        &self.workspace_code
+    }
+
+    /// Updates workspace details, validating fields and incrementing row_version.
     pub fn update_details(
         &mut self,
         name: impl AsRef<str>,
-        slug: impl AsRef<str>,
+        workspace_code: impl AsRef<str>,
     ) -> Result<(), DomainError> {
         let valid_name = validate_non_empty("name", name.as_ref())?.to_string();
-        let valid_slug = validate_slug(slug.as_ref())?;
+        let valid_code = validate_slug(workspace_code.as_ref())?;
         self.name = valid_name;
-        self.slug = valid_slug;
-        self.updated_at = Utc::now();
+        self.workspace_code = valid_code;
+        self.row_version += 1;
         Ok(())
     }
 }
@@ -104,7 +109,9 @@ mod tests {
         assert_eq!(ws.program_id, prog_id);
         assert_eq!(ws.organization_id, org_id);
         assert_eq!(ws.name, "Dev Workspace");
-        assert_eq!(ws.slug, "dev-workspace");
+        assert_eq!(ws.workspace_code, "dev-workspace");
+        assert_eq!(ws.slug(), "dev-workspace");
         assert_eq!(ws.current_source_state_id, None);
+        assert_eq!(ws.row_version, 1);
     }
 }

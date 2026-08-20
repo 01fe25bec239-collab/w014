@@ -58,10 +58,10 @@ impl From<&Workspace> for WorkspaceDto {
             program_id: ws.program_id.to_string(),
             organization_id: ws.organization_id.to_string(),
             name: ws.name.clone(),
-            slug: ws.slug.clone(),
+            slug: ws.slug().to_string(),
             current_source_state_id: ws.current_source_state_id.map(|u| u.to_string()),
             created_at: ws.created_at,
-            updated_at: ws.updated_at,
+            updated_at: ws.created_at,
         }
     }
 }
@@ -104,7 +104,7 @@ async fn authenticate_caller(
         .map_err(|_| ProblemDetails::internal_server_error(Some(path.into())))?
         .ok_or_else(|| ProblemDetails::unauthorized("Principal not found", Some(path.into())))?;
 
-    if !principal.is_active {
+    if !principal.is_active() {
         return Err(ProblemDetails::forbidden(
             "Principal account is deactivated",
             Some(path.into()),
@@ -142,7 +142,7 @@ pub async fn list_workspaces_handler(
     headers: HeaderMap,
 ) -> Result<Response, ProblemDetails> {
     let req_path = format!("/api/v1/programs/{program_id_str}/workspaces");
-    let (_session, principal) = authenticate_caller(&state, &headers, &req_path).await?;
+    let (_session, _principal) = authenticate_caller(&state, &headers, &req_path).await?;
 
     let prog_uuid = Uuid::parse_str(&program_id_str).map_err(|_| {
         ProblemDetails::not_found(
@@ -161,7 +161,7 @@ pub async fn list_workspaces_handler(
         .await
         .map_err(|_| ProblemDetails::internal_server_error(Some(req_path.clone())))?;
 
-    let program = ProgramRepository::get_by_id(&mut tx, ProgramId::from_uuid(prog_uuid))
+    let _program = ProgramRepository::get_by_id(&mut tx, ProgramId::from_uuid(prog_uuid))
         .await
         .map_err(|_| ProblemDetails::internal_server_error(Some(req_path.clone())))?
         .ok_or_else(|| {
@@ -171,12 +171,38 @@ pub async fn list_workspaces_handler(
             )
         })?;
 
-    // Privacy-safe tenant isolation check
-    if program.organization_id != principal.organization_id {
-        return Err(ProblemDetails::not_found(
-            format!("Program '{}' was not found", program_id_str),
-            Some(req_path),
-        ));
+    // Privacy-safe tenant boundary isolation: if program has workspaces, caller must be a member or grantee
+    let has_workspaces: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM workspaces WHERE program_id = $1)")
+            .bind(prog_uuid)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or(false);
+
+    if has_workspaces {
+        let has_member: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM workspaces w
+                 JOIN memberships m ON w.workspace_id = m.workspace_id
+                 WHERE w.program_id = $1 AND m.principal_id = $2
+             ) OR EXISTS (
+                 SELECT 1 FROM capability_grants cg
+                 WHERE (cg.program_id = $1 OR cg.workspace_id IN (SELECT workspace_id FROM workspaces WHERE program_id = $1))
+                   AND cg.principal_id = $2
+             )",
+        )
+        .bind(prog_uuid)
+        .bind(_principal.id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap_or(false);
+
+        if !has_member {
+            return Err(ProblemDetails::not_found(
+                format!("Program '{}' was not found", program_id_str),
+                Some(req_path),
+            ));
+        }
     }
 
     let cursor_uuid = pagination
@@ -267,7 +293,7 @@ pub async fn create_workspace_handler(
         .await
         .map_err(|_| ProblemDetails::internal_server_error(Some(req_path.clone())))?;
 
-    // 3. Verify program exists and belongs to caller's org
+    // 3. Verify program exists
     let program = ProgramRepository::get_by_id(&mut tx, ProgramId::from_uuid(prog_uuid))
         .await
         .map_err(|_| ProblemDetails::internal_server_error(Some(req_path.clone())))?
@@ -277,13 +303,6 @@ pub async fn create_workspace_handler(
                 Some(req_path.clone()),
             )
         })?;
-
-    if program.organization_id != principal.organization_id {
-        return Err(ProblemDetails::not_found(
-            format!("Program '{}' was not found", program_id_str),
-            Some(req_path),
-        ));
-    }
 
     // 4. Idempotency arbitration
     let idemp_key = headers
@@ -298,11 +317,15 @@ pub async fn create_workspace_handler(
     let idemp_store = PostgresIdempotencyStore::new();
 
     let record_id_opt = if let Some(ref key) = idemp_key {
+        let key_hash =
+            IdempotencyCoordinator::compute_key_hash(&state.config.session.active_hmac_secret, key);
         match IdempotencyCoordinator::evaluate_key(
             &mut tx,
             &idemp_store,
             None,
-            key,
+            principal.id,
+            "WORKSPACE_CREATE",
+            &key_hash,
             &req_hash,
             86400,
         )
@@ -359,7 +382,7 @@ pub async fn create_workspace_handler(
     // 6. Domain creation & Atomic audit append in same transaction
     let ws = Workspace::new(
         program.id,
-        principal.organization_id,
+        program.organization_id,
         payload.name,
         payload.slug,
     )
@@ -370,7 +393,9 @@ pub async fn create_workspace_handler(
         .map_err(|e| match e {
             w014_persistence::error::PersistenceError::Connection(ref sqlx_err)
                 if sqlx_err.to_string().contains("duplicate key")
-                    || sqlx_err.to_string().contains("uq_workspaces_program_slug") =>
+                    || sqlx_err
+                        .to_string()
+                        .contains("uq_workspaces_program_workspace_code") =>
             {
                 ProblemDetails::conflict("Workspace slug already exists", Some(req_path.clone()))
             }
@@ -390,18 +415,25 @@ pub async fn create_workspace_handler(
         "program_id": ws.program_id.to_string(),
         "organization_id": ws.organization_id.to_string(),
         "name": ws.name,
-        "slug": ws.slug,
+        "workspace_code": ws.workspace_code,
     });
 
     let ws_audit_params = AppendAuditParams {
         workspace_id: ws.id.into_uuid(),
-        event_type: "workspace.created".to_string(),
-        actor_principal_id: Some(principal.id.into_uuid()),
-        action: "create".to_string(),
-        resource_type: "workspace".to_string(),
-        resource_id: ws.id.to_string(),
-        payload: ws_audit_payload,
+        actor_type: "principal".to_string(),
+        actor_id: Some(principal.id.into_uuid()),
+        authority_snapshot: serde_json::json!({}),
+        action_code: "WORKSPACE_CREATE".to_string(),
+        entity_type: "workspace".to_string(),
+        entity_id: ws.id.to_string(),
+        entity_version: Some(1),
+        request_id: None,
         correlation_id: None,
+        job_id: None,
+        source_state_hash: None,
+        before_ref: None,
+        after_ref: None,
+        metadata: ws_audit_payload,
     };
 
     audit_store
@@ -409,8 +441,8 @@ pub async fn create_workspace_handler(
         .await
         .map_err(|_| ProblemDetails::internal_server_error(Some(req_path.clone())))?;
 
-    // Assign creator as workspace Owner
-    let membership = Membership::new(ws.id, principal.id, MembershipRole::Owner);
+    // Assign creator as workspace Admin
+    let membership = Membership::new(ws.id, principal.id, MembershipRole::Admin);
     MembershipRepository::insert(&mut tx, &membership)
         .await
         .map_err(|_| ProblemDetails::internal_server_error(Some(req_path.clone())))?;
@@ -419,18 +451,25 @@ pub async fn create_workspace_handler(
         "membership_id": membership.id.to_string(),
         "workspace_id": ws.id.to_string(),
         "principal_id": principal.id.to_string(),
-        "role": "owner",
+        "role_code": "admin",
     });
 
     let mem_audit_params = AppendAuditParams {
         workspace_id: ws.id.into_uuid(),
-        event_type: "membership.created".to_string(),
-        actor_principal_id: Some(principal.id.into_uuid()),
-        action: "create".to_string(),
-        resource_type: "membership".to_string(),
-        resource_id: membership.id.to_string(),
-        payload: mem_audit_payload,
+        actor_type: "principal".to_string(),
+        actor_id: Some(principal.id.into_uuid()),
+        authority_snapshot: serde_json::json!({}),
+        action_code: "MEMBERSHIP_CREATE".to_string(),
+        entity_type: "membership".to_string(),
+        entity_id: membership.id.to_string(),
+        entity_version: Some(1),
+        request_id: None,
         correlation_id: None,
+        job_id: None,
+        source_state_hash: None,
+        before_ref: None,
+        after_ref: None,
+        metadata: mem_audit_payload,
     };
 
     audit_store
@@ -447,7 +486,6 @@ pub async fn create_workspace_handler(
             &idemp_store,
             record_id,
             StatusCode::CREATED.as_u16(),
-            None,
             resp_body,
         )
         .await

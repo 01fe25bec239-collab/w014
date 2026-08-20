@@ -116,14 +116,16 @@ fn test_session_rotation_semantics() {
 
     // 1. Distinct rotation succeeds
     let rotation =
-        SessionRotation::new(s_id, old_hash.to_vec(), new_hash.to_vec(), Some("10.0.0.1")).unwrap();
+        SessionRotation::new(s_id, 1, old_hash.to_vec(), new_hash.to_vec(), "periodic").unwrap();
     assert_eq!(rotation.session_id, s_id);
+    assert_eq!(rotation.rotation_number, 1);
     assert_eq!(rotation.old_handle_hash, old_hash.to_vec());
     assert_eq!(rotation.new_handle_hash, new_hash.to_vec());
+    assert_eq!(rotation.reason, "periodic");
 
     // 2. Identical rotation hash is rejected
-    let same_err =
-        SessionRotation::new(s_id, old_hash.to_vec(), old_hash.to_vec(), None::<&str>).unwrap_err();
+    let same_err = SessionRotation::new(s_id, 1, old_hash.to_vec(), old_hash.to_vec(), "periodic")
+        .unwrap_err();
     assert_eq!(same_err, AuthnError::IdenticalRotationHashes);
 }
 

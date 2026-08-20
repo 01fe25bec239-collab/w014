@@ -1,7 +1,7 @@
 //! Authoritative PostgreSQL Audit Append Implementation.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
@@ -13,13 +13,20 @@ use crate::error::PersistenceError;
 #[derive(Debug, Clone)]
 pub struct AppendAuditParams {
     pub workspace_id: Uuid,
-    pub event_type: String,
-    pub actor_principal_id: Option<Uuid>,
-    pub action: String,
-    pub resource_type: String,
-    pub resource_id: String,
-    pub payload: serde_json::Value,
+    pub actor_type: String,
+    pub actor_id: Option<Uuid>,
+    pub authority_snapshot: serde_json::Value,
+    pub action_code: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub entity_version: Option<i32>,
+    pub request_id: Option<String>,
     pub correlation_id: Option<String>,
+    pub job_id: Option<Uuid>,
+    pub source_state_hash: Option<Vec<u8>>,
+    pub before_ref: Option<serde_json::Value>,
+    pub after_ref: Option<serde_json::Value>,
+    pub metadata: serde_json::Value,
 }
 
 /// Authoritative contract for audit chain initialization, retrieval, and append operations.
@@ -38,7 +45,7 @@ pub trait AuditAppendContract: Send + Sync {
         params: AppendAuditParams,
     ) -> Result<AuditEventRecord, PersistenceError>;
 
-    /// Explicitly initializes an audit chain head for a workspace with sequence 0 and genesis hash.
+    /// Explicitly initializes an audit chain head for a workspace with sequence 0 and NULL last hash.
     async fn initialize_chain_head(
         &self,
         tx: &mut PgConnection,
@@ -85,26 +92,22 @@ impl AuditAppendContract for PostgresAuditStore {
         tx: &mut PgConnection,
         workspace_id: Uuid,
     ) -> Result<AuditChainHeadRecord, PersistenceError> {
-        let genesis = self.hasher.genesis_hash();
         let row = sqlx::query(
             "INSERT INTO audit_chain_heads (
-                workspace_id, head_sequence_num, head_event_hash, genesis_hash, last_appended_at, updated_at
-            ) VALUES ($1, 0, $2, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ON CONFLICT (workspace_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
-            RETURNING workspace_id, head_sequence_num, head_event_hash, genesis_hash, last_appended_at, updated_at"
+                workspace_id, last_sequence, last_event_hash, updated_at
+            ) VALUES ($1, 0, NULL, clock_timestamp())
+            ON CONFLICT (workspace_id) DO UPDATE SET updated_at = clock_timestamp()
+            RETURNING workspace_id, last_sequence, last_event_hash, updated_at",
         )
         .bind(workspace_id)
-        .bind(genesis)
         .fetch_one(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
 
         Ok(AuditChainHeadRecord {
             workspace_id: row.get("workspace_id"),
-            head_sequence_num: row.get("head_sequence_num"),
-            head_event_hash: row.get("head_event_hash"),
-            genesis_hash: row.get("genesis_hash"),
-            last_appended_at: row.get("last_appended_at"),
+            last_sequence: row.get("last_sequence"),
+            last_event_hash: row.get("last_event_hash"),
             updated_at: row.get("updated_at"),
         })
     }
@@ -115,9 +118,9 @@ impl AuditAppendContract for PostgresAuditStore {
         workspace_id: Uuid,
     ) -> Result<Option<AuditChainHeadRecord>, PersistenceError> {
         let maybe_row = sqlx::query(
-            "SELECT workspace_id, head_sequence_num, head_event_hash, genesis_hash, last_appended_at, updated_at
+            "SELECT workspace_id, last_sequence, last_event_hash, updated_at
              FROM audit_chain_heads
-             WHERE workspace_id = $1"
+             WHERE workspace_id = $1",
         )
         .bind(workspace_id)
         .fetch_optional(&mut *tx)
@@ -126,10 +129,8 @@ impl AuditAppendContract for PostgresAuditStore {
 
         Ok(maybe_row.map(|row| AuditChainHeadRecord {
             workspace_id: row.get("workspace_id"),
-            head_sequence_num: row.get("head_sequence_num"),
-            head_event_hash: row.get("head_event_hash"),
-            genesis_hash: row.get("genesis_hash"),
-            last_appended_at: row.get("last_appended_at"),
+            last_sequence: row.get("last_sequence"),
+            last_event_hash: row.get("last_event_hash"),
             updated_at: row.get("updated_at"),
         }))
     }
@@ -140,21 +141,19 @@ impl AuditAppendContract for PostgresAuditStore {
         params: AppendAuditParams,
     ) -> Result<AuditEventRecord, PersistenceError> {
         // 1. Ensure chain head exists (idempotent insert), then acquire exclusive row lock FOR UPDATE
-        let genesis = self.hasher.genesis_hash();
         sqlx::query(
             "INSERT INTO audit_chain_heads (
-                workspace_id, head_sequence_num, head_event_hash, genesis_hash, last_appended_at, updated_at
-            ) VALUES ($1, 0, $2, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ON CONFLICT (workspace_id) DO NOTHING"
+                workspace_id, last_sequence, last_event_hash, updated_at
+            ) VALUES ($1, 0, NULL, clock_timestamp())
+            ON CONFLICT (workspace_id) DO NOTHING",
         )
         .bind(params.workspace_id)
-        .bind(genesis)
         .execute(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
 
         let head_row = sqlx::query(
-            "SELECT head_sequence_num, head_event_hash, genesis_hash
+            "SELECT last_sequence, last_event_hash, clock_timestamp() as now_ts
              FROM audit_chain_heads
              WHERE workspace_id = $1
              FOR UPDATE",
@@ -164,52 +163,74 @@ impl AuditAppendContract for PostgresAuditStore {
         .await
         .map_err(PersistenceError::Connection)?;
 
-        let current_seq: i64 = head_row.get("head_sequence_num");
-        let prev_hash: String = head_row.get("head_event_hash");
+        let current_seq: i64 = head_row.get("last_sequence");
+        let prev_hash: Option<Vec<u8>> = head_row.get("last_event_hash");
+        let occurred_at: DateTime<Utc> = head_row.get("now_ts");
 
         let next_seq = current_seq + 1;
-        let recorded_at = Utc::now();
+        let audit_event_id = Uuid::new_v4();
 
         // 2. Build canonical audit envelope and compute deterministic SHA-256 hash
         let envelope = CanonicalAuditEnvelope {
+            audit_event_id,
             workspace_id: params.workspace_id,
-            sequence_num: next_seq,
-            previous_event_hash: prev_hash.clone(),
-            event_type: params.event_type.clone(),
-            actor_principal_id: params.actor_principal_id,
-            action: params.action.clone(),
-            resource_type: params.resource_type.clone(),
-            resource_id: params.resource_id.clone(),
-            payload: params.payload.clone(),
+            sequence: next_seq,
+            occurred_at,
+            actor_type: params.actor_type.clone(),
+            actor_id: params.actor_id,
+            authority_snapshot: params.authority_snapshot.clone(),
+            action_code: params.action_code.clone(),
+            entity_type: params.entity_type.clone(),
+            entity_id: params.entity_id.clone(),
+            entity_version: params.entity_version,
+            request_id: params.request_id.clone(),
             correlation_id: params.correlation_id.clone(),
-            recorded_at,
+            job_id: params.job_id,
+            source_state_hash: params.source_state_hash.clone(),
+            before_ref: params.before_ref.clone(),
+            after_ref: params.after_ref.clone(),
+            metadata: params.metadata.clone(),
         };
 
-        let event_hash = self.hasher.compute_event_hash(&envelope);
+        let event_hash = self
+            .hasher
+            .compute_event_hash(prev_hash.as_deref(), &envelope);
 
         // 3. Insert immutable event into audit_events
         let insert_row = sqlx::query(
             "INSERT INTO audit_events (
-                workspace_id, sequence_num, previous_event_hash, event_hash,
-                event_type, actor_principal_id, action, resource_type, resource_id,
-                payload, job_id, correlation_id, recorded_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12)
-            RETURNING id, workspace_id, sequence_num, previous_event_hash, event_hash,
-                      event_type, actor_principal_id, action, resource_type, resource_id,
-                      payload, job_id, correlation_id, recorded_at",
+                audit_event_id, workspace_id, sequence, occurred_at,
+                actor_type, actor_id, authority_snapshot, action_code,
+                entity_type, entity_id, entity_version, request_id,
+                correlation_id, job_id, source_state_hash, before_ref,
+                after_ref, metadata, previous_event_hash, event_hash
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+            RETURNING audit_event_id, workspace_id, sequence, occurred_at,
+                      actor_type, actor_id, authority_snapshot, action_code,
+                      entity_type, entity_id, entity_version, request_id,
+                      correlation_id, job_id, source_state_hash, before_ref,
+                      after_ref, metadata, previous_event_hash, event_hash",
         )
+        .bind(audit_event_id)
         .bind(params.workspace_id)
         .bind(next_seq)
+        .bind(occurred_at)
+        .bind(&params.actor_type)
+        .bind(params.actor_id)
+        .bind(&params.authority_snapshot)
+        .bind(&params.action_code)
+        .bind(&params.entity_type)
+        .bind(&params.entity_id)
+        .bind(params.entity_version)
+        .bind(&params.request_id)
+        .bind(&params.correlation_id)
+        .bind(params.job_id)
+        .bind(&params.source_state_hash)
+        .bind(&params.before_ref)
+        .bind(&params.after_ref)
+        .bind(&params.metadata)
         .bind(&prev_hash)
         .bind(&event_hash)
-        .bind(&params.event_type)
-        .bind(params.actor_principal_id)
-        .bind(&params.action)
-        .bind(&params.resource_type)
-        .bind(&params.resource_id)
-        .bind(&params.payload)
-        .bind(&params.correlation_id)
-        .bind(recorded_at)
         .fetch_one(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
@@ -217,35 +238,40 @@ impl AuditAppendContract for PostgresAuditStore {
         // 4. Update audit_chain_heads with new sequence and head event hash
         sqlx::query(
             "UPDATE audit_chain_heads
-             SET head_sequence_num = $2,
-                 head_event_hash = $3,
-                 last_appended_at = $4,
-                 updated_at = CURRENT_TIMESTAMP
+             SET last_sequence = $2,
+                 last_event_hash = $3,
+                 updated_at = $4
              WHERE workspace_id = $1",
         )
         .bind(params.workspace_id)
         .bind(next_seq)
         .bind(&event_hash)
-        .bind(recorded_at)
+        .bind(occurred_at)
         .execute(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
 
         Ok(AuditEventRecord {
-            id: insert_row.get("id"),
+            audit_event_id: insert_row.get("audit_event_id"),
             workspace_id: insert_row.get("workspace_id"),
-            sequence_num: insert_row.get("sequence_num"),
+            sequence: insert_row.get("sequence"),
+            occurred_at: insert_row.get("occurred_at"),
+            actor_type: insert_row.get("actor_type"),
+            actor_id: insert_row.get("actor_id"),
+            authority_snapshot: insert_row.get("authority_snapshot"),
+            action_code: insert_row.get("action_code"),
+            entity_type: insert_row.get("entity_type"),
+            entity_id: insert_row.get("entity_id"),
+            entity_version: insert_row.get("entity_version"),
+            request_id: insert_row.get("request_id"),
+            correlation_id: insert_row.get("correlation_id"),
+            job_id: insert_row.get("job_id"),
+            source_state_hash: insert_row.get("source_state_hash"),
+            before_ref: insert_row.get("before_ref"),
+            after_ref: insert_row.get("after_ref"),
+            metadata: insert_row.get("metadata"),
             previous_event_hash: insert_row.get("previous_event_hash"),
             event_hash: insert_row.get("event_hash"),
-            event_type: insert_row.get("event_type"),
-            actor_principal_id: insert_row.get("actor_principal_id"),
-            action: insert_row.get("action"),
-            resource_type: insert_row.get("resource_type"),
-            resource_id: insert_row.get("resource_id"),
-            payload: insert_row.get("payload"),
-            job_id: insert_row.get("job_id"),
-            correlation_id: insert_row.get("correlation_id"),
-            recorded_at: insert_row.get("recorded_at"),
         })
     }
 
@@ -255,12 +281,14 @@ impl AuditAppendContract for PostgresAuditStore {
         workspace_id: Uuid,
     ) -> Result<Vec<AuditEventRecord>, PersistenceError> {
         let rows = sqlx::query(
-            "SELECT id, workspace_id, sequence_num, previous_event_hash, event_hash,
-                    event_type, actor_principal_id, action, resource_type, resource_id,
-                    payload, job_id, correlation_id, recorded_at
+            "SELECT audit_event_id, workspace_id, sequence, occurred_at,
+                    actor_type, actor_id, authority_snapshot, action_code,
+                    entity_type, entity_id, entity_version, request_id,
+                    correlation_id, job_id, source_state_hash, before_ref,
+                    after_ref, metadata, previous_event_hash, event_hash
              FROM audit_events
              WHERE workspace_id = $1
-             ORDER BY sequence_num ASC",
+             ORDER BY sequence ASC",
         )
         .bind(workspace_id)
         .fetch_all(&mut *tx)
@@ -270,20 +298,26 @@ impl AuditAppendContract for PostgresAuditStore {
         let records = rows
             .into_iter()
             .map(|row| AuditEventRecord {
-                id: row.get("id"),
+                audit_event_id: row.get("audit_event_id"),
                 workspace_id: row.get("workspace_id"),
-                sequence_num: row.get("sequence_num"),
+                sequence: row.get("sequence"),
+                occurred_at: row.get("occurred_at"),
+                actor_type: row.get("actor_type"),
+                actor_id: row.get("actor_id"),
+                authority_snapshot: row.get("authority_snapshot"),
+                action_code: row.get("action_code"),
+                entity_type: row.get("entity_type"),
+                entity_id: row.get("entity_id"),
+                entity_version: row.get("entity_version"),
+                request_id: row.get("request_id"),
+                correlation_id: row.get("correlation_id"),
+                job_id: row.get("job_id"),
+                source_state_hash: row.get("source_state_hash"),
+                before_ref: row.get("before_ref"),
+                after_ref: row.get("after_ref"),
+                metadata: row.get("metadata"),
                 previous_event_hash: row.get("previous_event_hash"),
                 event_hash: row.get("event_hash"),
-                event_type: row.get("event_type"),
-                actor_principal_id: row.get("actor_principal_id"),
-                action: row.get("action"),
-                resource_type: row.get("resource_type"),
-                resource_id: row.get("resource_id"),
-                payload: row.get("payload"),
-                job_id: row.get("job_id"),
-                correlation_id: row.get("correlation_id"),
-                recorded_at: row.get("recorded_at"),
             })
             .collect();
 

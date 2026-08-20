@@ -9,7 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::error::DomainError;
-use crate::ids::{OrganizationId, PrincipalId};
+use crate::ids::PrincipalId;
 use crate::validation::validate_non_empty;
 
 /// Type category of a principal.
@@ -55,22 +55,17 @@ impl FromStr for PrincipalType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
     pub id: PrincipalId,
-    pub organization_id: OrganizationId,
-    pub principal_type: PrincipalType,
-    pub email: Option<String>,
     pub display_name: String,
-    pub is_active: bool,
+    pub email: Option<String>,
+    pub status: String,
     pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
 }
 
 impl Principal {
     /// Creates a new active Principal domain entity.
     pub fn new(
-        organization_id: OrganizationId,
-        principal_type: PrincipalType,
-        email: Option<impl AsRef<str>>,
         display_name: impl AsRef<str>,
+        email: Option<impl AsRef<str>>,
     ) -> Result<Self, DomainError> {
         let valid_display_name =
             validate_non_empty("display_name", display_name.as_ref())?.to_string();
@@ -85,27 +80,20 @@ impl Principal {
 
         Ok(Self {
             id: PrincipalId::new(),
-            organization_id,
-            principal_type,
-            email: valid_email,
             display_name: valid_display_name,
-            is_active: true,
+            email: valid_email,
+            status: "active".to_string(),
             created_at: now,
-            updated_at: now,
         })
     }
 
     /// Reconstructs an existing Principal from persistent storage.
-    #[allow(clippy::too_many_arguments)]
     pub fn reconstruct(
         id: PrincipalId,
-        organization_id: OrganizationId,
-        principal_type: PrincipalType,
-        email: Option<String>,
         display_name: String,
-        is_active: bool,
+        email: Option<String>,
+        status: String,
         created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
     ) -> Result<Self, DomainError> {
         let valid_display_name = validate_non_empty("display_name", &display_name)?.to_string();
         let valid_email = match email {
@@ -115,33 +103,37 @@ impl Principal {
 
         Ok(Self {
             id,
-            organization_id,
-            principal_type,
-            email: valid_email,
             display_name: valid_display_name,
-            is_active,
+            email: valid_email,
+            status,
             created_at,
-            updated_at,
         })
+    }
+
+    /// Evaluates if principal is currently active.
+    pub fn is_active(&self) -> bool {
+        self.status == "active"
     }
 
     /// Deactivates the principal.
     pub fn deactivate(&mut self) {
-        self.is_active = false;
-        self.updated_at = Utc::now();
+        self.status = "deactivated".to_string();
     }
 
     /// Activates the principal.
     pub fn activate(&mut self) {
-        self.is_active = true;
-        self.updated_at = Utc::now();
+        self.status = "active".to_string();
     }
 
-    /// Updates display name, advancing `updated_at`.
+    /// Suspends the principal.
+    pub fn suspend(&mut self) {
+        self.status = "suspended".to_string();
+    }
+
+    /// Updates display name.
     pub fn update_display_name(&mut self, new_name: impl AsRef<str>) -> Result<(), DomainError> {
         let valid_name = validate_non_empty("display_name", new_name.as_ref())?.to_string();
         self.display_name = valid_name;
-        self.updated_at = Utc::now();
         Ok(())
     }
 
@@ -151,7 +143,6 @@ impl Principal {
             Some(e) => Some(validate_non_empty("email", e.as_ref())?.to_string()),
             None => None,
         };
-        self.updated_at = Utc::now();
         Ok(())
     }
 }
@@ -179,30 +170,25 @@ mod tests {
 
     #[test]
     fn test_principal_creation_and_lifecycle() {
-        let org_id = OrganizationId::new();
-        let mut p = Principal::new(
-            org_id,
-            PrincipalType::User,
-            Some("user@example.com"),
-            "Alice User",
-        )
-        .unwrap();
+        let mut p = Principal::new("Alice User", Some("user@example.com")).unwrap();
 
-        assert!(p.is_active);
+        assert!(p.is_active());
+        assert_eq!(p.status, "active");
         assert_eq!(p.display_name, "Alice User");
         assert_eq!(p.email.as_deref(), Some("user@example.com"));
 
         p.deactivate();
-        assert!(!p.is_active);
+        assert!(!p.is_active());
+        assert_eq!(p.status, "deactivated");
 
         p.activate();
-        assert!(p.is_active);
+        assert!(p.is_active());
+        assert_eq!(p.status, "active");
     }
 
     #[test]
     fn test_principal_empty_display_name_rejected() {
-        let org_id = OrganizationId::new();
-        let err = Principal::new(org_id, PrincipalType::User, None::<&str>, "  ").unwrap_err();
+        let err = Principal::new("  ", None::<&str>).unwrap_err();
         assert_eq!(err, DomainError::EmptyField("display_name"));
     }
 }

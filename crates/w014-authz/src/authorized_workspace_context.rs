@@ -43,7 +43,7 @@ impl AuthorizedWorkspaceContext {
     /// Fail-closed semantics:
     /// - Base capabilities are initialized from `RoleProfile::base_capabilities(membership_role)`.
     /// - All provided capability grants are filtered to ensure:
-    ///   1. `grant.workspace_id == workspace_id`
+    ///   1. `grant.workspace_id == Some(workspace_id)` OR `grant.program_id == Some(program_id)`
     ///   2. `grant.principal_id == principal_id`
     ///   3. `grant.is_active_at(evaluated_at)`
     /// - Active grants are merged into the resolved `CapabilitySet`.
@@ -60,8 +60,10 @@ impl AuthorizedWorkspaceContext {
         let mut valid_active_grants = Vec::new();
 
         for grant in grants {
-            // Ensure grant strictly belongs to this workspace and principal
-            if grant.workspace_id == workspace_id
+            let matches_scope =
+                grant.workspace_id == Some(workspace_id) || grant.program_id == Some(program_id);
+
+            if matches_scope
                 && grant.principal_id == principal_id
                 && grant.is_active_at(evaluated_at)
             {
@@ -237,13 +239,13 @@ mod tests {
         let ws_id = WorkspaceId::new();
         let now = Utc::now();
 
-        // 1. Viewer role with no extra grants
+        // 1. Reader role with no extra grants
         let ctx = AuthorizedWorkspaceContext::resolve(
             p_id,
             org_id,
             prog_id,
             ws_id,
-            MembershipRole::Viewer,
+            MembershipRole::Reader,
             vec![],
             now,
         );
@@ -252,7 +254,7 @@ mod tests {
         assert_eq!(ctx.organization_id(), org_id);
         assert_eq!(ctx.program_id(), prog_id);
         assert_eq!(ctx.workspace_id(), ws_id);
-        assert_eq!(ctx.membership_role(), MembershipRole::Viewer);
+        assert_eq!(ctx.membership_role(), MembershipRole::Reader);
 
         assert!(ctx.can_read_workspace());
         assert!(!ctx.can_write_workspace());
@@ -272,7 +274,7 @@ mod tests {
         let ws_id = WorkspaceId::new();
         let now = Utc::now();
 
-        // Active grant for OVERRIDE_BLOCK
+        // Active grant for OVERRIDE_BLOCK (workspace-scoped)
         let active_grant = CapabilityGrant::new(
             ws_id,
             p_id,
@@ -285,12 +287,16 @@ mod tests {
         // Expired grant for RIGHTS_REVIEW
         let expired_grant = CapabilityGrant::reconstruct(
             crate::capability::CapabilityGrantId::new(),
-            ws_id,
+            Some(ws_id),
+            None,
             p_id,
             Capability::RightsReview,
             None,
             now - Duration::hours(2),
             Some(now - Duration::hours(1)),
+            None,
+            None,
+            None,
         );
 
         // Grant for a different workspace
@@ -303,24 +309,31 @@ mod tests {
         )
         .unwrap();
 
+        // Program-scoped grant for RULE_ACTIVATION
+        let prog_grant = CapabilityGrant::new_program_grant(
+            prog_id,
+            p_id,
+            Capability::RuleActivation,
+            None,
+            Some(now + Duration::hours(1)),
+        )
+        .unwrap();
+
         let ctx = AuthorizedWorkspaceContext::resolve(
             p_id,
             org_id,
             prog_id,
             ws_id,
-            MembershipRole::Member,
-            vec![active_grant, expired_grant, other_ws_grant],
+            MembershipRole::Operator,
+            vec![active_grant, expired_grant, other_ws_grant, prog_grant],
             now,
         );
 
         assert!(ctx.can_read_workspace());
         assert!(ctx.can_write_workspace());
         assert!(ctx.can_override_block());
+        assert!(ctx.can_activate_rule(), "Program grant must resolve");
         assert!(!ctx.can_review_rights(), "Expired grant must not resolve");
-        assert!(
-            !ctx.can_activate_rule(),
-            "Grant for other workspace must not resolve"
-        );
-        assert_eq!(ctx.active_grants().len(), 1);
+        assert_eq!(ctx.active_grants().len(), 2);
     }
 }

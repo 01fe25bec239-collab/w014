@@ -11,33 +11,27 @@ use w014_domain::ids::PrincipalId;
 #[test]
 fn test_oidc_identity_invariants() {
     let p_id = PrincipalId::new();
-    let claims = serde_json::json!({
-        "iss": "https://accounts.google.com",
-        "sub": "user-sub-12345",
-        "email": "user@example.com"
-    });
 
     let identity = OidcIdentity::new(
         p_id,
         "https://accounts.google.com",
         "user-sub-12345",
         Some("user@example.com"),
-        claims.clone(),
     )
     .unwrap();
 
     assert_eq!(identity.principal_id, p_id);
     assert_eq!(identity.issuer, "https://accounts.google.com");
     assert_eq!(identity.subject, "user-sub-12345");
-    assert_eq!(identity.email.as_deref(), Some("user@example.com"));
+    assert_eq!(identity.email(), Some("user@example.com"));
     assert_eq!(
         identity.identity_key(),
         ("https://accounts.google.com", "user-sub-12345")
     );
 
     // Empty issuer/subject rejected
-    assert!(OidcIdentity::new(p_id, "   ", "sub", None::<&str>, claims.clone()).is_err());
-    assert!(OidcIdentity::new(p_id, "https://issuer.com", "   ", None::<&str>, claims).is_err());
+    assert!(OidcIdentity::new(p_id, "   ", "sub", None::<&str>).is_err());
+    assert!(OidcIdentity::new(p_id, "https://issuer.com", "   ", None::<&str>).is_err());
 }
 
 #[test]
@@ -85,22 +79,26 @@ fn test_session_rotation_invariants() {
     // Valid rotation
     let rot = SessionRotation::new(
         s_id,
+        1,
         b"old_token_hash_val".to_vec(),
         b"new_token_hash_val".to_vec(),
-        Some("10.0.0.1"),
+        "periodic",
     )
     .unwrap();
 
     assert_eq!(rot.session_id, s_id);
+    assert_eq!(rot.rotation_number, 1);
     assert_eq!(rot.old_handle_hash, b"old_token_hash_val".to_vec());
     assert_eq!(rot.new_handle_hash, b"new_token_hash_val".to_vec());
+    assert_eq!(rot.reason, "periodic");
 
     // Identical hash rejected
     let err = SessionRotation::new(
         s_id,
+        1,
         b"same_hash".to_vec(),
         b"same_hash".to_vec(),
-        None::<&str>,
+        "periodic",
     )
     .unwrap_err();
     assert_eq!(err, AuthnError::IdenticalRotationHashes);
@@ -111,15 +109,18 @@ fn test_oidc_transaction_validity_invariants() {
     let now = Utc::now();
     let expires = now + Duration::minutes(5);
 
-    let tx = OidcTransaction::new(
-        "state_token_12345",
-        "nonce_67890",
-        Some("pkce_verifier_abcde"),
-        "https://app.local/callback",
+    let mut tx = OidcTransaction::new(
+        b"state_hash_12345".to_vec(),
+        b"nonce_hash_67890".to_vec(),
+        Some(b"pkce_cipher_abcde".to_vec()),
+        "/callback",
         expires,
     )
     .unwrap();
 
     assert!(tx.is_valid_at(now));
     assert!(!tx.is_valid_at(expires + Duration::seconds(1)));
+
+    tx.consume(now);
+    assert!(!tx.is_valid_at(now));
 }

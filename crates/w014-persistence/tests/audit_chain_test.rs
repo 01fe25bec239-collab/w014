@@ -1,12 +1,12 @@
 //! Authoritative Audit Chain Integration and Invariant Tests against real PostgreSQL 18.
 //!
 //! Validates:
-//! - One authoritative chain head per workspace.
+//! - One authoritative chain head per workspace (last_sequence = 0, last_event_hash = NULL).
 //! - Strict monotonically increasing sequence per workspace.
-//! - Cryptographic hash chain linkage anchored at genesis.
+//! - Cryptographic hash chain linkage with BYTEA hashes and RFC-8785 JSON canonicalization.
 //! - Atomic event insert + chain-head advancement.
-//! - Concurrent append serialization and integrity.
-//! - Complete chain verification and tamper/gap detection.
+//! - Concurrent append serialization with SELECT FOR UPDATE row lock.
+//! - Complete chain verification and tamper/gap/disorder detection.
 
 use serde_json::json;
 use std::sync::Arc;
@@ -22,14 +22,14 @@ async fn setup_test_workspace(test_db: &TestDatabase) -> (Uuid, Uuid, Uuid) {
     let program_id = Uuid::new_v4();
     let workspace_id = Uuid::new_v4();
 
-    sqlx::query("INSERT INTO organizations (id, name, slug) VALUES ($1, 'Audit Test Org', $2)")
+    sqlx::query("INSERT INTO organizations (organization_id, display_name, slug) VALUES ($1, 'Audit Test Org', $2)")
         .bind(org_id)
         .bind(format!("org-{}", org_id.simple()))
         .execute(test_db.pool())
         .await
         .expect("Failed to create test org");
 
-    sqlx::query("INSERT INTO programs (id, organization_id, name, slug) VALUES ($1, $2, 'Audit Test Program', $3)")
+    sqlx::query("INSERT INTO programs (program_id, organization_id, name, program_code) VALUES ($1, $2, 'Audit Test Program', $3)")
         .bind(program_id)
         .bind(org_id)
         .bind(format!("prog-{}", program_id.simple()))
@@ -37,7 +37,7 @@ async fn setup_test_workspace(test_db: &TestDatabase) -> (Uuid, Uuid, Uuid) {
         .await
         .expect("Failed to create test program");
 
-    sqlx::query("INSERT INTO workspaces (id, program_id, organization_id, name, slug) VALUES ($1, $2, $3, 'Audit Test Workspace', $4)")
+    sqlx::query("INSERT INTO workspaces (workspace_id, program_id, organization_id, name, workspace_code) VALUES ($1, $2, $3, 'Audit Test Workspace', $4)")
         .bind(workspace_id)
         .bind(program_id)
         .bind(org_id)
@@ -73,9 +73,8 @@ async fn test_audit_chain_lifecycle_and_hash_integrity() {
     tx.commit().await.expect("Failed to commit tx");
 
     assert_eq!(head.workspace_id, workspace_id);
-    assert_eq!(head.head_sequence_num, 0);
-    assert_eq!(head.head_event_hash, hasher.genesis_hash());
-    assert_eq!(head.genesis_hash, hasher.genesis_hash());
+    assert_eq!(head.last_sequence, 0);
+    assert_eq!(head.last_event_hash, None);
 
     // 2. Append first audit event (sequence = 1)
     let mut tx = test_db.pool().begin().await.expect("Failed to begin tx");
@@ -84,22 +83,29 @@ async fn test_audit_chain_lifecycle_and_hash_integrity() {
             &mut tx,
             AppendAuditParams {
                 workspace_id,
-                event_type: "workspace.created".to_string(),
-                actor_principal_id: None,
-                action: "CREATE".to_string(),
-                resource_type: "workspace".to_string(),
-                resource_id: workspace_id.to_string(),
-                payload: json!({"name": "Audit Test Workspace"}),
+                actor_type: "user".to_string(),
+                actor_id: None,
+                authority_snapshot: json!({}),
+                action_code: "WORKSPACE_CREATE".to_string(),
+                entity_type: "workspace".to_string(),
+                entity_id: workspace_id.to_string(),
+                entity_version: Some(1),
+                request_id: Some("req-001".to_string()),
                 correlation_id: Some("corr-001".to_string()),
+                job_id: None,
+                source_state_hash: None,
+                before_ref: None,
+                after_ref: Some(json!({"name": "Audit Test Workspace"})),
+                metadata: json!({"environment": "test"}),
             },
         )
         .await
         .expect("Failed to append event 1");
     tx.commit().await.expect("Failed to commit tx");
 
-    assert_eq!(event1.sequence_num, 1);
-    assert_eq!(event1.previous_event_hash, hasher.genesis_hash());
-    assert_eq!(event1.event_hash.len(), 64);
+    assert_eq!(event1.sequence, 1);
+    assert_eq!(event1.previous_event_hash, None);
+    assert_eq!(event1.event_hash.len(), 32);
 
     // Verify chain head was updated to sequence 1 and event1 hash
     let mut tx = test_db.pool().begin().await.expect("Failed to begin tx");
@@ -110,8 +116,11 @@ async fn test_audit_chain_lifecycle_and_hash_integrity() {
         .expect("Chain head must exist");
     tx.commit().await.expect("Failed to commit tx");
 
-    assert_eq!(head_after_1.head_sequence_num, 1);
-    assert_eq!(head_after_1.head_event_hash, event1.event_hash);
+    assert_eq!(head_after_1.last_sequence, 1);
+    assert_eq!(
+        head_after_1.last_event_hash,
+        Some(event1.event_hash.clone())
+    );
 
     // 3. Append second audit event (sequence = 2)
     let mut tx = test_db.pool().begin().await.expect("Failed to begin tx");
@@ -120,22 +129,29 @@ async fn test_audit_chain_lifecycle_and_hash_integrity() {
             &mut tx,
             AppendAuditParams {
                 workspace_id,
-                event_type: "membership.granted".to_string(),
-                actor_principal_id: None,
-                action: "GRANT".to_string(),
-                resource_type: "membership".to_string(),
-                resource_id: "mem-123".to_string(),
-                payload: json!({"role": "admin"}),
+                actor_type: "user".to_string(),
+                actor_id: None,
+                authority_snapshot: json!({}),
+                action_code: "MEMBERSHIP_GRANT".to_string(),
+                entity_type: "membership".to_string(),
+                entity_id: "mem-123".to_string(),
+                entity_version: Some(1),
+                request_id: Some("req-002".to_string()),
                 correlation_id: Some("corr-002".to_string()),
+                job_id: None,
+                source_state_hash: None,
+                before_ref: None,
+                after_ref: Some(json!({"role_code": "admin"})),
+                metadata: json!({}),
             },
         )
         .await
         .expect("Failed to append event 2");
     tx.commit().await.expect("Failed to commit tx");
 
-    assert_eq!(event2.sequence_num, 2);
-    assert_eq!(event2.previous_event_hash, event1.event_hash);
-    assert_eq!(event2.event_hash.len(), 64);
+    assert_eq!(event2.sequence, 2);
+    assert_eq!(event2.previous_event_hash, Some(event1.event_hash.clone()));
+    assert_eq!(event2.event_hash.len(), 32);
     assert_ne!(event1.event_hash, event2.event_hash);
 
     // 4. Append third audit event (sequence = 3)
@@ -145,21 +161,28 @@ async fn test_audit_chain_lifecycle_and_hash_integrity() {
             &mut tx,
             AppendAuditParams {
                 workspace_id,
-                event_type: "capability.granted".to_string(),
-                actor_principal_id: None,
-                action: "GRANT".to_string(),
-                resource_type: "capability_grant".to_string(),
-                resource_id: "cap-456".to_string(),
-                payload: json!({"capability": "source:read"}),
+                actor_type: "user".to_string(),
+                actor_id: None,
+                authority_snapshot: json!({}),
+                action_code: "CAPABILITY_GRANT".to_string(),
+                entity_type: "capability_grant".to_string(),
+                entity_id: "cap-456".to_string(),
+                entity_version: Some(1),
+                request_id: Some("req-003".to_string()),
                 correlation_id: Some("corr-003".to_string()),
+                job_id: None,
+                source_state_hash: None,
+                before_ref: None,
+                after_ref: Some(json!({"capability_code": "source:read"})),
+                metadata: json!({}),
             },
         )
         .await
         .expect("Failed to append event 3");
     tx.commit().await.expect("Failed to commit tx");
 
-    assert_eq!(event3.sequence_num, 3);
-    assert_eq!(event3.previous_event_hash, event2.event_hash);
+    assert_eq!(event3.sequence, 3);
+    assert_eq!(event3.previous_event_hash, Some(event2.event_hash.clone()));
 
     // 5. Fetch all events and verify complete chain cryptographic integrity
     let mut tx = test_db.pool().begin().await.expect("Failed to begin tx");
@@ -175,13 +198,13 @@ async fn test_audit_chain_lifecycle_and_hash_integrity() {
         "Audit chain integrity check must pass for unmodified events"
     );
 
-    // 6. Test tamper detection: modifying one event's payload in memory fails verification
+    // 6. Test tamper detection: modifying one event's metadata in memory fails verification
     let mut tampered_events = events.clone();
-    tampered_events[1].payload = json!({"role": "superadmin_hacked"});
+    tampered_events[1].metadata = json!({"role": "superadmin_hacked"});
     let tamper_res = hasher.verify_chain_integrity(&tampered_events);
     match tamper_res {
-        Err(AuditIntegrityError::HashTamperDetected { sequence_num, .. }) => {
-            assert_eq!(sequence_num, 2);
+        Err(AuditIntegrityError::HashTamperDetected { sequence, .. }) => {
+            assert_eq!(sequence, 2);
         }
         other => panic!("Expected HashTamperDetected error, got: {other:?}"),
     }
@@ -220,13 +243,20 @@ async fn test_audit_chain_concurrent_appends_serialization() {
                     &mut tx,
                     AppendAuditParams {
                         workspace_id: ws_id,
-                        event_type: format!("concurrent.event.{i}"),
-                        actor_principal_id: None,
-                        action: "MUTATE".to_string(),
-                        resource_type: "item".to_string(),
-                        resource_id: format!("res-{i}"),
-                        payload: json!({"task_index": i}),
+                        actor_type: "worker".to_string(),
+                        actor_id: None,
+                        authority_snapshot: json!({}),
+                        action_code: "TASK_PROCESS".to_string(),
+                        entity_type: "task".to_string(),
+                        entity_id: format!("res-{i}"),
+                        entity_version: Some(1),
+                        request_id: None,
                         correlation_id: Some(format!("corr-{i}")),
+                        job_id: None,
+                        source_state_hash: None,
+                        before_ref: None,
+                        after_ref: None,
+                        metadata: json!({"task_index": i}),
                     },
                 )
                 .await
@@ -257,7 +287,7 @@ async fn test_audit_chain_concurrent_appends_serialization() {
 
     // Verify sequences are strictly 1..=10
     for (idx, event) in events.iter().enumerate() {
-        assert_eq!(event.sequence_num, (idx as i64) + 1);
+        assert_eq!(event.sequence, (idx as i64) + 1);
     }
 
     test_db.close().await.expect("Failed to drop test database");

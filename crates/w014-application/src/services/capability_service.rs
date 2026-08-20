@@ -1,6 +1,4 @@
 //! Capability Grant application service with atomic audit logging.
-//!
-//! Note: The WI-0103 capability engine is deferred to WI-0103.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
@@ -50,13 +48,24 @@ impl CapabilityGrantService {
 
         let audit_params = AppendAuditParams {
             workspace_id: workspace_id.into_uuid(),
-            event_type: "capability.granted".to_string(),
-            actor_principal_id: actor_principal_id.map(|p| p.into_uuid()),
-            action: "grant".to_string(),
-            resource_type: "capability_grant".to_string(),
-            resource_id: grant.id.to_string(),
-            payload: audit_payload,
+            actor_type: if actor_principal_id.is_some() {
+                "principal".to_string()
+            } else {
+                "system".to_string()
+            },
+            actor_id: actor_principal_id.map(|p| p.into_uuid()),
+            authority_snapshot: serde_json::json!({}),
+            action_code: "CAPABILITY_GRANT".to_string(),
+            entity_type: "capability_grant".to_string(),
+            entity_id: grant.id.to_string(),
+            entity_version: Some(1),
+            request_id: None,
             correlation_id,
+            job_id: None,
+            source_state_hash: None,
+            before_ref: None,
+            after_ref: Some(audit_payload),
+            metadata: serde_json::json!({}),
         };
 
         audit_store.append_audit_event(tx, audit_params).await?;
@@ -77,29 +86,49 @@ impl CapabilityGrantService {
             .ok_or_else(|| ApplicationError::NotFound(format!("Capability grant {}", grant_id)))?;
 
         let now = Utc::now();
-        grant.revoke(now)?;
-        CapabilityGrantRepository::update_expiry(tx, grant.id, grant.expires_at).await?;
+        grant.revoke(now, actor_principal_id, Some("Revoked via API".to_string()))?;
+        CapabilityGrantRepository::revoke(
+            tx,
+            grant.id,
+            now,
+            actor_principal_id,
+            Some("Revoked via API"),
+        )
+        .await?;
 
         let audit_payload = serde_json::json!({
             "grant_id": grant.id.to_string(),
-            "workspace_id": grant.workspace_id.to_string(),
+            "workspace_id": grant.workspace_id.map(|id| id.to_string()),
             "principal_id": grant.principal_id.to_string(),
             "capability": grant.capability.as_str(),
             "revoked_at": now.to_rfc3339(),
         });
 
-        let audit_params = AppendAuditParams {
-            workspace_id: grant.workspace_id.into_uuid(),
-            event_type: "capability.revoked".to_string(),
-            actor_principal_id: actor_principal_id.map(|p| p.into_uuid()),
-            action: "revoke".to_string(),
-            resource_type: "capability_grant".to_string(),
-            resource_id: grant.id.to_string(),
-            payload: audit_payload,
-            correlation_id,
-        };
+        if let Some(ws_id) = grant.workspace_id {
+            let audit_params = AppendAuditParams {
+                workspace_id: ws_id.into_uuid(),
+                actor_type: if actor_principal_id.is_some() {
+                    "principal".to_string()
+                } else {
+                    "system".to_string()
+                },
+                actor_id: actor_principal_id.map(|p| p.into_uuid()),
+                authority_snapshot: serde_json::json!({}),
+                action_code: "CAPABILITY_REVOKE".to_string(),
+                entity_type: "capability_grant".to_string(),
+                entity_id: grant.id.to_string(),
+                entity_version: Some(2),
+                request_id: None,
+                correlation_id,
+                job_id: None,
+                source_state_hash: None,
+                before_ref: None,
+                after_ref: Some(audit_payload),
+                metadata: serde_json::json!({}),
+            };
 
-        audit_store.append_audit_event(tx, audit_params).await?;
+            audit_store.append_audit_event(tx, audit_params).await?;
+        }
 
         Ok(())
     }

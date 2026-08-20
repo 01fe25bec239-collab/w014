@@ -64,27 +64,18 @@ impl WorkspaceAuthzResolver {
                 ApplicationError::NotFound(format!("Organization {}", workspace.organization_id))
             })?;
 
-        // 4. Fetch principal and verify active status and tenant binding
+        // 4. Fetch principal and verify active status
         let principal = PrincipalRepository::get_by_id(tx, principal_id)
             .await?
             .ok_or_else(|| ApplicationError::NotFound(format!("Principal {}", principal_id)))?;
 
-        if !principal.is_active {
+        if !principal.is_active() {
             return Err(ApplicationError::Authz(AuthzError::InactivePrincipal(
                 principal_id,
             )));
         }
 
-        if principal.organization_id != workspace.organization_id {
-            return Err(ApplicationError::Authz(AuthzError::TenantBoundaryMismatch(
-                format!(
-                    "Principal org '{}' does not match workspace org '{}'",
-                    principal.organization_id, workspace.organization_id
-                ),
-            )));
-        }
-
-        // 5. Fetch membership
+        // 5. Fetch membership and verify active status and validity
         let membership =
             MembershipRepository::get_by_workspace_and_principal(tx, workspace_id, principal_id)
                 .await?
@@ -95,10 +86,18 @@ impl WorkspaceAuthzResolver {
                     })
                 })?;
 
-        // 6. Fetch capability grants for principal in this workspace
-        let grants = CapabilityGrantRepository::get_by_workspace_and_principal(
+        if !membership.is_active_at(evaluated_at) {
+            return Err(ApplicationError::Authz(AuthzError::NoMembership {
+                principal_id,
+                workspace_id,
+            }));
+        }
+
+        // 6. Fetch capability grants for principal in this workspace or program
+        let grants = CapabilityGrantRepository::get_active_for_context(
             tx,
             workspace_id,
+            program.id,
             principal_id,
         )
         .await?;
@@ -109,7 +108,7 @@ impl WorkspaceAuthzResolver {
             organization.id,
             program.id,
             workspace.id,
-            membership.role,
+            membership.role(),
             grants,
             evaluated_at,
         );

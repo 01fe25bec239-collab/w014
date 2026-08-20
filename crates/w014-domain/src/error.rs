@@ -20,9 +20,7 @@ pub enum DomainError {
     InvalidPrincipalType(String),
 
     /// An invalid membership role was specified.
-    #[error(
-        "Invalid membership role '{0}': expected 'owner', 'admin', 'member', 'viewer', or 'auditor'"
-    )]
+    #[error("Invalid membership role '{0}': expected 'admin', 'operator', 'reviewer', or 'reader'")]
     InvalidMembershipRole(String),
 
     /// General entity invariant validation failure.

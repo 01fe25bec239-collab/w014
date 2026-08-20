@@ -49,7 +49,7 @@ impl From<&CapabilityGrant> for CapabilityGrantDto {
     fn from(g: &CapabilityGrant) -> Self {
         Self {
             id: Some(g.id.to_string()),
-            workspace_id: g.workspace_id.to_string(),
+            workspace_id: g.workspace_id.map(|w| w.to_string()).unwrap_or_default(),
             principal_id: g.principal_id.to_string(),
             capability: g.capability.to_string(),
             granted_by: g.granted_by.map(|p| p.to_string()),
@@ -95,7 +95,7 @@ async fn authenticate_caller(
         .map_err(|_| ProblemDetails::internal_server_error(Some(path.into())))?
         .ok_or_else(|| ProblemDetails::unauthorized("Principal not found", Some(path.into())))?;
 
-    if !principal.is_active {
+    if !principal.is_active() {
         return Err(ProblemDetails::forbidden(
             "Principal account is deactivated",
             Some(path.into()),
@@ -219,7 +219,7 @@ pub async fn create_capability_grant_handler(
     };
 
     // 4. Primary Rust authorization check: STRICTLY REQUIRES GRANT_AUTHORITY special authority!
-    // (Never implied by Admin or Owner role profile)
+    // (Never implied by Admin role profile)
     if !awc.can_grant_authority() {
         return Err(ProblemDetails::forbidden(
             "GRANT_AUTHORITY special authority required to grant capabilities",
@@ -275,11 +275,15 @@ pub async fn create_capability_grant_handler(
     let idemp_store = PostgresIdempotencyStore::new();
 
     let record_id_opt = if let Some(ref key) = idemp_key {
+        let key_hash =
+            IdempotencyCoordinator::compute_key_hash(&state.config.session.active_hmac_secret, key);
         match IdempotencyCoordinator::evaluate_key(
             ws_tx.conn(),
             &idemp_store,
             Some(awc.workspace_id()),
-            key,
+            principal.id,
+            "CAPABILITY_GRANT",
+            &key_hash,
             &req_hash,
             86400,
         )
@@ -372,13 +376,20 @@ pub async fn create_capability_grant_handler(
 
     let grant_audit_params = AppendAuditParams {
         workspace_id: awc.workspace_id().into_uuid(),
-        event_type: "capability.granted".to_string(),
-        actor_principal_id: Some(principal.id.into_uuid()),
-        action: "grant".to_string(),
-        resource_type: "capability_grant".to_string(),
-        resource_id: grant.id.to_string(),
-        payload: grant_audit_payload,
+        actor_type: "principal".to_string(),
+        actor_id: Some(principal.id.into_uuid()),
+        authority_snapshot: serde_json::json!({}),
+        action_code: "CAPABILITY_GRANT".to_string(),
+        entity_type: "capability_grant".to_string(),
+        entity_id: grant.id.to_string(),
+        entity_version: Some(1),
+        request_id: None,
         correlation_id: None,
+        job_id: None,
+        source_state_hash: None,
+        before_ref: None,
+        after_ref: None,
+        metadata: grant_audit_payload,
     };
 
     audit_store
@@ -395,7 +406,6 @@ pub async fn create_capability_grant_handler(
             &idemp_store,
             record_id,
             StatusCode::CREATED.as_u16(),
-            None,
             resp_body,
         )
         .await
@@ -537,11 +547,15 @@ pub async fn revoke_capability_grant_handler(
     let idemp_store = PostgresIdempotencyStore::new();
 
     let record_id_opt = if let Some(ref key) = idemp_key {
+        let key_hash =
+            IdempotencyCoordinator::compute_key_hash(&state.config.session.active_hmac_secret, key);
         match IdempotencyCoordinator::evaluate_key(
             ws_tx.conn(),
             &idemp_store,
             Some(awc.workspace_id()),
-            key,
+            principal.id,
+            "CAPABILITY_REVOKE",
+            &key_hash,
             &req_hash,
             86400,
         )
@@ -592,14 +606,14 @@ pub async fn revoke_capability_grant_handler(
         )
     })?;
 
-    if grant.workspace_id != awc.workspace_id() {
+    if grant.workspace_id != Some(awc.workspace_id()) {
         return Err(ProblemDetails::not_found(
             format!("Capability grant '{}' was not found", grant_id_str),
             Some(req_path),
         ));
     }
 
-    if grant.is_expired_at(now) {
+    if !grant.is_active_at(now) {
         return Err(ProblemDetails::conflict(
             format!(
                 "Capability grant '{}' is already revoked or expired",
@@ -611,12 +625,18 @@ pub async fn revoke_capability_grant_handler(
 
     // 8. Revoke grant (one-way revocation)
     grant
-        .revoke(now)
+        .revoke(now, Some(principal.id), payload.reason.clone())
         .map_err(|e| ProblemDetails::conflict(e.to_string(), Some(req_path.clone())))?;
 
-    CapabilityGrantRepository::update_expiry(ws_tx.conn(), grant.id, grant.expires_at)
-        .await
-        .map_err(|_| ProblemDetails::internal_server_error(Some(req_path.clone())))?;
+    CapabilityGrantRepository::revoke(
+        ws_tx.conn(),
+        grant.id,
+        now,
+        Some(principal.id),
+        payload.reason.as_deref(),
+    )
+    .await
+    .map_err(|_| ProblemDetails::internal_server_error(Some(req_path.clone())))?;
 
     // 9. Append capability.revoked audit event
     let audit_store = PostgresAuditStore::new();
@@ -631,13 +651,20 @@ pub async fn revoke_capability_grant_handler(
 
     let revoke_audit_params = AppendAuditParams {
         workspace_id: awc.workspace_id().into_uuid(),
-        event_type: "capability.revoked".to_string(),
-        actor_principal_id: Some(principal.id.into_uuid()),
-        action: "revoke".to_string(),
-        resource_type: "capability_grant".to_string(),
-        resource_id: grant.id.to_string(),
-        payload: revoke_audit_payload,
+        actor_type: "principal".to_string(),
+        actor_id: Some(principal.id.into_uuid()),
+        authority_snapshot: serde_json::json!({}),
+        action_code: "CAPABILITY_REVOKE".to_string(),
+        entity_type: "capability_grant".to_string(),
+        entity_id: grant.id.to_string(),
+        entity_version: Some(1),
+        request_id: None,
         correlation_id: None,
+        job_id: None,
+        source_state_hash: None,
+        before_ref: None,
+        after_ref: None,
+        metadata: revoke_audit_payload,
     };
 
     audit_store
@@ -654,7 +681,6 @@ pub async fn revoke_capability_grant_handler(
             &idemp_store,
             record_id,
             StatusCode::OK.as_u16(),
-            None,
             resp_body,
         )
         .await

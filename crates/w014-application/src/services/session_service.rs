@@ -60,7 +60,7 @@ impl SessionService {
         new_handle_hash: impl Into<Vec<u8>>,
         new_idle_expires_at: DateTime<Utc>,
         new_absolute_expires_at: DateTime<Utc>,
-        ip_address: Option<impl AsRef<str>>,
+        reason: Option<impl AsRef<str>>,
     ) -> Result<SessionRotation, ApplicationError> {
         let mut session = SessionRepository::get_by_id(tx, session_id)
             .await?
@@ -68,11 +68,15 @@ impl SessionService {
 
         let old_handle_hash = session.handle_hash.clone();
         let new_hash_bytes = new_handle_hash.into();
+        session.rotation_counter += 1;
+        let rotation_number = session.rotation_counter;
+
         let rotation = SessionRotation::new(
             session_id,
+            rotation_number,
             old_handle_hash,
             new_hash_bytes.clone(),
-            ip_address.as_ref().map(|s| s.as_ref()),
+            reason.as_ref().map(|s| s.as_ref()).unwrap_or("periodic"),
         )?;
 
         // 1. Insert immutable rotation record
@@ -84,7 +88,6 @@ impl SessionService {
         session.last_seen_at = now;
         session.idle_expires_at = new_idle_expires_at;
         session.absolute_expires_at = new_absolute_expires_at;
-        session.rotation_counter += 1;
         SessionRepository::update(tx, &session).await?;
 
         Ok(rotation)
