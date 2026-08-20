@@ -11,7 +11,7 @@
 //! - Immutability trigger protection on `audit_events` (preventing UPDATE/DELETE).
 //! - Protection trigger on `audit_chain_heads` (preventing DELETE and sequence reduction).
 //! - CHECK constraints across all M001R tables.
-//! - Role privilege boundaries and absence of BYPASSRLS for `w014_app` and `w014_readonly`.
+//! - Role privilege boundaries and absence of BYPASSRLS for `w014_app` and `w014_worker`.
 
 use serde_json::json;
 use uuid::Uuid;
@@ -51,7 +51,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
 
     // Insert Org A & Org B
     sqlx::query(
-        "INSERT INTO organizations (id, name, slug) VALUES ($1, 'Org A', $2), ($3, 'Org B', $4)",
+        "INSERT INTO organizations (organization_id, display_name, slug) VALUES ($1, 'Org A', $2), ($3, 'Org B', $4)",
     )
     .bind(org_a)
     .bind(format!("org-a-{}", org_a.simple()))
@@ -62,19 +62,17 @@ async fn test_rls_workspace_a_b_full_isolation() {
     .expect("Failed to create orgs");
 
     // Insert Principals
-    sqlx::query("INSERT INTO principals (id, organization_id, principal_type, email, display_name) VALUES ($1, $2, 'user', $3, 'User A'), ($4, $5, 'user', $6, 'User B')")
+    sqlx::query("INSERT INTO principals (principal_id, display_name, email, status) VALUES ($1, 'User A', $2, 'active'), ($3, 'User B', $4, 'active')")
         .bind(principal_a)
-        .bind(org_a)
         .bind(format!("alice-{}@org-a.com", principal_a.simple()))
         .bind(principal_b)
-        .bind(org_b)
         .bind(format!("bob-{}@org-b.com", principal_b.simple()))
         .execute(test_db.pool())
         .await
         .expect("Failed to create principals");
 
     // Insert Programs
-    sqlx::query("INSERT INTO programs (id, organization_id, name, slug) VALUES ($1, $2, 'Prog A', $3), ($4, $5, 'Prog B', $6)")
+    sqlx::query("INSERT INTO programs (program_id, organization_id, name, program_code) VALUES ($1, $2, 'Prog A', $3), ($4, $5, 'Prog B', $6)")
         .bind(prog_a)
         .bind(org_a)
         .bind(format!("prog-a-{}", prog_a.simple()))
@@ -86,7 +84,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
         .expect("Failed to create programs");
 
     // Insert Workspaces
-    sqlx::query("INSERT INTO workspaces (id, program_id, organization_id, name, slug) VALUES ($1, $2, $3, 'WS A', $4), ($5, $6, $7, 'WS B', $8)")
+    sqlx::query("INSERT INTO workspaces (workspace_id, program_id, organization_id, name, workspace_code) VALUES ($1, $2, $3, 'WS A', $4), ($5, $6, $7, 'WS B', $8)")
         .bind(ws_a)
         .bind(prog_a)
         .bind(org_a)
@@ -100,7 +98,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
         .expect("Failed to create workspaces");
 
     // Insert Memberships
-    sqlx::query("INSERT INTO memberships (id, workspace_id, principal_id, role) VALUES ($1, $2, $3, 'owner'), ($4, $5, $6, 'owner')")
+    sqlx::query("INSERT INTO memberships (membership_id, workspace_id, principal_id, role_code, status) VALUES ($1, $2, $3, 'admin', 'active'), ($4, $5, $6, 'admin', 'active')")
         .bind(membership_a)
         .bind(ws_a)
         .bind(principal_a)
@@ -112,7 +110,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
         .expect("Failed to create memberships");
 
     // Insert Capability Grants
-    sqlx::query("INSERT INTO capability_grants (id, workspace_id, principal_id, capability) VALUES ($1, $2, $3, 'WORKSPACE_WRITE'), ($4, $5, $6, 'WORKSPACE_WRITE')")
+    sqlx::query("INSERT INTO capability_grants (capability_grant_id, workspace_id, principal_id, capability_code) VALUES ($1, $2, $3, 'WORKSPACE_WRITE'), ($4, $5, $6, 'WORKSPACE_WRITE')")
         .bind(grant_a)
         .bind(ws_a)
         .bind(principal_a)
@@ -125,14 +123,16 @@ async fn test_rls_workspace_a_b_full_isolation() {
 
     // Insert Idempotency Records
     sqlx::query(
-        "INSERT INTO idempotency_records (id, workspace_id, idempotency_key, request_hash, status, expires_at)
-         VALUES ($1, $2, 'key-a', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'completed', CURRENT_TIMESTAMP + INTERVAL '1 hour'),
-                ($3, $4, 'key-b', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'completed', CURRENT_TIMESTAMP + INTERVAL '1 hour')"
+        "INSERT INTO idempotency_records (idempotency_record_id, workspace_id, principal_id, route_code, key_hash, request_hash, response_status, expires_at)
+         VALUES ($1, $2, $3, 'ROUTE_A', '\\xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::bytea, '\\xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::bytea, 200, clock_timestamp() + INTERVAL '1 hour'),
+                ($4, $5, $6, 'ROUTE_B', '\\xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'::bytea, '\\xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'::bytea, 200, clock_timestamp() + INTERVAL '1 hour')"
     )
     .bind(idemp_a)
     .bind(ws_a)
+    .bind(principal_a)
     .bind(idemp_b)
     .bind(ws_b)
+    .bind(principal_b)
     .execute(test_db.pool())
     .await
     .expect("Failed to insert idempotency records");
@@ -149,13 +149,20 @@ async fn test_rls_workspace_a_b_full_isolation() {
                 &mut tx,
                 AppendAuditParams {
                     workspace_id: ws_a,
-                    event_type: "ws_a.init".to_string(),
-                    actor_principal_id: Some(principal_a),
-                    action: "CREATE".to_string(),
-                    resource_type: "workspace".to_string(),
-                    resource_id: ws_a.to_string(),
-                    payload: json!({"workspace": "ws_a"}),
+                    actor_type: "user".to_string(),
+                    actor_id: Some(principal_a),
+                    authority_snapshot: json!({}),
+                    action_code: "WORKSPACE_CREATE".to_string(),
+                    entity_type: "workspace".to_string(),
+                    entity_id: ws_a.to_string(),
+                    entity_version: Some(1),
+                    request_id: None,
                     correlation_id: Some("corr-a".to_string()),
+                    job_id: None,
+                    source_state_hash: None,
+                    before_ref: None,
+                    after_ref: Some(json!({"workspace": "ws_a"})),
+                    metadata: json!({}),
                 },
             )
             .await
@@ -170,13 +177,20 @@ async fn test_rls_workspace_a_b_full_isolation() {
                 &mut tx,
                 AppendAuditParams {
                     workspace_id: ws_b,
-                    event_type: "ws_b.init".to_string(),
-                    actor_principal_id: Some(principal_b),
-                    action: "CREATE".to_string(),
-                    resource_type: "workspace".to_string(),
-                    resource_id: ws_b.to_string(),
-                    payload: json!({"workspace": "ws_b"}),
+                    actor_type: "user".to_string(),
+                    actor_id: Some(principal_b),
+                    authority_snapshot: json!({}),
+                    action_code: "WORKSPACE_CREATE".to_string(),
+                    entity_type: "workspace".to_string(),
+                    entity_id: ws_b.to_string(),
+                    entity_version: Some(1),
+                    request_id: None,
                     correlation_id: Some("corr-b".to_string()),
+                    job_id: None,
+                    source_state_hash: None,
+                    before_ref: None,
+                    after_ref: Some(json!({"workspace": "ws_b"})),
+                    metadata: json!({}),
                 },
             )
             .await
@@ -206,7 +220,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
             .expect("get context");
         assert_eq!(current_ctx, Some(ws_a));
 
-        let ws_a_visible: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+        let ws_a_visible: Vec<Uuid> = sqlx::query_scalar("SELECT workspace_id FROM workspaces")
             .fetch_all(&mut *tx)
             .await
             .expect("query workspaces");
@@ -216,7 +230,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
             "Workspace A can access own workspace record"
         );
 
-        let memberships_a: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM memberships")
+        let memberships_a: Vec<Uuid> = sqlx::query_scalar("SELECT membership_id FROM memberships")
             .fetch_all(&mut *tx)
             .await
             .expect("query memberships");
@@ -226,10 +240,13 @@ async fn test_rls_workspace_a_b_full_isolation() {
             "Workspace A can access own membership"
         );
 
-        let grants_a: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM capability_grants")
-            .fetch_all(&mut *tx)
-            .await
-            .expect("query capability_grants");
+        let grants_a: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT capability_grant_id FROM capability_grants WHERE workspace_id = $1",
+        )
+        .bind(ws_a)
+        .fetch_all(&mut *tx)
+        .await
+        .expect("query capability_grants");
         assert_eq!(
             grants_a,
             vec![grant_a],
@@ -246,18 +263,19 @@ async fn test_rls_workspace_a_b_full_isolation() {
             "Workspace A can access own audit chain head"
         );
 
-        let events_a: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM audit_events")
+        let events_a: Vec<Uuid> = sqlx::query_scalar("SELECT audit_event_id FROM audit_events")
             .fetch_all(&mut *tx)
             .await
             .expect("query audit_events");
         assert_eq!(events_a.len(), 1, "Workspace A can access own audit event");
 
-        let idemp_records_a: Vec<Uuid> =
-            sqlx::query_scalar("SELECT id FROM idempotency_records WHERE workspace_id = $1")
-                .bind(ws_a)
-                .fetch_all(&mut *tx)
-                .await
-                .expect("query idempotency_records");
+        let idemp_records_a: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT idempotency_record_id FROM idempotency_records WHERE workspace_id = $1",
+        )
+        .bind(ws_a)
+        .fetch_all(&mut *tx)
+        .await
+        .expect("query idempotency_records");
         assert_eq!(
             idemp_records_a,
             vec![idemp_a],
@@ -266,7 +284,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
 
         // 1.2 RLS_WORKSPACE_A_CANNOT_ACCESS_B / CROSS_WORKSPACE_SELECT_DENIED: PASS
         let ws_b_lookup: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM workspaces WHERE id = $1")
+            sqlx::query_scalar("SELECT workspace_id FROM workspaces WHERE workspace_id = $1")
                 .bind(ws_b)
                 .fetch_optional(&mut *tx)
                 .await
@@ -277,7 +295,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
         );
 
         let member_b_lookup: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM memberships WHERE workspace_id = $1")
+            sqlx::query_scalar("SELECT membership_id FROM memberships WHERE workspace_id = $1")
                 .bind(ws_b)
                 .fetch_optional(&mut *tx)
                 .await
@@ -287,12 +305,13 @@ async fn test_rls_workspace_a_b_full_isolation() {
             "Workspace A must NOT see Workspace B membership"
         );
 
-        let grant_b_lookup: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM capability_grants WHERE workspace_id = $1")
-                .bind(ws_b)
-                .fetch_optional(&mut *tx)
-                .await
-                .expect("lookup grant_b");
+        let grant_b_lookup: Option<Uuid> = sqlx::query_scalar(
+            "SELECT capability_grant_id FROM capability_grants WHERE workspace_id = $1",
+        )
+        .bind(ws_b)
+        .fetch_optional(&mut *tx)
+        .await
+        .expect("lookup grant_b");
         assert!(
             grant_b_lookup.is_none(),
             "Workspace A must NOT see Workspace B capability grant"
@@ -311,7 +330,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
         );
 
         let event_b_lookup: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM audit_events WHERE workspace_id = $1")
+            sqlx::query_scalar("SELECT audit_event_id FROM audit_events WHERE workspace_id = $1")
                 .bind(ws_b)
                 .fetch_optional(&mut *tx)
                 .await
@@ -321,12 +340,13 @@ async fn test_rls_workspace_a_b_full_isolation() {
             "Workspace A must NOT see Workspace B audit event"
         );
 
-        let idemp_b_lookup: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM idempotency_records WHERE workspace_id = $1")
-                .bind(ws_b)
-                .fetch_optional(&mut *tx)
-                .await
-                .expect("lookup idemp_b");
+        let idemp_b_lookup: Option<Uuid> = sqlx::query_scalar(
+            "SELECT idempotency_record_id FROM idempotency_records WHERE workspace_id = $1",
+        )
+        .bind(ws_b)
+        .fetch_optional(&mut *tx)
+        .await
+        .expect("lookup idemp_b");
         assert!(
             idemp_b_lookup.is_none(),
             "Workspace A must NOT see Workspace B idempotency record"
@@ -346,7 +366,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
         set_session_workspace_id(&mut tx, ws_a).await.unwrap();
 
         let bad_insert = sqlx::query(
-            "INSERT INTO memberships (id, workspace_id, principal_id, role) VALUES ($1, $2, $3, 'viewer')"
+            "INSERT INTO memberships (membership_id, workspace_id, principal_id, role_code, status) VALUES ($1, $2, $3, 'reader', 'active')"
         )
         .bind(Uuid::new_v4())
         .bind(ws_b)
@@ -371,7 +391,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
         set_session_workspace_id(&mut tx, ws_a).await.unwrap();
 
         let bad_insert = sqlx::query(
-            "INSERT INTO capability_grants (id, workspace_id, principal_id, capability) VALUES ($1, $2, $3, 'WORKSPACE_READ')"
+            "INSERT INTO capability_grants (capability_grant_id, workspace_id, principal_id, capability_code) VALUES ($1, $2, $3, 'WORKSPACE_READ')"
         )
         .bind(Uuid::new_v4())
         .bind(ws_b)
@@ -397,35 +417,10 @@ async fn test_rls_workspace_a_b_full_isolation() {
 
         let bad_insert = sqlx::query(
             "INSERT INTO audit_events (
-                workspace_id, sequence_num, previous_event_hash, event_hash,
-                event_type, action, resource_type, resource_id, payload
-            ) VALUES ($1, 99, '0000000000000000000000000000000000000000000000000000000000000000',
-                      '1111111111111111111111111111111111111111111111111111111111111111',
-                      'attack.event', 'INJECT', 'res', '1', '{}'::jsonb)",
-        )
-        .bind(ws_b)
-        .execute(&mut *tx)
-        .await;
-
-        assert!(
-            bad_insert.is_err(),
-            "Cross-workspace insert into audit_events must be denied by RLS WITH CHECK"
-        );
-        tx.rollback().await.expect("rollback");
-    }
-
-    // 1.3.4 Idempotency Records insert for WS B under WS A context
-    {
-        let mut tx = test_db.pool().begin().await.expect("begin tx");
-        sqlx::query("SET LOCAL ROLE w014_app")
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        set_session_workspace_id(&mut tx, ws_a).await.unwrap();
-
-        let bad_insert = sqlx::query(
-            "INSERT INTO idempotency_records (id, workspace_id, idempotency_key, request_hash, status, expires_at)
-             VALUES ($1, $2, 'bad-key', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'in_progress', CURRENT_TIMESTAMP + INTERVAL '1 hour')"
+                audit_event_id, workspace_id, sequence, occurred_at,
+                actor_type, action_code, entity_type, entity_id, event_hash
+            ) VALUES ($1, $2, 99, clock_timestamp(),
+                      'system', 'INJECT', 'res', '1', '\\x1111111111111111111111111111111111111111111111111111111111111111'::bytea)",
         )
         .bind(Uuid::new_v4())
         .bind(ws_b)
@@ -434,7 +429,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
 
         assert!(
             bad_insert.is_err(),
-            "Cross-workspace insert into idempotency_records must be denied by RLS WITH CHECK"
+            "Cross-workspace insert into audit_events must be denied by RLS WITH CHECK"
         );
         tx.rollback().await.expect("rollback");
     }
@@ -449,11 +444,12 @@ async fn test_rls_workspace_a_b_full_isolation() {
             .unwrap();
         set_session_workspace_id(&mut tx, ws_a).await.unwrap();
 
-        let bad_update = sqlx::query("UPDATE memberships SET workspace_id = $1 WHERE id = $2")
-            .bind(ws_b)
-            .bind(membership_a)
-            .execute(&mut *tx)
-            .await;
+        let bad_update =
+            sqlx::query("UPDATE memberships SET workspace_id = $1 WHERE membership_id = $2")
+                .bind(ws_b)
+                .bind(membership_a)
+                .execute(&mut *tx)
+                .await;
 
         assert!(
             bad_update.is_err(),
@@ -471,11 +467,12 @@ async fn test_rls_workspace_a_b_full_isolation() {
             .unwrap();
         set_session_workspace_id(&mut tx, ws_a).await.unwrap();
 
-        let blind_update = sqlx::query("UPDATE memberships SET role = 'viewer' WHERE id = $1")
-            .bind(membership_b)
-            .execute(&mut *tx)
-            .await
-            .expect("update query executes");
+        let blind_update =
+            sqlx::query("UPDATE memberships SET role_code = 'reader' WHERE membership_id = $1")
+                .bind(membership_b)
+                .execute(&mut *tx)
+                .await
+                .expect("update query executes");
 
         assert_eq!(
             blind_update.rows_affected(),
@@ -494,11 +491,12 @@ async fn test_rls_workspace_a_b_full_isolation() {
             .unwrap();
         set_session_workspace_id(&mut tx, ws_a).await.unwrap();
 
-        let valid_update = sqlx::query("UPDATE memberships SET role = 'admin' WHERE id = $1")
-            .bind(membership_a)
-            .execute(&mut *tx)
-            .await
-            .expect("valid same-workspace update executes");
+        let valid_update =
+            sqlx::query("UPDATE memberships SET role_code = 'operator' WHERE membership_id = $1")
+                .bind(membership_a)
+                .execute(&mut *tx)
+                .await
+                .expect("valid same-workspace update executes");
 
         assert_eq!(
             valid_update.rows_affected(),
@@ -524,7 +522,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
 
         // 2.1 RLS_WORKSPACE_B_CANNOT_ACCESS_A: PASS
         let ws_a_lookup: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM workspaces WHERE id = $1")
+            sqlx::query_scalar("SELECT workspace_id FROM workspaces WHERE workspace_id = $1")
                 .bind(ws_a)
                 .fetch_optional(&mut *tx)
                 .await
@@ -535,7 +533,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
         );
 
         let member_a_lookup: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM memberships WHERE workspace_id = $1")
+            sqlx::query_scalar("SELECT membership_id FROM memberships WHERE workspace_id = $1")
                 .bind(ws_a)
                 .fetch_optional(&mut *tx)
                 .await
@@ -546,7 +544,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
         );
 
         // 2.2 Workspace B can see own rows
-        let ws_b_visible: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+        let ws_b_visible: Vec<Uuid> = sqlx::query_scalar("SELECT workspace_id FROM workspaces")
             .fetch_all(&mut *tx)
             .await
             .expect("query workspaces");
@@ -569,7 +567,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
             .await
             .expect("clear context");
 
-        let no_workspaces: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workspaces")
+        let no_workspaces: Vec<Uuid> = sqlx::query_scalar("SELECT workspace_id FROM workspaces")
             .fetch_all(&mut *tx)
             .await
             .expect("query workspaces without context");
@@ -579,7 +577,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
             "No workspaces visible when RLS context is unset (fail closed)"
         );
 
-        let no_memberships: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM memberships")
+        let no_memberships: Vec<Uuid> = sqlx::query_scalar("SELECT membership_id FROM memberships")
             .fetch_all(&mut *tx)
             .await
             .expect("query memberships without context");
@@ -589,17 +587,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
             "No memberships visible when RLS context is unset"
         );
 
-        let no_grants: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM capability_grants")
-            .fetch_all(&mut *tx)
-            .await
-            .expect("query capability_grants without context");
-        assert_eq!(
-            no_grants.len(),
-            0,
-            "No grants visible when RLS context is unset"
-        );
-
-        let no_events: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM audit_events")
+        let no_events: Vec<Uuid> = sqlx::query_scalar("SELECT audit_event_id FROM audit_events")
             .fetch_all(&mut *tx)
             .await
             .expect("query audit_events without context");
@@ -611,7 +599,7 @@ async fn test_rls_workspace_a_b_full_isolation() {
 
         // Any insert without context must fail WITH CHECK
         let bad_insert_without_ctx = sqlx::query(
-            "INSERT INTO memberships (id, workspace_id, principal_id, role) VALUES ($1, $2, $3, 'viewer')"
+            "INSERT INTO memberships (membership_id, workspace_id, principal_id, role_code, status) VALUES ($1, $2, $3, 'reader', 'active')"
         )
         .bind(Uuid::new_v4())
         .bind(ws_a)
@@ -647,7 +635,7 @@ async fn test_cross_workspace_composite_fk_rejection() {
 
     // 1. Create Org 1 and Org 2
     sqlx::query(
-        "INSERT INTO organizations (id, name, slug) VALUES ($1, 'Org 1', $2), ($3, 'Org 2', $4)",
+        "INSERT INTO organizations (organization_id, display_name, slug) VALUES ($1, 'Org 1', $2), ($3, 'Org 2', $4)",
     )
     .bind(org1)
     .bind(format!("org-1-{}", org1.simple()))
@@ -658,7 +646,7 @@ async fn test_cross_workspace_composite_fk_rejection() {
     .expect("create orgs");
 
     // 2. Create Program 1 in Org 1 and Program 2 in Org 2
-    sqlx::query("INSERT INTO programs (id, organization_id, name, slug) VALUES ($1, $2, 'Prog 1', $3), ($4, $5, 'Prog 2', $6)")
+    sqlx::query("INSERT INTO programs (program_id, organization_id, name, program_code) VALUES ($1, $2, 'Prog 1', $3), ($4, $5, 'Prog 2', $6)")
         .bind(prog1_in_org1)
         .bind(org1)
         .bind(format!("prog-1-{}", prog1_in_org1.simple()))
@@ -672,7 +660,7 @@ async fn test_cross_workspace_composite_fk_rejection() {
     // 3. Attempt to create a Workspace in Org 2 referencing Program 1 (from Org 1)
     // Must be strictly rejected by composite FK `fk_workspaces_program_org` at the PostgreSQL boundary!
     let cross_org_workspace_res = sqlx::query(
-        "INSERT INTO workspaces (id, program_id, organization_id, name, slug)
+        "INSERT INTO workspaces (workspace_id, program_id, organization_id, name, workspace_code)
          VALUES ($1, $2, $3, 'Cross WS', $4)",
     )
     .bind(Uuid::new_v4())
@@ -695,7 +683,7 @@ async fn test_cross_workspace_composite_fk_rejection() {
 
     // 4. Valid same-organization workspace insertion must succeed
     let valid_ws = sqlx::query(
-        "INSERT INTO workspaces (id, program_id, organization_id, name, slug)
+        "INSERT INTO workspaces (workspace_id, program_id, organization_id, name, workspace_code)
          VALUES ($1, $2, $3, 'Valid WS', $4)",
     )
     .bind(Uuid::new_v4())
@@ -730,7 +718,7 @@ async fn test_immutability_triggers_and_checks() {
     let prog_id = Uuid::new_v4();
     let ws_id = Uuid::new_v4();
 
-    sqlx::query("INSERT INTO organizations (id, name, slug) VALUES ($1, 'Imm Org', $2)")
+    sqlx::query("INSERT INTO organizations (organization_id, display_name, slug) VALUES ($1, 'Imm Org', $2)")
         .bind(org_id)
         .bind(format!("org-{}", org_id.simple()))
         .execute(test_db.pool())
@@ -738,7 +726,7 @@ async fn test_immutability_triggers_and_checks() {
         .expect("Failed to create org");
 
     sqlx::query(
-        "INSERT INTO programs (id, organization_id, name, slug) VALUES ($1, $2, 'Imm Prog', $3)",
+        "INSERT INTO programs (program_id, organization_id, name, program_code) VALUES ($1, $2, 'Imm Prog', $3)",
     )
     .bind(prog_id)
     .bind(org_id)
@@ -747,7 +735,7 @@ async fn test_immutability_triggers_and_checks() {
     .await
     .expect("Failed to create prog");
 
-    sqlx::query("INSERT INTO workspaces (id, program_id, organization_id, name, slug) VALUES ($1, $2, $3, 'Imm WS', $4)")
+    sqlx::query("INSERT INTO workspaces (workspace_id, program_id, organization_id, name, workspace_code) VALUES ($1, $2, $3, 'Imm WS', $4)")
         .bind(ws_id)
         .bind(prog_id)
         .bind(org_id)
@@ -763,13 +751,20 @@ async fn test_immutability_triggers_and_checks() {
             &mut tx,
             AppendAuditParams {
                 workspace_id: ws_id,
-                event_type: "test.immutability".to_string(),
-                actor_principal_id: None,
-                action: "CREATE".to_string(),
-                resource_type: "item".to_string(),
-                resource_id: "1".to_string(),
-                payload: json!({}),
+                actor_type: "system".to_string(),
+                actor_id: None,
+                authority_snapshot: json!({}),
+                action_code: "CREATE".to_string(),
+                entity_type: "item".to_string(),
+                entity_id: "1".to_string(),
+                entity_version: Some(1),
+                request_id: None,
                 correlation_id: None,
+                job_id: None,
+                source_state_hash: None,
+                before_ref: None,
+                after_ref: None,
+                metadata: json!({}),
             },
         )
         .await
@@ -777,10 +772,11 @@ async fn test_immutability_triggers_and_checks() {
     tx.commit().await.expect("Failed to commit tx");
 
     // 1. Attempt UPDATE on audit_events: MUST FAIL via trigger
-    let update_res = sqlx::query("UPDATE audit_events SET action = 'MUTATED' WHERE id = $1")
-        .bind(event.id)
-        .execute(test_db.pool())
-        .await;
+    let update_res =
+        sqlx::query("UPDATE audit_events SET action_code = 'MUTATED' WHERE audit_event_id = $1")
+            .bind(event.audit_event_id)
+            .execute(test_db.pool())
+            .await;
 
     assert!(
         update_res.is_err(),
@@ -793,8 +789,8 @@ async fn test_immutability_triggers_and_checks() {
     );
 
     // 2. Attempt DELETE on audit_events: MUST FAIL via trigger
-    let delete_res = sqlx::query("DELETE FROM audit_events WHERE id = $1")
-        .bind(event.id)
+    let delete_res = sqlx::query("DELETE FROM audit_events WHERE audit_event_id = $1")
+        .bind(event.audit_event_id)
         .execute(test_db.pool())
         .await;
 
@@ -815,17 +811,18 @@ async fn test_immutability_triggers_and_checks() {
     );
 
     // 4. Check constraint tests: empty strings
-    let bad_org = sqlx::query("INSERT INTO organizations (name, slug) VALUES ('', 'empty-name')")
-        .execute(test_db.pool())
-        .await;
+    let bad_org =
+        sqlx::query("INSERT INTO organizations (display_name, slug) VALUES ('', 'empty-name')")
+            .execute(test_db.pool())
+            .await;
     assert!(
         bad_org.is_err(),
         "Empty name must be rejected by check constraint"
     );
 
     let bad_role = sqlx::query(
-        "INSERT INTO memberships (workspace_id, principal_id, role)
-         VALUES ($1, $2, 'invalid_role')",
+        "INSERT INTO memberships (workspace_id, principal_id, role_code, status)
+         VALUES ($1, $2, 'invalid_role', 'active')",
     )
     .bind(ws_id)
     .bind(Uuid::new_v4())

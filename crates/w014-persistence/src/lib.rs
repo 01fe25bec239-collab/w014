@@ -1,4 +1,4 @@
-//! SQLx Migration Runner and Persistence Infrastructure for W-014.
+//! SQLx Migration Runner and Persistence Infrastructure for W-014 conforming to Prompt-12.
 //!
 //! Provides the authoritative migration runner, database configuration management,
 //! credential masking, and the reusable fresh/upgrade migration test harness.
@@ -13,8 +13,8 @@ pub mod runner;
 
 pub use audit::{
     AppendAuditParams, AuditAppendContract, AuditChainHashContract, AuditChainHasher,
-    AuditChainHeadRecord, AuditEventRecord, CanonicalAuditEnvelope, GENESIS_HASH,
-    PostgresAuditStore,
+    AuditChainHeadRecord, AuditEventRecord, CanonicalAuditEnvelope, PostgresAuditStore,
+    canonicalize_json,
 };
 pub use config::{DEFAULT_LOCAL_DATABASE_URL, DatabaseConfig};
 pub use error::{AuditIntegrityError, PersistenceError};
@@ -23,8 +23,8 @@ pub use harness::{
     run_fresh_migration_harness, run_upgrade_migration_harness,
 };
 pub use idempotency::{
-    IdempotencyCheckResult, IdempotencyHasher, IdempotencyRecord, IdempotencyStatus,
-    IdempotencyStore, PostgresIdempotencyStore,
+    IdempotencyCheckResult, IdempotencyHasher, IdempotencyRecord, IdempotencyStore,
+    PostgresIdempotencyStore,
 };
 pub use rls::{clear_session_workspace_id, get_session_workspace_id, set_session_workspace_id};
 pub use runner::{

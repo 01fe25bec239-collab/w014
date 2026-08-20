@@ -1,55 +1,31 @@
-//! Authoritative PostgreSQL Idempotency Store Implementation.
+//! Authoritative PostgreSQL Idempotency Store Implementation conforming to Prompt-12 / Prompt-13.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
+use crate::audit::hasher::canonicalize_json;
 use crate::error::PersistenceError;
 
-/// Status lifecycle of an idempotency record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IdempotencyStatus {
-    InProgress,
-    Completed,
-    Failed,
-}
-
-impl IdempotencyStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::InProgress => "in_progress",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-        }
-    }
-
-    pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s {
-            "in_progress" => Some(Self::InProgress),
-            "completed" => Some(Self::Completed),
-            "failed" => Some(Self::Failed),
-            _ => None,
-        }
-    }
-}
+type HmacSha256 = Hmac<Sha256>;
 
 /// Authoritative idempotency record stored in `idempotency_records`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct IdempotencyRecord {
-    pub id: Uuid,
+    pub idempotency_record_id: Uuid,
     pub workspace_id: Option<Uuid>,
-    pub idempotency_key: String,
-    pub request_hash: String,
-    pub status: String,
-    pub response_status_code: Option<i32>,
-    pub response_headers: Option<serde_json::Value>,
+    pub principal_id: Uuid,
+    pub route_code: String,
+    pub key_hash: Vec<u8>,
+    pub request_hash: Vec<u8>,
+    pub response_status: Option<i16>,
     pub response_body: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
 }
 
 /// Result of evaluating an idempotency key against the store.
@@ -62,7 +38,6 @@ pub enum IdempotencyCheckResult {
     /// Key was previously completed with an identical request payload. Authoritative replay.
     Replay {
         status_code: u16,
-        headers: Option<serde_json::Value>,
         body: Option<serde_json::Value>,
     },
     /// The idempotency key was previously used with a DIFFERENT request payload. Mismatch rejected!
@@ -81,27 +56,29 @@ pub trait IdempotencyStore: Send + Sync {
     /// - Replay semantics for identical request hashes on completed records.
     /// - Strict rejection (`Mismatch`) if the same key is reused with a different request hash.
     /// - In-flight serialization for concurrent requests.
-    /// - No history deletion as a recovery mechanism.
+    /// - FILL-ONCE response behavior (never overwrites completed responses).
+    #[allow(clippy::too_many_arguments)]
     async fn start_or_get(
         &self,
         tx: &mut PgConnection,
         workspace_id: Option<Uuid>,
-        idempotency_key: &str,
-        request_hash: &str,
+        principal_id: Uuid,
+        route_code: &str,
+        key_hash: &[u8],
+        request_hash: &[u8],
         ttl_seconds: i64,
     ) -> Result<IdempotencyCheckResult, PersistenceError>;
 
-    /// Completes the idempotency record with authoritative response status, headers, and body.
+    /// Completes the idempotency record with authoritative response status and body (fill-once).
     async fn complete(
         &self,
         tx: &mut PgConnection,
         record_id: Uuid,
         status_code: u16,
-        headers: Option<serde_json::Value>,
         body: Option<serde_json::Value>,
     ) -> Result<(), PersistenceError>;
 
-    /// Marks the idempotency record as failed.
+    /// Removes an in-progress idempotency record on unhandled failure to allow immediate retry.
     async fn fail(&self, tx: &mut PgConnection, record_id: Uuid) -> Result<(), PersistenceError>;
 
     /// Retrieves an idempotency record by ID.
@@ -112,19 +89,27 @@ pub trait IdempotencyStore: Send + Sync {
     ) -> Result<Option<IdempotencyRecord>, PersistenceError>;
 }
 
-/// Helper for deterministic SHA-256 request payload hashing.
+/// Helper for deterministic HMAC key hashing and SHA-256 payload hashing.
 pub struct IdempotencyHasher;
 
 impl IdempotencyHasher {
-    /// Computes the 64-character lowercase hex SHA-256 hash of raw bytes.
-    pub fn compute_request_hash(data: &[u8]) -> String {
-        let digest = Sha256::digest(data);
-        hex::encode(digest)
+    /// Computes HMAC-SHA256 of the raw client key to avoid persisting plaintext keys.
+    pub fn compute_key_hash(hmac_secret: &[u8], raw_client_key: &str) -> Vec<u8> {
+        let mut mac = HmacSha256::new_from_slice(hmac_secret)
+            .unwrap_or_else(|_| HmacSha256::new_from_slice(&[0u8; 32]).expect("fallback"));
+        mac.update(raw_client_key.as_bytes());
+        mac.finalize().into_bytes().to_vec()
     }
 
-    /// Computes the 64-character lowercase hex SHA-256 hash of a JSON value.
-    pub fn compute_json_hash(val: &serde_json::Value) -> String {
-        let canonical_bytes = serde_json::to_vec(val).unwrap_or_default();
+    /// Computes the 32-byte SHA-256 hash of raw bytes.
+    pub fn compute_request_hash(data: &[u8]) -> Vec<u8> {
+        let digest = Sha256::digest(data);
+        digest.to_vec()
+    }
+
+    /// Computes the 32-byte SHA-256 hash of a JSON value after RFC-8785 canonicalization.
+    pub fn compute_json_hash(val: &serde_json::Value) -> Vec<u8> {
+        let canonical_bytes = canonicalize_json(val);
         Self::compute_request_hash(&canonical_bytes)
     }
 }
@@ -141,89 +126,68 @@ impl PostgresIdempotencyStore {
 
 #[async_trait]
 impl IdempotencyStore for PostgresIdempotencyStore {
+    #[allow(clippy::too_many_arguments)]
     async fn start_or_get(
         &self,
         tx: &mut PgConnection,
         workspace_id: Option<Uuid>,
-        idempotency_key: &str,
-        request_hash: &str,
+        principal_id: Uuid,
+        route_code: &str,
+        key_hash: &[u8],
+        request_hash: &[u8],
         ttl_seconds: i64,
     ) -> Result<IdempotencyCheckResult, PersistenceError> {
         let row_opt = sqlx::query(
-            "SELECT id, workspace_id, idempotency_key, request_hash, status,
-                    response_status_code, response_headers, response_body,
-                    created_at, expires_at, completed_at
+            "SELECT idempotency_record_id, workspace_id, principal_id, route_code,
+                    key_hash, request_hash, response_status, response_body,
+                    created_at, expires_at
              FROM idempotency_records
              WHERE (workspace_id = $1 OR (workspace_id IS NULL AND $1 IS NULL))
-               AND idempotency_key = $2
+               AND principal_id = $2
+               AND route_code = $3
+               AND key_hash = $4
              FOR UPDATE",
         )
         .bind(workspace_id)
-        .bind(idempotency_key)
+        .bind(principal_id)
+        .bind(route_code)
+        .bind(key_hash)
         .fetch_optional(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
 
         if let Some(row) = row_opt {
-            let stored_hash: String = row.get("request_hash");
-            let status: String = row.get("status");
-            let id: Uuid = row.get("id");
+            let stored_hash: Vec<u8> = row.get("request_hash");
+            let response_status: Option<i16> = row.get("response_status");
+            let id: Uuid = row.get("idempotency_record_id");
             let expires_at: DateTime<Utc> = row.get("expires_at");
 
             // 1. Check request hash matching
-            if !stored_hash.eq_ignore_ascii_case(request_hash) {
+            if stored_hash != request_hash {
                 return Ok(IdempotencyCheckResult::Mismatch {
-                    expected_hash: stored_hash,
-                    actual_hash: request_hash.to_string(),
+                    expected_hash: hex::encode(&stored_hash),
+                    actual_hash: hex::encode(request_hash),
                 });
             }
 
             // 2. Handle completed record replay
-            if status == "completed" {
-                let status_code: i32 = row
-                    .get::<Option<i32>, _>("response_status_code")
-                    .unwrap_or(200);
-                let headers: Option<serde_json::Value> = row.get("response_headers");
+            if let Some(status) = response_status {
                 let body: Option<serde_json::Value> = row.get("response_body");
-
                 return Ok(IdempotencyCheckResult::Replay {
-                    status_code: status_code as u16,
-                    headers,
+                    status_code: status as u16,
                     body,
                 });
             }
 
             // 3. Handle in-progress record
-            if status == "in_progress" {
-                let now = Utc::now();
-                if expires_at < now {
-                    // Lock expired; reacquire with renewed TTL
-                    sqlx::query(
-                        "UPDATE idempotency_records
-                         SET expires_at = CURRENT_TIMESTAMP + ($2 || ' seconds')::INTERVAL,
-                             created_at = CURRENT_TIMESTAMP
-                         WHERE id = $1",
-                    )
-                    .bind(id)
-                    .bind(ttl_seconds.to_string())
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(PersistenceError::Connection)?;
-
-                    return Ok(IdempotencyCheckResult::Acquired { record_id: id });
-                }
-
-                return Ok(IdempotencyCheckResult::InProgress);
-            }
-
-            // 4. Handle failed record; allow retry with renewed TTL
-            if status == "failed" {
+            let now = Utc::now();
+            if expires_at < now {
+                // Lock expired; reacquire with renewed TTL
                 sqlx::query(
                     "UPDATE idempotency_records
-                     SET status = 'in_progress',
-                         expires_at = CURRENT_TIMESTAMP + ($2 || ' seconds')::INTERVAL,
-                         created_at = CURRENT_TIMESTAMP
-                     WHERE id = $1",
+                     SET expires_at = clock_timestamp() + ($2 || ' seconds')::INTERVAL,
+                         created_at = clock_timestamp()
+                     WHERE idempotency_record_id = $1",
                 )
                 .bind(id)
                 .bind(ttl_seconds.to_string())
@@ -233,26 +197,30 @@ impl IdempotencyStore for PostgresIdempotencyStore {
 
                 return Ok(IdempotencyCheckResult::Acquired { record_id: id });
             }
+
+            return Ok(IdempotencyCheckResult::InProgress);
         }
 
-        // 5. Insert new record in 'in_progress' state
+        // 4. Insert new record in 'in_progress' state
         let insert_row = sqlx::query(
             "INSERT INTO idempotency_records (
-                workspace_id, idempotency_key, request_hash, status, expires_at
+                workspace_id, principal_id, route_code, key_hash, request_hash, expires_at
             ) VALUES (
-                $1, $2, $3, 'in_progress', CURRENT_TIMESTAMP + ($4 || ' seconds')::INTERVAL
+                $1, $2, $3, $4, $5, clock_timestamp() + ($6 || ' seconds')::INTERVAL
             )
-            RETURNING id",
+            RETURNING idempotency_record_id",
         )
         .bind(workspace_id)
-        .bind(idempotency_key)
+        .bind(principal_id)
+        .bind(route_code)
+        .bind(key_hash)
         .bind(request_hash)
         .bind(ttl_seconds.to_string())
         .fetch_one(&mut *tx)
         .await
         .map_err(PersistenceError::Connection)?;
 
-        let record_id: Uuid = insert_row.get("id");
+        let record_id: Uuid = insert_row.get("idempotency_record_id");
         Ok(IdempotencyCheckResult::Acquired { record_id })
     }
 
@@ -261,21 +229,17 @@ impl IdempotencyStore for PostgresIdempotencyStore {
         tx: &mut PgConnection,
         record_id: Uuid,
         status_code: u16,
-        headers: Option<serde_json::Value>,
         body: Option<serde_json::Value>,
     ) -> Result<(), PersistenceError> {
+        // Fill once semantics: only update if response_status is NULL
         sqlx::query(
             "UPDATE idempotency_records
-             SET status = 'completed',
-                 response_status_code = $2,
-                 response_headers = $3,
-                 response_body = $4,
-                 completed_at = CURRENT_TIMESTAMP
-             WHERE id = $1",
+             SET response_status = $2,
+                 response_body = $3
+             WHERE idempotency_record_id = $1 AND response_status IS NULL",
         )
         .bind(record_id)
-        .bind(status_code as i32)
-        .bind(headers)
+        .bind(status_code as i16)
         .bind(body)
         .execute(&mut *tx)
         .await
@@ -285,10 +249,10 @@ impl IdempotencyStore for PostgresIdempotencyStore {
     }
 
     async fn fail(&self, tx: &mut PgConnection, record_id: Uuid) -> Result<(), PersistenceError> {
+        // On unhandled failure of in-progress record, delete it so it can be cleanly retried
         sqlx::query(
-            "UPDATE idempotency_records
-             SET status = 'failed'
-             WHERE id = $1",
+            "DELETE FROM idempotency_records
+             WHERE idempotency_record_id = $1 AND response_status IS NULL",
         )
         .bind(record_id)
         .execute(&mut *tx)
@@ -304,11 +268,11 @@ impl IdempotencyStore for PostgresIdempotencyStore {
         record_id: Uuid,
     ) -> Result<Option<IdempotencyRecord>, PersistenceError> {
         let maybe_row = sqlx::query(
-            "SELECT id, workspace_id, idempotency_key, request_hash, status,
-                    response_status_code, response_headers, response_body,
-                    created_at, expires_at, completed_at
+            "SELECT idempotency_record_id, workspace_id, principal_id, route_code,
+                    key_hash, request_hash, response_status, response_body,
+                    created_at, expires_at
              FROM idempotency_records
-             WHERE id = $1",
+             WHERE idempotency_record_id = $1",
         )
         .bind(record_id)
         .fetch_optional(&mut *tx)
@@ -316,17 +280,16 @@ impl IdempotencyStore for PostgresIdempotencyStore {
         .map_err(PersistenceError::Connection)?;
 
         Ok(maybe_row.map(|row| IdempotencyRecord {
-            id: row.get("id"),
+            idempotency_record_id: row.get("idempotency_record_id"),
             workspace_id: row.get("workspace_id"),
-            idempotency_key: row.get("idempotency_key"),
+            principal_id: row.get("principal_id"),
+            route_code: row.get("route_code"),
+            key_hash: row.get("key_hash"),
             request_hash: row.get("request_hash"),
-            status: row.get("status"),
-            response_status_code: row.get("response_status_code"),
-            response_headers: row.get("response_headers"),
+            response_status: row.get("response_status"),
             response_body: row.get("response_body"),
             created_at: row.get("created_at"),
             expires_at: row.get("expires_at"),
-            completed_at: row.get("completed_at"),
         }))
     }
 }
@@ -342,11 +305,26 @@ mod tests {
         let hash1 = IdempotencyHasher::compute_json_hash(&payload);
         let hash2 = IdempotencyHasher::compute_json_hash(&payload);
 
-        assert_eq!(hash1.len(), 64);
+        assert_eq!(hash1.len(), 32);
         assert_eq!(hash1, hash2);
 
         let modified_payload = json!({"action": "create_item", "amount": 200});
         let hash3 = IdempotencyHasher::compute_json_hash(&modified_payload);
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_compute_key_hash() {
+        let secret = b"secret-key-material";
+        let key1 = "client-idempotency-key-001";
+        let key2 = "client-idempotency-key-002";
+
+        let hash1 = IdempotencyHasher::compute_key_hash(secret, key1);
+        let hash2 = IdempotencyHasher::compute_key_hash(secret, key1);
+        let hash3 = IdempotencyHasher::compute_key_hash(secret, key2);
+
+        assert_eq!(hash1.len(), 32);
+        assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
     }
 }

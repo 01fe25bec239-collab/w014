@@ -1,8 +1,8 @@
-//! Fresh M001R Migration Test against real PostgreSQL 18.
+//! Fresh M001R + M001R-F1 Migration Test against real PostgreSQL 18.
 //!
 //! Validates:
-//! - Fresh application of the embedded M001R production migration bundle.
-//! - Creation of all 13 M001R tables.
+//! - Fresh application of the embedded M001R + M001R-F1 production migration bundle.
+//! - Creation of all 13 M001R tables conforming to Prompt-12.
 //! - Absence of deferred staged FKs (current_source_state_id, job_id).
 //! - Absence of W2 job tables.
 //! - Repeat run idempotency.
@@ -15,7 +15,7 @@ async fn test_m001r_fresh_migration_and_catalog_invariants() {
         .await
         .expect("Failed to provision isolated test database");
 
-    // 1. Run fresh migration harness with embedded M001R migrator
+    // 1. Run fresh migration harness with embedded M001R + M001R-F1 migrator
     let result = run_fresh_migration_harness(test_db.pool(), &MIGRATOR)
         .await
         .expect("M001R fresh migration harness failed");
@@ -25,18 +25,18 @@ async fn test_m001r_fresh_migration_and_catalog_invariants() {
     assert_eq!(result.initial_status.current_version, None);
     assert!(!result.initial_status.is_up_to_date);
 
-    // 3. Assert M001R applied successfully
+    // 3. Assert M001R and M001R-F1 applied successfully
     assert_eq!(
         result.first_run_report.newly_applied_versions,
-        vec![20260819000001]
+        vec![20260819000001, 20260820000001]
     );
-    assert_eq!(result.first_run_report.total_applied_count, 1);
-    assert_eq!(result.first_run_report.latest_version, Some(20260819000001));
+    assert_eq!(result.first_run_report.total_applied_count, 2);
+    assert_eq!(result.first_run_report.latest_version, Some(20260820000001));
     assert!(!result.first_run_report.already_up_to_date);
 
     // 4. Assert repeat run idempotency
     assert!(result.repeat_run_report.newly_applied_versions.is_empty());
-    assert_eq!(result.repeat_run_report.total_applied_count, 1);
+    assert_eq!(result.repeat_run_report.total_applied_count, 2);
     assert!(result.repeat_run_report.already_up_to_date);
 
     // 5. Assert all 13 expected M001R tables exist in public schema
@@ -70,7 +70,7 @@ async fn test_m001r_fresh_migration_and_catalog_invariants() {
 
         assert!(
             exists,
-            "Expected table '{table}' to exist after M001R migration"
+            "Expected table '{table}' to exist after M001R + M001R-F1 migration"
         );
     }
 
@@ -81,6 +81,9 @@ async fn test_m001r_fresh_migration_and_catalog_invariants() {
         "job_dependencies",
         "job_progress",
         "dead_letter_entries",
+        "documents",
+        "document_versions",
+        "effective_contract_states",
     ];
 
     for table in &forbidden_w2_tables {

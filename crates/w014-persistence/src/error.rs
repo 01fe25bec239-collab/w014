@@ -61,32 +61,32 @@ pub enum AuditIntegrityError {
         current: i64,
     },
 
-    /// The previous_event_hash of an event does not match the prior event's hash (or genesis).
+    /// The previous_event_hash of an event does not match the prior event's hash.
     #[error(
-        "Audit previous hash mismatch at sequence {sequence_num}: expected '{expected}', got '{actual}'"
+        "Audit previous hash mismatch at sequence {sequence}: expected '{expected}', got '{actual}'"
     )]
     PreviousHashMismatch {
-        sequence_num: i64,
+        sequence: i64,
         expected: String,
         actual: String,
     },
 
     /// The recomputed SHA-256 hash of an audit event does not match its stored hash (tamper detected).
     #[error(
-        "Audit event hash tamper detected at sequence {sequence_num}: stored '{recorded_hash}', recomputed '{computed_hash}'"
+        "Audit event hash tamper detected at sequence {sequence}: stored '{recorded_hash}', recomputed '{computed_hash}'"
     )]
     HashTamperDetected {
-        sequence_num: i64,
+        sequence: i64,
         recorded_hash: String,
         computed_hash: String,
     },
 
     /// An event in the chain belongs to an unexpected workspace.
     #[error(
-        "Workspace ID mismatch in audit chain at sequence {sequence_num}: expected '{expected}', got '{actual}'"
+        "Workspace ID mismatch in audit chain at sequence {sequence}: expected '{expected}', got '{actual}'"
     )]
     WorkspaceMismatch {
-        sequence_num: i64,
+        sequence: i64,
         expected: Uuid,
         actual: Uuid,
     },
