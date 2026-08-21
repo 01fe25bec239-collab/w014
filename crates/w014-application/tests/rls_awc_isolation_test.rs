@@ -978,7 +978,22 @@ async fn test_staged_fk_and_boundaries_preserved() {
         "current_source_state_id must remain unconstrained in W1 (deferred to W3)"
     );
 
-    // 2. Verify audit_events.job_id is nullable and has NO FK constraint to jobs
+    // 2. Verify audit_events.job_id is nullable (NULL succeeds) and enforces FK to jobs in W2
+    let event_with_null_job = sqlx::query(
+        "INSERT INTO audit_events (audit_event_id, workspace_id, sequence, previous_event_hash, event_hash, actor_type, authority_snapshot, action_code, entity_type, entity_id, metadata, job_id)
+         VALUES ($1, $2, 9998, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea, 'principal', '{}'::jsonb, 'STAGED_TEST', 'test', 'test-1', '{}'::jsonb, NULL)"
+    )
+    .bind(Uuid::new_v4())
+    .bind(f.ws_a.id.as_uuid())
+    .execute(&mut *tx)
+    .await;
+
+    assert!(
+        event_with_null_job.is_ok(),
+        "job_id must remain nullable in W2"
+    );
+
+    // Arbitrary non-existent UUID fails because FK to jobs is closed in W2
     let random_job_id = Uuid::new_v4();
     let event_with_random_job = sqlx::query(
         "INSERT INTO audit_events (audit_event_id, workspace_id, sequence, previous_event_hash, event_hash, actor_type, authority_snapshot, action_code, entity_type, entity_id, metadata, job_id)
@@ -986,13 +1001,13 @@ async fn test_staged_fk_and_boundaries_preserved() {
     )
     .bind(Uuid::new_v4())
     .bind(f.ws_a.id.as_uuid())
-    .bind(random_job_id) // Arbitrary UUID succeeds because FK is deferred to W2
+    .bind(random_job_id)
     .execute(&mut *tx)
     .await;
 
     assert!(
-        event_with_random_job.is_ok(),
-        "job_id must remain unconstrained in W1 (deferred to W2)"
+        event_with_random_job.is_err(),
+        "job_id FK constraint to jobs table must be enforced in W2"
     );
 
     tx.rollback().await.unwrap();

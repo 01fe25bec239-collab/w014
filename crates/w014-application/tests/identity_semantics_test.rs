@@ -696,7 +696,7 @@ async fn test_staged_fks_and_boundary_checks() {
         "STAGED FK VIOLATION: current_source_state_id must NOT have a foreign key in W1"
     );
 
-    // 2. Verify audit_events.job_id is nullable and has NO foreign key
+    // 2. Verify audit_events.job_id is closed to jobs table in W2
     let job_fk_count: i64 = sqlx::query_scalar(
         "SELECT count(*)
          FROM information_schema.table_constraints tc
@@ -710,11 +710,11 @@ async fn test_staged_fks_and_boundary_checks() {
     .await
     .unwrap();
     assert_eq!(
-        job_fk_count, 0,
-        "STAGED FK VIOLATION: audit_events.job_id must NOT have a foreign key in W1"
+        job_fk_count, 1,
+        "STAGED FK CLOSURE: audit_events.job_id MUST have a foreign key to jobs in W2"
     );
 
-    // 3. Verify W2 jobs execution tables do not exist
+    // 3. Verify W2 jobs execution tables exist in W2
     let jobs_table_count: i64 = sqlx::query_scalar(
         "SELECT count(*)
          FROM information_schema.tables
@@ -725,8 +725,8 @@ async fn test_staged_fks_and_boundary_checks() {
     .await
     .unwrap();
     assert_eq!(
-        jobs_table_count, 0,
-        "W2 BOUNDARY VIOLATION: jobs table must not exist in W1"
+        jobs_table_count, 1,
+        "W2 PHYSICAL SUBSTRATE: jobs table must exist in W2"
     );
 
     test_db.close().await.expect("drop test db");

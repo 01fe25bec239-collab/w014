@@ -1401,13 +1401,13 @@ async fn test_security_gate_staged_fk_boundaries_and_absence_of_w2_w3_surfaces()
     .unwrap();
     assert_eq!(count_fk, 0, "No source_state FK on workspaces in W1");
 
-    // Ensure `audit_events.job_id` does NOT exist as foreign key
+    // Ensure `audit_events.job_id` FK is closed to jobs table in W2
     let count_job_fk: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.table_constraints
-         WHERE table_name = 'audit_events' AND constraint_name LIKE '%job%'",
+         WHERE table_name = 'audit_events' AND constraint_name = 'fk_audit_events_job'",
     )
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(count_job_fk, 0, "No jobs FK on audit_events in W1");
+    assert_eq!(count_job_fk, 1, "jobs FK on audit_events closed in W2");
 }

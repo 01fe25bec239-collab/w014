@@ -835,3 +835,212 @@ async fn test_immutability_triggers_and_checks() {
 
     test_db.close().await.expect("Failed to drop test database");
 }
+
+#[tokio::test]
+async fn test_m002r_rls_isolation_and_composite_fk_enforcement() {
+    let test_db = TestDatabase::new()
+        .await
+        .expect("Failed to provision isolated test database");
+
+    MigrationRunner::new(&MIGRATOR)
+        .run(test_db.pool())
+        .await
+        .expect("Failed to apply migrations");
+
+    let pool = test_db.pool();
+
+    // 1. Setup Orgs, Programs, Workspaces A and B
+    let org_a = Uuid::new_v4();
+    let org_b = Uuid::new_v4();
+    let prog_a = Uuid::new_v4();
+    let prog_b = Uuid::new_v4();
+    let ws_a = Uuid::new_v4();
+    let ws_b = Uuid::new_v4();
+
+    sqlx::query("INSERT INTO organizations (organization_id, display_name, slug) VALUES ($1, 'Org A', $2), ($3, 'Org B', $4)")
+        .bind(org_a)
+        .bind(format!("org-a-{}", org_a.simple()))
+        .bind(org_b)
+        .bind(format!("org-b-{}", org_b.simple()))
+        .execute(pool)
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO programs (program_id, organization_id, name, program_code) VALUES ($1, $2, 'Prog A', $3), ($4, $5, 'Prog B', $6)")
+        .bind(prog_a)
+        .bind(org_a)
+        .bind(format!("prog-a-{}", prog_a.simple()))
+        .bind(prog_b)
+        .bind(org_b)
+        .bind(format!("prog-b-{}", prog_b.simple()))
+        .execute(pool)
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO workspaces (workspace_id, program_id, organization_id, name, workspace_code) VALUES ($1, $2, $3, 'WS A', $4), ($5, $6, $7, 'WS B', $8)")
+        .bind(ws_a)
+        .bind(prog_a)
+        .bind(org_a)
+        .bind(format!("ws-a-{}", ws_a.simple()))
+        .bind(ws_b)
+        .bind(prog_b)
+        .bind(org_b)
+        .bind(format!("ws-b-{}", ws_b.simple()))
+        .execute(pool)
+        .await
+        .unwrap();
+
+    // 2. Insert records into M002R tables for Workspace A and Workspace B
+    let doc_a = Uuid::new_v4();
+    let doc_b = Uuid::new_v4();
+    sqlx::query("INSERT INTO documents (document_id, workspace_id, title, document_type) VALUES ($1, $2, 'Doc A', 'pdf'), ($3, $4, 'Doc B', 'pdf')")
+        .bind(doc_a)
+        .bind(ws_a)
+        .bind(doc_b)
+        .bind(ws_b)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let job_a = Uuid::new_v4();
+    let job_b = Uuid::new_v4();
+    sqlx::query("INSERT INTO jobs (job_id, workspace_id, queue_name, job_type, payload) VALUES ($1, $2, 'parser', 'extract', '{}'::jsonb), ($3, $4, 'parser', 'extract', '{}'::jsonb)")
+        .bind(job_a)
+        .bind(ws_a)
+        .bind(job_b)
+        .bind(ws_b)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let ver_a = Uuid::new_v4();
+    let ver_b = Uuid::new_v4();
+    let dummy_hash = vec![0u8; 32];
+    sqlx::query("INSERT INTO document_versions (document_version_id, document_id, workspace_id, version_number, byte_size, sha256_hash, content_type) VALUES ($1, $2, $3, 1, 100, $4, 'application/pdf'), ($5, $6, $7, 1, 200, $4, 'application/pdf')")
+        .bind(ver_a)
+        .bind(doc_a)
+        .bind(ws_a)
+        .bind(&dummy_hash)
+        .bind(ver_b)
+        .bind(doc_b)
+        .bind(ws_b)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    // 3. Test RLS Isolation under w014_app role
+    // Context WS A
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE w014_app")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        set_session_workspace_id(&mut tx, ws_a).await.unwrap();
+
+        let docs_in_a: Vec<Uuid> = sqlx::query_scalar("SELECT document_id FROM documents")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(docs_in_a, vec![doc_a], "WS A must only see Doc A");
+
+        let jobs_in_a: Vec<Uuid> = sqlx::query_scalar("SELECT job_id FROM jobs")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(jobs_in_a, vec![job_a], "WS A must only see Job A");
+
+        // Attempt insert into WS B while in WS A context -> MUST FAIL
+        let bad_insert = sqlx::query("INSERT INTO documents (workspace_id, title, document_type) VALUES ($1, 'Spoofed Doc', 'pdf')")
+            .bind(ws_b)
+            .execute(&mut *tx)
+            .await;
+        assert!(
+            bad_insert.is_err(),
+            "Inserting WS B document in WS A context must be rejected by RLS WITH CHECK"
+        );
+
+        tx.rollback().await.unwrap();
+    }
+
+    // Context WS B
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE w014_app")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        set_session_workspace_id(&mut tx, ws_b).await.unwrap();
+
+        let docs_in_b: Vec<Uuid> = sqlx::query_scalar("SELECT document_id FROM documents")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(docs_in_b, vec![doc_b], "WS B must only see Doc B");
+
+        let jobs_in_b: Vec<Uuid> = sqlx::query_scalar("SELECT job_id FROM jobs")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(jobs_in_b, vec![job_b], "WS B must only see Job B");
+
+        tx.rollback().await.unwrap();
+    }
+
+    // Context Cleared -> 0 rows visible under RLS
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE w014_app")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        clear_session_workspace_id(&mut tx).await.unwrap();
+
+        let docs_cleared: Vec<Uuid> = sqlx::query_scalar("SELECT document_id FROM documents")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        assert!(
+            docs_cleared.is_empty(),
+            "Cleared context must yield 0 documents under RLS"
+        );
+
+        tx.rollback().await.unwrap();
+    }
+
+    // 4. Test Composite FK Boundary Isolation
+    // Attempt to create a document version in WS A referencing doc_b (which is in WS B) -> MUST FAIL
+    let cross_ws_ver = sqlx::query(
+        "INSERT INTO document_versions (document_version_id, document_id, workspace_id, version_number, byte_size, sha256_hash, content_type)
+         VALUES ($1, $2, $3, 2, 100, $4, 'application/pdf')"
+    )
+    .bind(Uuid::new_v4())
+    .bind(doc_b) // Doc B is in WS B
+    .bind(ws_a)  // Attempting to attach to WS A
+    .bind(&dummy_hash)
+    .execute(pool)
+    .await;
+
+    assert!(
+        cross_ws_ver.is_err(),
+        "Cross-workspace composite FK violation must be rejected at DB boundary"
+    );
+
+    // Attempt to create a job attempt in WS A referencing job_b (which is in WS B) -> MUST FAIL
+    let cross_ws_attempt = sqlx::query(
+        "INSERT INTO job_attempts (job_attempt_id, job_id, workspace_id, attempt_number, worker_id)
+         VALUES ($1, $2, $3, 1, 'worker-1')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(job_b) // Job B is in WS B
+    .bind(ws_a) // Attempting to attach to WS A
+    .execute(pool)
+    .await;
+
+    assert!(
+        cross_ws_attempt.is_err(),
+        "Cross-workspace composite FK on job_attempts must be rejected"
+    );
+
+    test_db.close().await.expect("Failed to drop test database");
+}

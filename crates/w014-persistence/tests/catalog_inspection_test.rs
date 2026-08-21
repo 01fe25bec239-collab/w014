@@ -38,8 +38,9 @@ async fn test_database_catalog_state_and_security_mechanics() {
         .await
         .expect("Failed to apply M001R migrations");
 
-    // 1. Verify exact 13 M001R tables exist
+    // 1. Verify exact 30 tables exist (13 M001R + 17 M002R)
     let expected_tables = vec![
+        // M001R (13)
         "organizations",
         "principals",
         "programs",
@@ -53,6 +54,24 @@ async fn test_database_catalog_state_and_security_mechanics() {
         "audit_chain_heads",
         "audit_events",
         "idempotency_records",
+        // M002R (17)
+        "documents",
+        "document_versions",
+        "document_version_metadata",
+        "upload_intents",
+        "object_artifacts",
+        "quarantine_records",
+        "parser_artifacts",
+        "parser_pages",
+        "parser_blocks",
+        "source_spans",
+        "jobs",
+        "job_attempts",
+        "job_dependencies",
+        "job_progress",
+        "dead_letter_entries",
+        "dependency_keys",
+        "change_events",
     ];
 
     for table in &expected_tables {
@@ -70,27 +89,8 @@ async fn test_database_catalog_state_and_security_mechanics() {
         assert!(exists, "Table '{table}' must exist in public schema");
     }
 
-    // 2. Verify all W2 job and document tables are strictly absent
-    let forbidden_tables = vec![
-        "jobs",
-        "job_attempts",
-        "job_dependencies",
-        "job_progress",
-        "dead_letter_entries",
-        "documents",
-        "document_versions",
-        "document_version_metadata",
-        "upload_intents",
-        "object_artifacts",
-        "quarantine_records",
-        "parser_artifacts",
-        "parser_pages",
-        "parser_blocks",
-        "source_spans",
-        "dependency_keys",
-        "change_events",
-        "effective_contract_states",
-    ];
+    // 2. Verify later-wave tables (W3/M003R/M004R) are strictly absent
+    let forbidden_tables = vec!["effective_contract_states"];
 
     for table in &forbidden_tables {
         let exists: bool = sqlx::query_scalar(
@@ -106,11 +106,11 @@ async fn test_database_catalog_state_and_security_mechanics() {
 
         assert!(
             !exists,
-            "Forbidden table '{table}' must NOT exist in W1 M001R"
+            "Forbidden table '{table}' must NOT exist in W2 M002R"
         );
     }
 
-    // 3. Verify Staged FK 1: workspaces.current_source_state_id FK is ABSENT
+    // 3. Verify Staged FK 1: workspaces.current_source_state_id FK is ABSENT (deferred to W3)
     let ws_fk_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (
             SELECT 1
@@ -129,10 +129,10 @@ async fn test_database_catalog_state_and_security_mechanics() {
 
     assert!(
         !ws_fk_exists,
-        "workspaces.current_source_state_id must NOT have a foreign key in W1"
+        "workspaces.current_source_state_id must NOT have a foreign key in W2"
     );
 
-    // 4. Verify Staged FK 2: audit_events.job_id FK is ABSENT
+    // 4. Verify Staged FK 2: audit_events.job_id -> jobs FK is CLOSED and PRESENT in W2
     let audit_job_fk_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (
             SELECT 1
@@ -150,11 +150,11 @@ async fn test_database_catalog_state_and_security_mechanics() {
     .expect("Failed to inspect audit_events FKs");
 
     assert!(
-        !audit_job_fk_exists,
-        "audit_events.job_id must NOT have a foreign key in W1"
+        audit_job_fk_exists,
+        "audit_events.job_id MUST have a foreign key to jobs table in W2"
     );
 
-    // 5. Verify RLS enabled and forced on tenant tables
+    // 5. Verify RLS enabled and forced on all 23 tenant tables
     let rls_tables = vec![
         "workspaces",
         "memberships",
@@ -162,6 +162,23 @@ async fn test_database_catalog_state_and_security_mechanics() {
         "audit_chain_heads",
         "audit_events",
         "idempotency_records",
+        "documents",
+        "document_versions",
+        "document_version_metadata",
+        "upload_intents",
+        "object_artifacts",
+        "quarantine_records",
+        "jobs",
+        "job_attempts",
+        "job_dependencies",
+        "job_progress",
+        "dead_letter_entries",
+        "parser_artifacts",
+        "parser_pages",
+        "parser_blocks",
+        "source_spans",
+        "dependency_keys",
+        "change_events",
     ];
 
     for table in &rls_tables {
@@ -325,6 +342,7 @@ async fn test_database_catalog_state_and_security_mechanics() {
 
     // 10. Verify composite unique constraints and composite foreign keys
     let expected_constraints = vec![
+        // M001R (8)
         ("programs", "uq_programs_id_org"),
         ("workspaces", "uq_workspaces_id_org"),
         ("workspaces", "fk_workspaces_program_org"),
@@ -333,6 +351,46 @@ async fn test_database_catalog_state_and_security_mechanics() {
         ("audit_events", "uq_audit_events_id_workspace"),
         ("idempotency_records", "uq_idempotency_records_id_workspace"),
         ("idempotency_records", "uq_idempotency_records_identity"),
+        // M002R (20)
+        ("documents", "uq_documents_id_workspace"),
+        ("document_versions", "uq_document_versions_id_workspace"),
+        (
+            "document_versions",
+            "fk_document_versions_document_workspace",
+        ),
+        (
+            "document_version_metadata",
+            "uq_doc_ver_metadata_id_workspace",
+        ),
+        (
+            "document_version_metadata",
+            "fk_doc_ver_metadata_ver_workspace",
+        ),
+        ("upload_intents", "uq_upload_intents_id_workspace"),
+        ("object_artifacts", "uq_object_artifacts_id_workspace"),
+        ("quarantine_records", "uq_quarantine_records_id_workspace"),
+        ("jobs", "uq_jobs_id_workspace"),
+        ("job_attempts", "uq_job_attempts_id_workspace"),
+        ("job_attempts", "fk_job_attempts_job_workspace"),
+        ("job_dependencies", "uq_job_dependencies_id_workspace"),
+        ("job_dependencies", "fk_job_dependencies_job_workspace"),
+        ("job_dependencies", "fk_job_dependencies_dep_workspace"),
+        ("job_progress", "uq_job_progress_id_workspace"),
+        ("job_progress", "fk_job_progress_job_workspace"),
+        ("dead_letter_entries", "uq_dead_letter_id_workspace"),
+        ("dead_letter_entries", "fk_dead_letter_job_workspace"),
+        ("parser_artifacts", "uq_parser_artifacts_id_workspace"),
+        ("parser_artifacts", "fk_parser_artifacts_doc_version_ws"),
+        ("parser_pages", "uq_parser_pages_id_workspace"),
+        ("parser_pages", "fk_parser_pages_artifact_workspace"),
+        ("parser_blocks", "uq_parser_blocks_id_workspace"),
+        ("parser_blocks", "fk_parser_blocks_page_workspace"),
+        ("source_spans", "uq_source_spans_id_workspace"),
+        ("source_spans", "fk_source_spans_block_workspace"),
+        ("dependency_keys", "uq_dependency_keys_id_workspace"),
+        ("dependency_keys", "uq_dependency_keys_workspace_hash"),
+        ("change_events", "uq_change_events_id_workspace"),
+        ("audit_events", "fk_audit_events_job"),
     ];
 
     for (table, constraint) in expected_constraints {
@@ -1028,6 +1086,318 @@ async fn test_exact_13_table_physical_prompt12_conformance() {
         !idem_cols.contains_key("response_status_code"),
         "legacy 'response_status_code' must NOT exist"
     );
+
+    test_db.close().await.expect("Failed to drop test database");
+}
+
+#[tokio::test]
+async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
+    let test_db = TestDatabase::new()
+        .await
+        .expect("Failed to provision isolated test database");
+
+    MigrationRunner::new(&MIGRATOR)
+        .run(test_db.pool())
+        .await
+        .expect("Failed to apply M001R + M002R migrations");
+
+    let pool = test_db.pool();
+
+    // 1. documents
+    let doc_cols = get_table_columns(pool, "documents").await;
+    assert!(doc_cols.contains_key("document_id"));
+    assert_eq!(doc_cols["document_id"].1, "NO");
+    assert!(doc_cols.contains_key("workspace_id"));
+    assert_eq!(doc_cols["workspace_id"].1, "NO");
+    assert!(doc_cols.contains_key("title"));
+    assert!(doc_cols.contains_key("document_type"));
+    assert!(doc_cols.contains_key("status"));
+    assert!(doc_cols.contains_key("created_by"));
+    assert_eq!(doc_cols["created_by"].1, "YES");
+    assert!(doc_cols.contains_key("created_at"));
+    assert!(doc_cols.contains_key("updated_at"));
+    assert!(doc_cols.contains_key("row_version"));
+
+    // 2. document_versions
+    let ver_cols = get_table_columns(pool, "document_versions").await;
+    assert!(ver_cols.contains_key("document_version_id"));
+    assert!(ver_cols.contains_key("document_id"));
+    assert!(ver_cols.contains_key("workspace_id"));
+    assert!(ver_cols.contains_key("version_number"));
+    assert!(ver_cols.contains_key("byte_size"));
+    assert!(ver_cols.contains_key("sha256_hash"));
+    assert_eq!(ver_cols["sha256_hash"].0, "bytea");
+    assert!(ver_cols.contains_key("content_type"));
+    assert!(ver_cols.contains_key("trust_state"));
+    assert!(ver_cols.contains_key("created_by"));
+    assert_eq!(ver_cols["created_by"].1, "YES");
+    assert!(ver_cols.contains_key("created_at"));
+
+    // 3. document_version_metadata
+    let meta_cols = get_table_columns(pool, "document_version_metadata").await;
+    assert!(meta_cols.contains_key("document_version_metadata_id"));
+    assert!(meta_cols.contains_key("document_version_id"));
+    assert!(meta_cols.contains_key("workspace_id"));
+    assert!(meta_cols.contains_key("metadata"));
+    assert_eq!(meta_cols["metadata"].0, "jsonb");
+    assert!(meta_cols.contains_key("custom_fields"));
+    assert_eq!(meta_cols["custom_fields"].0, "jsonb");
+    assert!(meta_cols.contains_key("extracted_author"));
+    assert_eq!(meta_cols["extracted_author"].1, "YES");
+    assert!(meta_cols.contains_key("extracted_title"));
+    assert_eq!(meta_cols["extracted_title"].1, "YES");
+    assert!(meta_cols.contains_key("page_count"));
+    assert_eq!(meta_cols["page_count"].1, "YES");
+    assert!(meta_cols.contains_key("word_count"));
+    assert_eq!(meta_cols["word_count"].1, "YES");
+
+    // 4. upload_intents
+    let upload_cols = get_table_columns(pool, "upload_intents").await;
+    assert!(upload_cols.contains_key("upload_intent_id"));
+    assert!(upload_cols.contains_key("workspace_id"));
+    assert!(upload_cols.contains_key("principal_id"));
+    assert!(upload_cols.contains_key("document_id"));
+    assert_eq!(upload_cols["document_id"].1, "YES");
+    assert!(upload_cols.contains_key("filename"));
+    assert!(upload_cols.contains_key("content_type"));
+    assert!(upload_cols.contains_key("expected_size_bytes"));
+    assert!(upload_cols.contains_key("status"));
+    assert!(upload_cols.contains_key("storage_key"));
+    assert!(upload_cols.contains_key("expires_at"));
+    assert!(upload_cols.contains_key("created_at"));
+    assert!(upload_cols.contains_key("completed_at"));
+    assert_eq!(upload_cols["completed_at"].1, "YES");
+
+    // 5. object_artifacts
+    let obj_cols = get_table_columns(pool, "object_artifacts").await;
+    assert!(obj_cols.contains_key("object_artifact_id"));
+    assert!(obj_cols.contains_key("workspace_id"));
+    assert!(obj_cols.contains_key("storage_bucket"));
+    assert!(obj_cols.contains_key("storage_key"));
+    assert!(obj_cols.contains_key("byte_size"));
+    assert!(obj_cols.contains_key("sha256_hash"));
+    assert_eq!(obj_cols["sha256_hash"].0, "bytea");
+    assert!(obj_cols.contains_key("content_type"));
+    assert!(obj_cols.contains_key("storage_tier"));
+    assert!(obj_cols.contains_key("created_at"));
+
+    // 6. quarantine_records
+    let qr_cols = get_table_columns(pool, "quarantine_records").await;
+    assert!(qr_cols.contains_key("quarantine_record_id"));
+    assert!(qr_cols.contains_key("workspace_id"));
+    assert!(qr_cols.contains_key("document_version_id"));
+    assert_eq!(qr_cols["document_version_id"].1, "YES");
+    assert!(qr_cols.contains_key("object_artifact_id"));
+    assert_eq!(qr_cols["object_artifact_id"].1, "YES");
+    assert!(qr_cols.contains_key("quarantine_reason"));
+    assert!(qr_cols.contains_key("scanner_name"));
+    assert!(qr_cols.contains_key("scanner_version"));
+    assert!(qr_cols.contains_key("threat_details"));
+    assert_eq!(qr_cols["threat_details"].0, "jsonb");
+    assert!(qr_cols.contains_key("status"));
+    assert!(qr_cols.contains_key("quarantined_at"));
+    assert!(qr_cols.contains_key("reviewed_at"));
+    assert_eq!(qr_cols["reviewed_at"].1, "YES");
+    assert!(qr_cols.contains_key("reviewed_by"));
+    assert_eq!(qr_cols["reviewed_by"].1, "YES");
+    assert!(qr_cols.contains_key("review_decision"));
+    assert_eq!(qr_cols["review_decision"].1, "YES");
+
+    // 7. jobs
+    let job_cols = get_table_columns(pool, "jobs").await;
+    assert!(job_cols.contains_key("job_id"));
+    assert!(job_cols.contains_key("workspace_id"));
+    assert!(job_cols.contains_key("queue_name"));
+    assert!(job_cols.contains_key("job_type"));
+    assert!(job_cols.contains_key("status"));
+    assert!(job_cols.contains_key("priority"));
+    assert!(job_cols.contains_key("payload"));
+    assert_eq!(job_cols["payload"].0, "jsonb");
+    assert!(job_cols.contains_key("result"));
+    assert_eq!(job_cols["result"].1, "YES");
+    assert!(job_cols.contains_key("error_details"));
+    assert_eq!(job_cols["error_details"].1, "YES");
+    assert!(job_cols.contains_key("idempotency_key"));
+    assert_eq!(job_cols["idempotency_key"].1, "YES");
+    assert!(job_cols.contains_key("correlation_id"));
+    assert_eq!(job_cols["correlation_id"].1, "YES");
+    assert!(job_cols.contains_key("lease_holder"));
+    assert_eq!(job_cols["lease_holder"].1, "YES");
+    assert!(job_cols.contains_key("lease_token"));
+    assert_eq!(job_cols["lease_token"].1, "YES");
+    assert!(job_cols.contains_key("lease_generation"));
+    assert!(job_cols.contains_key("lease_expires_at"));
+    assert_eq!(job_cols["lease_expires_at"].1, "YES");
+    assert!(job_cols.contains_key("last_heartbeat_at"));
+    assert_eq!(job_cols["last_heartbeat_at"].1, "YES");
+    assert!(job_cols.contains_key("attempt_count"));
+    assert!(job_cols.contains_key("max_attempts"));
+    assert!(job_cols.contains_key("backoff_base_secs"));
+    assert!(job_cols.contains_key("backoff_max_secs"));
+    assert!(job_cols.contains_key("next_run_at"));
+    assert!(job_cols.contains_key("created_at"));
+    assert!(job_cols.contains_key("started_at"));
+    assert_eq!(job_cols["started_at"].1, "YES");
+    assert!(job_cols.contains_key("completed_at"));
+    assert_eq!(job_cols["completed_at"].1, "YES");
+    assert!(job_cols.contains_key("row_version"));
+
+    // 8. job_attempts
+    let att_cols = get_table_columns(pool, "job_attempts").await;
+    assert!(att_cols.contains_key("job_attempt_id"));
+    assert!(att_cols.contains_key("job_id"));
+    assert!(att_cols.contains_key("workspace_id"));
+    assert!(att_cols.contains_key("attempt_number"));
+    assert!(att_cols.contains_key("worker_id"));
+    assert!(att_cols.contains_key("lease_token"));
+    assert_eq!(att_cols["lease_token"].1, "YES");
+    assert!(att_cols.contains_key("status"));
+    assert!(att_cols.contains_key("started_at"));
+    assert!(att_cols.contains_key("heartbeat_at"));
+    assert!(att_cols.contains_key("finished_at"));
+    assert_eq!(att_cols["finished_at"].1, "YES");
+    assert!(att_cols.contains_key("error_message"));
+    assert_eq!(att_cols["error_message"].1, "YES");
+    assert!(att_cols.contains_key("error_details"));
+    assert_eq!(att_cols["error_details"].1, "YES");
+    assert!(att_cols.contains_key("metadata"));
+    assert_eq!(att_cols["metadata"].0, "jsonb");
+
+    // 9. job_dependencies
+    let dep_cols = get_table_columns(pool, "job_dependencies").await;
+    assert!(dep_cols.contains_key("job_dependency_id"));
+    assert!(dep_cols.contains_key("job_id"));
+    assert!(dep_cols.contains_key("depends_on_job_id"));
+    assert!(dep_cols.contains_key("workspace_id"));
+    assert!(dep_cols.contains_key("created_at"));
+
+    // 10. job_progress
+    let prog_cols = get_table_columns(pool, "job_progress").await;
+    assert!(prog_cols.contains_key("job_progress_id"));
+    assert!(prog_cols.contains_key("job_id"));
+    assert!(prog_cols.contains_key("workspace_id"));
+    assert!(prog_cols.contains_key("stage"));
+    assert!(prog_cols.contains_key("progress_pct"));
+    assert!(prog_cols.contains_key("message"));
+    assert_eq!(prog_cols["message"].1, "YES");
+    assert!(prog_cols.contains_key("details"));
+    assert_eq!(prog_cols["details"].0, "jsonb");
+    assert!(prog_cols.contains_key("updated_at"));
+
+    // 11. dead_letter_entries
+    let dl_cols = get_table_columns(pool, "dead_letter_entries").await;
+    assert!(dl_cols.contains_key("dead_letter_entry_id"));
+    assert!(dl_cols.contains_key("job_id"));
+    assert!(dl_cols.contains_key("workspace_id"));
+    assert!(dl_cols.contains_key("queue_name"));
+    assert!(dl_cols.contains_key("job_type"));
+    assert!(dl_cols.contains_key("failed_at"));
+    assert!(dl_cols.contains_key("attempt_count"));
+    assert!(dl_cols.contains_key("failure_reason"));
+    assert!(dl_cols.contains_key("error_details"));
+    assert_eq!(dl_cols["error_details"].0, "jsonb");
+    assert!(dl_cols.contains_key("payload"));
+    assert_eq!(dl_cols["payload"].0, "jsonb");
+    assert!(dl_cols.contains_key("resolved_at"));
+    assert_eq!(dl_cols["resolved_at"].1, "YES");
+    assert!(dl_cols.contains_key("resolved_by"));
+    assert_eq!(dl_cols["resolved_by"].1, "YES");
+    assert!(dl_cols.contains_key("resolution_notes"));
+    assert_eq!(dl_cols["resolution_notes"].1, "YES");
+
+    // 12. parser_artifacts
+    let pa_cols = get_table_columns(pool, "parser_artifacts").await;
+    assert!(pa_cols.contains_key("parser_artifact_id"));
+    assert!(pa_cols.contains_key("document_version_id"));
+    assert!(pa_cols.contains_key("workspace_id"));
+    assert!(pa_cols.contains_key("job_id"));
+    assert_eq!(pa_cols["job_id"].1, "YES");
+    assert!(pa_cols.contains_key("parser_name"));
+    assert!(pa_cols.contains_key("parser_version"));
+    assert!(pa_cols.contains_key("status"));
+    assert!(pa_cols.contains_key("page_count"));
+    assert!(pa_cols.contains_key("block_count"));
+    assert!(pa_cols.contains_key("span_count"));
+    assert!(pa_cols.contains_key("execution_duration_ms"));
+    assert_eq!(pa_cols["execution_duration_ms"].1, "YES");
+    assert!(pa_cols.contains_key("error_message"));
+    assert_eq!(pa_cols["error_message"].1, "YES");
+    assert!(pa_cols.contains_key("created_at"));
+    assert!(pa_cols.contains_key("completed_at"));
+    assert_eq!(pa_cols["completed_at"].1, "YES");
+
+    // 13. parser_pages
+    let pp_cols = get_table_columns(pool, "parser_pages").await;
+    assert!(pp_cols.contains_key("parser_page_id"));
+    assert!(pp_cols.contains_key("parser_artifact_id"));
+    assert!(pp_cols.contains_key("workspace_id"));
+    assert!(pp_cols.contains_key("page_number"));
+    assert!(pp_cols.contains_key("width"));
+    assert_eq!(pp_cols["width"].1, "YES");
+    assert!(pp_cols.contains_key("height"));
+    assert_eq!(pp_cols["height"].1, "YES");
+    assert!(pp_cols.contains_key("rotation"));
+    assert!(pp_cols.contains_key("text_content"));
+    assert!(pp_cols.contains_key("metadata"));
+    assert_eq!(pp_cols["metadata"].0, "jsonb");
+    assert!(pp_cols.contains_key("created_at"));
+
+    // 14. parser_blocks
+    let pb_cols = get_table_columns(pool, "parser_blocks").await;
+    assert!(pb_cols.contains_key("parser_block_id"));
+    assert!(pb_cols.contains_key("parser_page_id"));
+    assert!(pb_cols.contains_key("workspace_id"));
+    assert!(pb_cols.contains_key("block_sequence"));
+    assert!(pb_cols.contains_key("block_type"));
+    assert!(pb_cols.contains_key("bounding_box"));
+    assert_eq!(pb_cols["bounding_box"].1, "YES");
+    assert!(pb_cols.contains_key("text_content"));
+    assert!(pb_cols.contains_key("confidence"));
+    assert_eq!(pb_cols["confidence"].1, "YES");
+    assert!(pb_cols.contains_key("metadata"));
+    assert_eq!(pb_cols["metadata"].0, "jsonb");
+    assert!(pb_cols.contains_key("created_at"));
+
+    // 15. source_spans
+    let ss_cols = get_table_columns(pool, "source_spans").await;
+    assert!(ss_cols.contains_key("source_span_id"));
+    assert!(ss_cols.contains_key("parser_block_id"));
+    assert!(ss_cols.contains_key("workspace_id"));
+    assert!(ss_cols.contains_key("span_sequence"));
+    assert!(ss_cols.contains_key("start_char"));
+    assert!(ss_cols.contains_key("end_char"));
+    assert!(ss_cols.contains_key("text_content"));
+    assert!(ss_cols.contains_key("bounding_box"));
+    assert_eq!(ss_cols["bounding_box"].1, "YES");
+    assert!(ss_cols.contains_key("confidence"));
+    assert_eq!(ss_cols["confidence"].1, "YES");
+    assert!(ss_cols.contains_key("metadata"));
+    assert_eq!(ss_cols["metadata"].0, "jsonb");
+    assert!(ss_cols.contains_key("created_at"));
+
+    // 16. dependency_keys
+    let dk_cols = get_table_columns(pool, "dependency_keys").await;
+    assert!(dk_cols.contains_key("dependency_key_id"));
+    assert!(dk_cols.contains_key("workspace_id"));
+    assert!(dk_cols.contains_key("key_type"));
+    assert!(dk_cols.contains_key("key_value"));
+    assert!(dk_cols.contains_key("key_hash"));
+    assert_eq!(dk_cols["key_hash"].0, "bytea");
+    assert!(dk_cols.contains_key("created_at"));
+
+    // 17. change_events
+    let ce_cols = get_table_columns(pool, "change_events").await;
+    assert!(ce_cols.contains_key("change_event_id"));
+    assert!(ce_cols.contains_key("workspace_id"));
+    assert!(ce_cols.contains_key("dependency_key_id"));
+    assert_eq!(ce_cols["dependency_key_id"].1, "YES");
+    assert!(ce_cols.contains_key("event_type"));
+    assert!(ce_cols.contains_key("entity_type"));
+    assert!(ce_cols.contains_key("entity_id"));
+    assert!(ce_cols.contains_key("change_payload"));
+    assert_eq!(ce_cols["change_payload"].0, "jsonb");
+    assert!(ce_cols.contains_key("detected_at"));
+    assert!(ce_cols.contains_key("created_at"));
 
     test_db.close().await.expect("Failed to drop test database");
 }

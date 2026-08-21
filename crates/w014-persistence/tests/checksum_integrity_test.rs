@@ -33,12 +33,12 @@ async fn test_published_m001r_and_m001r_f1_checksum_integrity() {
         "M001R-F1 forward repair migration must exist"
     );
 
-    // Verify MIGRATOR includes both migrations in exact sequence
+    // Verify MIGRATOR includes all 3 migrations in exact sequence
     let versions: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
     assert_eq!(
         versions,
-        vec![20260819000001, 20260820000001],
-        "MIGRATOR must contain 20260819000001 followed by 20260820000001"
+        vec![20260819000001, 20260820000001, 20260821000001],
+        "MIGRATOR must contain 20260819000001, 20260820000001, and 20260821000001 in sequence"
     );
 }
 

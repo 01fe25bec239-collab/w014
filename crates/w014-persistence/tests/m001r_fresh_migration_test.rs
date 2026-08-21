@@ -7,7 +7,9 @@
 //! - Absence of W2 job tables.
 //! - Repeat run idempotency.
 
-use w014_persistence::{MIGRATOR, TestDatabase, run_fresh_migration_harness};
+use std::fs;
+use tempfile::tempdir;
+use w014_persistence::{Migrator, TestDatabase, run_fresh_migration_harness};
 
 #[tokio::test]
 async fn test_m001r_fresh_migration_and_catalog_invariants() {
@@ -15,8 +17,43 @@ async fn test_m001r_fresh_migration_and_catalog_invariants() {
         .await
         .expect("Failed to provision isolated test database");
 
-    // 1. Run fresh migration harness with embedded M001R + M001R-F1 migrator
-    let result = run_fresh_migration_harness(test_db.pool(), &MIGRATOR)
+    let m001r_content = fs::read_to_string(
+        "crates/w014-persistence/migrations/20260819000001_m001r_identity_session_audit_idempotency.sql",
+    )
+    .or_else(|_| fs::read_to_string("migrations/20260819000001_m001r_identity_session_audit_idempotency.sql"))
+    .expect("Failed to read M001R migration file");
+
+    let m001r_f1_content = fs::read_to_string(
+        "crates/w014-persistence/migrations/20260820000001_m001r_prompt12_conformance_repair.sql",
+    )
+    .or_else(|_| {
+        fs::read_to_string("migrations/20260820000001_m001r_prompt12_conformance_repair.sql")
+    })
+    .expect("Failed to read M001R-F1 migration file");
+
+    let baseline_dir = tempdir().expect("Failed to create baseline migration dir");
+    fs::write(
+        baseline_dir
+            .path()
+            .join("20260819000001_m001r_identity_session_audit_idempotency.sql"),
+        &m001r_content,
+    )
+    .expect("Failed to write baseline migration");
+
+    fs::write(
+        baseline_dir
+            .path()
+            .join("20260820000001_m001r_prompt12_conformance_repair.sql"),
+        &m001r_f1_content,
+    )
+    .expect("Failed to write M001R-F1 migration");
+
+    let m001r_migrator = Migrator::new(baseline_dir.path())
+        .await
+        .expect("Failed to load m001r migrator");
+
+    // 1. Run fresh migration harness with isolated M001R + M001R-F1 migrator
+    let result = run_fresh_migration_harness(test_db.pool(), &m001r_migrator)
         .await
         .expect("M001R fresh migration harness failed");
 

@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use crate::error::PersistenceError;
 
-/// Compile-time embedded production migration bundle.
+/// Compile-time embedded production migration bundle (M001R + M001R-F1 + M002R).
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 /// Record of an applied migration stored in `_sqlx_migrations`.
