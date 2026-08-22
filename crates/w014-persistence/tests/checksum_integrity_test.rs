@@ -24,6 +24,26 @@ async fn test_published_m001r_and_m001r_f1_checksum_integrity() {
         "Published M001R migration file MUST remain byte-for-byte unchanged"
     );
 
+    // Verify published M001R-F1 forward repair migration checksum integrity
+    let m001r_f1_content = fs::read(
+        "migrations/20260820000001_m001r_prompt12_conformance_repair.sql",
+    )
+    .or_else(|_| {
+        fs::read(
+            "crates/w014-persistence/migrations/20260820000001_m001r_prompt12_conformance_repair.sql",
+        )
+    })
+    .expect("Failed to read published M001R-F1 migration file");
+
+    let mut f1_hasher = Sha256::new();
+    f1_hasher.update(&m001r_f1_content);
+    let f1_checksum = hex::encode(f1_hasher.finalize());
+
+    assert_eq!(
+        f1_checksum, "c277418404cd92c118071ba2ec9e211accc0b810160c0653baff04178a6d16e5",
+        "Published M001R-F1 migration file MUST remain byte-for-byte unchanged"
+    );
+
     // Verify forward repair migration exists
     let m001r_f1_exists = fs::metadata("migrations/20260820000001_m001r_prompt12_conformance_repair.sql")
         .or_else(|_| fs::metadata("crates/w014-persistence/migrations/20260820000001_m001r_prompt12_conformance_repair.sql"))

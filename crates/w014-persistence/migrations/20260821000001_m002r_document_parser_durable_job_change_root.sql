@@ -157,18 +157,24 @@ CREATE INDEX IF NOT EXISTS idx_quarantine_records_status ON quarantine_records(s
 -- ============================================================================
 
 -- 2.1 Jobs Table
+-- Frozen Prompt-12 status domain: requested -> queued -> running ->
+--   retryable (re-claimable) / succeeded / failed / cancelled / dead_letter.
+-- Queue claim support: status IN ('queued','retryable'), not_before <= clock_timestamp(),
+--   cancellation_requested = false, lease absent or expired, FOR UPDATE SKIP LOCKED.
+-- Canonical Jobs-AI semantic identity: UNIQUE(idempotency_key).
 CREATE TABLE IF NOT EXISTS jobs (
     job_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     queue_name TEXT NOT NULL,
     job_type TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'enqueued',
+    status TEXT NOT NULL DEFAULT 'requested',
     priority INT NOT NULL DEFAULT 0,
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     result JSONB NULL,
     error_details JSONB NULL,
     idempotency_key TEXT NULL,
     correlation_id TEXT NULL,
+    cancellation_requested BOOLEAN NOT NULL DEFAULT false,
     lease_holder TEXT NULL,
     lease_token UUID NULL,
     lease_generation BIGINT NOT NULL DEFAULT 0,
@@ -178,99 +184,144 @@ CREATE TABLE IF NOT EXISTS jobs (
     max_attempts INT NOT NULL DEFAULT 3,
     backoff_base_secs INT NOT NULL DEFAULT 2,
     backoff_max_secs INT NOT NULL DEFAULT 300,
-    next_run_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    not_before TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     started_at TIMESTAMPTZ NULL,
     completed_at TIMESTAMPTZ NULL,
     row_version INT NOT NULL DEFAULT 1,
     CONSTRAINT chk_jobs_queue_name_non_empty CHECK (length(trim(queue_name)) > 0),
     CONSTRAINT chk_jobs_job_type_non_empty CHECK (length(trim(job_type)) > 0),
-    CONSTRAINT chk_jobs_status CHECK (status IN ('enqueued', 'claimed', 'running', 'completed', 'failed', 'cancelled', 'dead_letter')),
+    CONSTRAINT chk_jobs_status CHECK (status IN ('requested', 'queued', 'running', 'retryable', 'succeeded', 'failed', 'cancelled', 'dead_letter')),
     CONSTRAINT chk_jobs_attempts CHECK (attempt_count >= 0 AND max_attempts > 0 AND attempt_count <= max_attempts),
     CONSTRAINT chk_jobs_lease_generation CHECK (lease_generation >= 0),
     CONSTRAINT chk_jobs_row_version_positive CHECK (row_version > 0),
-    CONSTRAINT uq_jobs_id_workspace UNIQUE (job_id, workspace_id)
+    CONSTRAINT uq_jobs_id_workspace UNIQUE (job_id, workspace_id),
+    CONSTRAINT uq_jobs_idempotency_key UNIQUE (idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_workspace_id ON jobs(workspace_id);
-CREATE INDEX IF NOT EXISTS idx_jobs_queue_status_poll ON jobs(queue_name, status, priority DESC, next_run_at ASC) WHERE status IN ('enqueued', 'claimed');
-CREATE INDEX IF NOT EXISTS idx_jobs_lease_expires ON jobs(lease_expires_at) WHERE status IN ('claimed', 'running');
+CREATE INDEX IF NOT EXISTS idx_jobs_queue_claim ON jobs(queue_name, priority DESC, not_before ASC) WHERE status IN ('queued', 'retryable') AND cancellation_requested = false;
+CREATE INDEX IF NOT EXISTS idx_jobs_lease_expires ON jobs(lease_expires_at) WHERE status = 'running' AND lease_expires_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_correlation_id ON jobs(correlation_id);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_workspace_queue_idemp ON jobs(workspace_id, queue_name, idempotency_key) WHERE idempotency_key IS NOT NULL AND status NOT IN ('completed', 'failed', 'cancelled', 'dead_letter');
 
 -- 2.2 Job Attempts Table
+-- Frozen Prompt-12 physical contract: append-only attempt history.
+-- Exact columns: job_attempt_id, job_id, attempt_number, worker_id, started_at,
+--   completed_at, outcome, error_code, error_detail_redacted.
+-- Only the frozen terminal-completion fields (outcome, completed_at, error_code,
+--   error_detail_redacted) may transition exactly once from 'running'.
 CREATE TABLE IF NOT EXISTS job_attempts (
     job_attempt_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id UUID NOT NULL,
-    workspace_id UUID NOT NULL,
+    job_id UUID NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
     attempt_number INT NOT NULL,
     worker_id TEXT NOT NULL,
-    lease_token UUID NULL,
-    status TEXT NOT NULL DEFAULT 'running',
-    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    finished_at TIMESTAMPTZ NULL,
-    error_message TEXT NULL,
-    error_details JSONB NULL,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    CONSTRAINT chk_job_attempts_attempt_num_positive CHECK (attempt_number > 0),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    completed_at TIMESTAMPTZ NULL,
+    outcome TEXT NOT NULL DEFAULT 'running',
+    error_code TEXT NULL,
+    error_detail_redacted TEXT NULL,
+    CONSTRAINT chk_job_attempts_attempt_number_positive CHECK (attempt_number >= 1),
     CONSTRAINT chk_job_attempts_worker_id_non_empty CHECK (length(trim(worker_id)) > 0),
-    CONSTRAINT chk_job_attempts_status CHECK (status IN ('running', 'completed', 'failed', 'timed_out', 'cancelled')),
-    CONSTRAINT chk_job_attempts_finished CHECK (finished_at IS NULL OR finished_at >= started_at),
-    CONSTRAINT uq_job_attempts_job_number UNIQUE (job_id, attempt_number),
-    CONSTRAINT uq_job_attempts_id_workspace UNIQUE (job_attempt_id, workspace_id),
-    CONSTRAINT fk_job_attempts_job_workspace FOREIGN KEY (job_id, workspace_id) REFERENCES jobs(job_id, workspace_id) ON DELETE CASCADE,
-    CONSTRAINT fk_job_attempts_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+    CONSTRAINT chk_job_attempts_outcome CHECK (outcome IN ('running', 'succeeded', 'retryable_failed', 'terminal_failed', 'cancelled', 'lease_expired')),
+    CONSTRAINT chk_job_attempts_terminal_completion CHECK ((outcome = 'running') = (completed_at IS NULL)),
+    CONSTRAINT uq_job_attempts_job_attempt UNIQUE (job_id, attempt_number)
 );
-CREATE INDEX IF NOT EXISTS idx_job_attempts_job_id ON job_attempts(job_id);
-CREATE INDEX IF NOT EXISTS idx_job_attempts_workspace_id ON job_attempts(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_job_attempts_worker_id ON job_attempts(worker_id);
 
+CREATE OR REPLACE FUNCTION fn_enforce_job_attempts_append_only()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        -- Referential-integrity cascades from parent jobs/workspaces rows are the
+        -- only permitted deletion path; direct DELETE mutations are prohibited.
+        IF pg_trigger_depth() > 1 THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION 'job_attempts is append-only: DELETE operations are prohibited';
+    END IF;
+    IF NEW.job_attempt_id IS DISTINCT FROM OLD.job_attempt_id
+       OR NEW.job_id IS DISTINCT FROM OLD.job_id
+       OR NEW.attempt_number IS DISTINCT FROM OLD.attempt_number
+       OR NEW.worker_id IS DISTINCT FROM OLD.worker_id
+       OR NEW.started_at IS DISTINCT FROM OLD.started_at THEN
+        RAISE EXCEPTION 'job_attempts identity fields are immutable: %', TG_OP;
+    END IF;
+    IF OLD.outcome <> 'running' THEN
+        RAISE EXCEPTION 'job_attempts row is finalized: terminal-completion fields may transition only once';
+    END IF;
+    IF NEW.outcome = 'running' THEN
+        RAISE EXCEPTION 'job_attempts UPDATE must transition outcome to a terminal value';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_enforce_job_attempts_append_only
+BEFORE UPDATE OR DELETE ON job_attempts
+FOR EACH ROW EXECUTE FUNCTION fn_enforce_job_attempts_append_only();
+
 -- 2.3 Job Dependencies Table
+-- Frozen Prompt-12 physical contract: dependency edges between jobs in the same
+-- family; tenant scoping flows through the parent jobs row. The predecessor
+-- success predicate is status = 'succeeded' on depends_on_job_id.
 CREATE TABLE IF NOT EXISTS job_dependencies (
     job_dependency_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id UUID NOT NULL,
-    depends_on_job_id UUID NOT NULL,
-    workspace_id UUID NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    job_id UUID NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    depends_on_job_id UUID NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT chk_job_dependencies_not_self CHECK (job_id <> depends_on_job_id),
-    CONSTRAINT uq_job_dependencies_pair UNIQUE (job_id, depends_on_job_id),
-    CONSTRAINT uq_job_dependencies_id_workspace UNIQUE (job_dependency_id, workspace_id),
-    CONSTRAINT fk_job_dependencies_job_workspace FOREIGN KEY (job_id, workspace_id) REFERENCES jobs(job_id, workspace_id) ON DELETE CASCADE,
-    CONSTRAINT fk_job_dependencies_dep_workspace FOREIGN KEY (depends_on_job_id, workspace_id) REFERENCES jobs(job_id, workspace_id) ON DELETE CASCADE,
-    CONSTRAINT fk_job_dependencies_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+    CONSTRAINT uq_job_dependencies_pair UNIQUE (job_id, depends_on_job_id)
 );
-CREATE INDEX IF NOT EXISTS idx_job_dependencies_job_id ON job_dependencies(job_id);
 CREATE INDEX IF NOT EXISTS idx_job_dependencies_depends_on ON job_dependencies(depends_on_job_id);
-CREATE INDEX IF NOT EXISTS idx_job_dependencies_workspace_id ON job_dependencies(workspace_id);
 
 -- 2.4 Job Progress Table
+-- Frozen Prompt-12 physical contract: DURABLE STAGE-LEVEL PROGRESS EVENTS.
+-- Exact columns: job_progress_id, job_id, sequence, stage_code, current, total,
+--   message_code, created_at. INSERT ONLY: multiple sequential events per job are
+--   permitted; duplicate (job_id, sequence) is rejected. No UPSERT / mutable row.
 CREATE TABLE IF NOT EXISTS job_progress (
     job_progress_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id UUID NOT NULL,
-    workspace_id UUID NOT NULL,
-    stage TEXT NOT NULL,
-    progress_pct INT NOT NULL DEFAULT 0,
-    message TEXT NULL,
-    details JSONB NOT NULL DEFAULT '{}'::jsonb,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT chk_job_progress_stage_non_empty CHECK (length(trim(stage)) > 0),
-    CONSTRAINT chk_job_progress_pct CHECK (progress_pct >= 0 AND progress_pct <= 100),
-    CONSTRAINT uq_job_progress_job UNIQUE (job_id),
-    CONSTRAINT uq_job_progress_id_workspace UNIQUE (job_progress_id, workspace_id),
-    CONSTRAINT fk_job_progress_job_workspace FOREIGN KEY (job_id, workspace_id) REFERENCES jobs(job_id, workspace_id) ON DELETE CASCADE,
-    CONSTRAINT fk_job_progress_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+    job_id UUID NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    sequence INT NOT NULL,
+    stage_code TEXT NOT NULL,
+    current BIGINT NOT NULL,
+    total BIGINT NULL,
+    message_code TEXT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT chk_job_progress_sequence_non_negative CHECK (sequence >= 0),
+    CONSTRAINT chk_job_progress_stage_code_non_empty CHECK (length(trim(stage_code)) > 0),
+    CONSTRAINT chk_job_progress_current_non_negative CHECK (current >= 0),
+    CONSTRAINT chk_job_progress_total_gte_current CHECK (total IS NULL OR total >= current),
+    CONSTRAINT chk_job_progress_message_code_non_empty CHECK (message_code IS NULL OR length(trim(message_code)) > 0),
+    CONSTRAINT uq_job_progress_job_sequence UNIQUE (job_id, sequence)
 );
-CREATE INDEX IF NOT EXISTS idx_job_progress_job_id ON job_progress(job_id);
-CREATE INDEX IF NOT EXISTS idx_job_progress_workspace_id ON job_progress(workspace_id);
+
+CREATE OR REPLACE FUNCTION fn_enforce_job_progress_insert_only()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        -- Referential-integrity cascades from parent jobs/workspaces rows are the
+        -- only permitted deletion path; direct DELETE mutations are prohibited.
+        IF pg_trigger_depth() > 1 THEN
+            RETURN OLD;
+        END IF;
+    END IF;
+    RAISE EXCEPTION 'job_progress is insert-only: % operations are prohibited', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_enforce_job_progress_insert_only
+BEFORE UPDATE OR DELETE ON job_progress
+FOR EACH ROW EXECUTE FUNCTION fn_enforce_job_progress_insert_only();
 
 -- 2.5 Dead Letter Entries Table
+-- Frozen Prompt-12 physical contract: one durable dead-letter record per poisoned
+-- job; tenant scoping flows through the parent jobs row.
 CREATE TABLE IF NOT EXISTS dead_letter_entries (
     dead_letter_entry_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id UUID NOT NULL,
-    workspace_id UUID NOT NULL,
+    job_id UUID NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
     queue_name TEXT NOT NULL,
     job_type TEXT NOT NULL,
-    failed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    failed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     attempt_count INT NOT NULL,
     failure_reason TEXT NOT NULL,
     error_details JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -283,13 +334,8 @@ CREATE TABLE IF NOT EXISTS dead_letter_entries (
     CONSTRAINT chk_dead_letter_job_type_non_empty CHECK (length(trim(job_type)) > 0),
     CONSTRAINT chk_dead_letter_attempt_count_positive CHECK (attempt_count > 0),
     CONSTRAINT chk_dead_letter_resolved CHECK (resolved_at IS NULL OR resolved_at >= failed_at),
-    CONSTRAINT uq_dead_letter_job UNIQUE (job_id),
-    CONSTRAINT uq_dead_letter_id_workspace UNIQUE (dead_letter_entry_id, workspace_id),
-    CONSTRAINT fk_dead_letter_job_workspace FOREIGN KEY (job_id, workspace_id) REFERENCES jobs(job_id, workspace_id) ON DELETE CASCADE,
-    CONSTRAINT fk_dead_letter_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+    CONSTRAINT uq_dead_letter_job UNIQUE (job_id)
 );
-CREATE INDEX IF NOT EXISTS idx_dead_letter_workspace_id ON dead_letter_entries(workspace_id);
-CREATE INDEX IF NOT EXISTS idx_dead_letter_job_id ON dead_letter_entries(job_id);
 CREATE INDEX IF NOT EXISTS idx_dead_letter_queue_name ON dead_letter_entries(queue_name);
 
 -- ============================================================================
@@ -522,37 +568,85 @@ CREATE POLICY rls_jobs_isolation ON jobs
     USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
     WITH CHECK (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
 
--- Job Attempts
+-- Job Attempts (tenant scoping flows through the parent jobs row)
 ALTER TABLE job_attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE job_attempts FORCE ROW LEVEL SECURITY;
 CREATE POLICY rls_job_attempts_isolation ON job_attempts
     FOR ALL
-    USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
-    WITH CHECK (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
+    USING (
+        EXISTS (
+            SELECT 1 FROM jobs j
+            WHERE j.job_id = job_attempts.job_id
+              AND j.workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM jobs j
+            WHERE j.job_id = job_attempts.job_id
+              AND j.workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
+        )
+    );
 
--- Job Dependencies
+-- Job Dependencies (tenant scoping flows through the parent jobs row)
 ALTER TABLE job_dependencies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE job_dependencies FORCE ROW LEVEL SECURITY;
 CREATE POLICY rls_job_dependencies_isolation ON job_dependencies
     FOR ALL
-    USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
-    WITH CHECK (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
+    USING (
+        EXISTS (
+            SELECT 1 FROM jobs j
+            WHERE j.job_id = job_dependencies.job_id
+              AND j.workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM jobs j
+            WHERE j.job_id = job_dependencies.job_id
+              AND j.workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
+        )
+    );
 
--- Job Progress
+-- Job Progress (tenant scoping flows through the parent jobs row)
 ALTER TABLE job_progress ENABLE ROW LEVEL SECURITY;
 ALTER TABLE job_progress FORCE ROW LEVEL SECURITY;
 CREATE POLICY rls_job_progress_isolation ON job_progress
     FOR ALL
-    USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
-    WITH CHECK (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
+    USING (
+        EXISTS (
+            SELECT 1 FROM jobs j
+            WHERE j.job_id = job_progress.job_id
+              AND j.workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM jobs j
+            WHERE j.job_id = job_progress.job_id
+              AND j.workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
+        )
+    );
 
--- Dead Letter Entries
+-- Dead Letter Entries (tenant scoping flows through the parent jobs row)
 ALTER TABLE dead_letter_entries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dead_letter_entries FORCE ROW LEVEL SECURITY;
 CREATE POLICY rls_dead_letter_entries_isolation ON dead_letter_entries
     FOR ALL
-    USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)
-    WITH CHECK (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid);
+    USING (
+        EXISTS (
+            SELECT 1 FROM jobs j
+            WHERE j.job_id = dead_letter_entries.job_id
+              AND j.workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM jobs j
+            WHERE j.job_id = dead_letter_entries.job_id
+              AND j.workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
+        )
+    );
 
 -- Parser Artifacts
 ALTER TABLE parser_artifacts ENABLE ROW LEVEL SECURITY;
@@ -616,10 +710,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON upload_intents TO w014_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON object_artifacts TO w014_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON quarantine_records TO w014_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON jobs TO w014_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON job_attempts TO w014_app;
+-- job_attempts: append-only attempt history (no DELETE; single terminal transition via UPDATE)
+GRANT SELECT, INSERT, UPDATE ON job_attempts TO w014_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON job_dependencies TO w014_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON job_progress TO w014_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON dead_letter_entries TO w014_app;
+-- job_progress: insert-only durable progress events (no UPDATE, no DELETE)
+GRANT SELECT, INSERT ON job_progress TO w014_app;
+-- dead_letter_entries: durable evidence with bounded resolution updates (no DELETE)
+GRANT SELECT, INSERT, UPDATE ON dead_letter_entries TO w014_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON parser_artifacts TO w014_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON parser_pages TO w014_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON parser_blocks TO w014_app;
@@ -635,10 +732,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON upload_intents TO w014_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON object_artifacts TO w014_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON quarantine_records TO w014_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON jobs TO w014_worker;
-GRANT SELECT, INSERT, UPDATE, DELETE ON job_attempts TO w014_worker;
+-- job_attempts: append-only attempt history (no DELETE; single terminal transition via UPDATE)
+GRANT SELECT, INSERT, UPDATE ON job_attempts TO w014_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON job_dependencies TO w014_worker;
-GRANT SELECT, INSERT, UPDATE, DELETE ON job_progress TO w014_worker;
-GRANT SELECT, INSERT, UPDATE, DELETE ON dead_letter_entries TO w014_worker;
+-- job_progress: insert-only durable progress events (no UPDATE, no DELETE)
+GRANT SELECT, INSERT ON job_progress TO w014_worker;
+-- dead_letter_entries: durable evidence with bounded resolution updates (no DELETE)
+GRANT SELECT, INSERT, UPDATE ON dead_letter_entries TO w014_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON parser_artifacts TO w014_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON parser_pages TO w014_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON parser_blocks TO w014_worker;

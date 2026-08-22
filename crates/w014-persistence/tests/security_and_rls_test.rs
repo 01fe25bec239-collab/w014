@@ -1026,21 +1026,47 @@ async fn test_m002r_rls_isolation_and_composite_fk_enforcement() {
         "Cross-workspace composite FK violation must be rejected at DB boundary"
     );
 
-    // Attempt to create a job attempt in WS A referencing job_b (which is in WS B) -> MUST FAIL
-    let cross_ws_attempt = sqlx::query(
-        "INSERT INTO job_attempts (job_attempt_id, job_id, workspace_id, attempt_number, worker_id)
-         VALUES ($1, $2, $3, 1, 'worker-1')",
-    )
-    .bind(Uuid::new_v4())
-    .bind(job_b) // Job B is in WS B
-    .bind(ws_a) // Attempting to attach to WS A
-    .execute(pool)
-    .await;
+    // Attempt to create a job attempt in WS A referencing job_b (which is in WS B)
+    // under the WS A RLS context -> MUST FAIL via RLS WITH CHECK through parent jobs.
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE w014_app")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        set_session_workspace_id(&mut tx, ws_a).await.unwrap();
 
-    assert!(
-        cross_ws_attempt.is_err(),
-        "Cross-workspace composite FK on job_attempts must be rejected"
-    );
+        let cross_ws_attempt = sqlx::query(
+            "INSERT INTO job_attempts (job_attempt_id, job_id, attempt_number, worker_id)
+             VALUES ($1, $2, 1, 'worker-1')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(job_b) // Job B is in WS B
+        .execute(&mut *tx)
+        .await;
+
+        assert!(
+            cross_ws_attempt.is_err(),
+            "Cross-workspace job_attempts insert must be rejected by RLS WITH CHECK"
+        );
+
+        // Direct FK enforcement: an attempt referencing a nonexistent job MUST fail.
+        let dangling_attempt = sqlx::query(
+            "INSERT INTO job_attempts (job_attempt_id, job_id, attempt_number, worker_id)
+             VALUES ($1, $2, 1, 'worker-1')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4()) // No such job exists
+        .execute(pool)
+        .await;
+
+        assert!(
+            dangling_attempt.is_err(),
+            "job_attempts FK to jobs(job_id) must reject dangling references"
+        );
+
+        tx.rollback().await.unwrap();
+    }
 
     test_db.close().await.expect("Failed to drop test database");
 }

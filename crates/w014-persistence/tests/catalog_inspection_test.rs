@@ -370,15 +370,11 @@ async fn test_database_catalog_state_and_security_mechanics() {
         ("object_artifacts", "uq_object_artifacts_id_workspace"),
         ("quarantine_records", "uq_quarantine_records_id_workspace"),
         ("jobs", "uq_jobs_id_workspace"),
-        ("job_attempts", "uq_job_attempts_id_workspace"),
-        ("job_attempts", "fk_job_attempts_job_workspace"),
-        ("job_dependencies", "uq_job_dependencies_id_workspace"),
-        ("job_dependencies", "fk_job_dependencies_job_workspace"),
-        ("job_dependencies", "fk_job_dependencies_dep_workspace"),
-        ("job_progress", "uq_job_progress_id_workspace"),
-        ("job_progress", "fk_job_progress_job_workspace"),
-        ("dead_letter_entries", "uq_dead_letter_id_workspace"),
-        ("dead_letter_entries", "fk_dead_letter_job_workspace"),
+        ("jobs", "uq_jobs_idempotency_key"),
+        ("job_attempts", "uq_job_attempts_job_attempt"),
+        ("job_dependencies", "uq_job_dependencies_pair"),
+        ("job_progress", "uq_job_progress_job_sequence"),
+        ("dead_letter_entries", "uq_dead_letter_job"),
         ("parser_artifacts", "uq_parser_artifacts_id_workspace"),
         ("parser_artifacts", "fk_parser_artifacts_doc_version_ws"),
         ("parser_pages", "uq_parser_pages_id_workspace"),
@@ -1221,6 +1217,10 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
     assert_eq!(job_cols["idempotency_key"].1, "YES");
     assert!(job_cols.contains_key("correlation_id"));
     assert_eq!(job_cols["correlation_id"].1, "YES");
+    assert!(
+        job_cols.contains_key("cancellation_requested"),
+        "jobs.cancellation_requested must exist for frozen claim predicate"
+    );
     assert!(job_cols.contains_key("lease_holder"));
     assert_eq!(job_cols["lease_holder"].1, "YES");
     assert!(job_cols.contains_key("lease_token"));
@@ -1234,7 +1234,14 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
     assert!(job_cols.contains_key("max_attempts"));
     assert!(job_cols.contains_key("backoff_base_secs"));
     assert!(job_cols.contains_key("backoff_max_secs"));
-    assert!(job_cols.contains_key("next_run_at"));
+    assert!(
+        job_cols.contains_key("not_before"),
+        "jobs.not_before must exist for frozen claim predicate"
+    );
+    assert!(
+        !job_cols.contains_key("next_run_at"),
+        "defective 'next_run_at' must not remain in jobs"
+    );
     assert!(job_cols.contains_key("created_at"));
     assert!(job_cols.contains_key("started_at"));
     assert_eq!(job_cols["started_at"].1, "YES");
@@ -1242,53 +1249,107 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
     assert_eq!(job_cols["completed_at"].1, "YES");
     assert!(job_cols.contains_key("row_version"));
 
-    // 8. job_attempts
+    // 8. job_attempts (exact frozen Prompt-12 columns)
     let att_cols = get_table_columns(pool, "job_attempts").await;
     assert!(att_cols.contains_key("job_attempt_id"));
     assert!(att_cols.contains_key("job_id"));
-    assert!(att_cols.contains_key("workspace_id"));
     assert!(att_cols.contains_key("attempt_number"));
     assert!(att_cols.contains_key("worker_id"));
-    assert!(att_cols.contains_key("lease_token"));
-    assert_eq!(att_cols["lease_token"].1, "YES");
-    assert!(att_cols.contains_key("status"));
     assert!(att_cols.contains_key("started_at"));
-    assert!(att_cols.contains_key("heartbeat_at"));
-    assert!(att_cols.contains_key("finished_at"));
-    assert_eq!(att_cols["finished_at"].1, "YES");
-    assert!(att_cols.contains_key("error_message"));
-    assert_eq!(att_cols["error_message"].1, "YES");
-    assert!(att_cols.contains_key("error_details"));
-    assert_eq!(att_cols["error_details"].1, "YES");
-    assert!(att_cols.contains_key("metadata"));
-    assert_eq!(att_cols["metadata"].0, "jsonb");
+    assert!(att_cols.contains_key("completed_at"));
+    assert_eq!(att_cols["completed_at"].1, "YES");
+    assert!(att_cols.contains_key("outcome"));
+    assert!(att_cols.contains_key("error_code"));
+    assert_eq!(att_cols["error_code"].1, "YES");
+    assert!(att_cols.contains_key("error_detail_redacted"));
+    assert_eq!(att_cols["error_detail_redacted"].1, "YES");
+    // Defective 0201-A substitutions must NOT remain.
+    assert!(
+        !att_cols.contains_key("workspace_id"),
+        "defective 'workspace_id' must not remain in job_attempts"
+    );
+    assert!(
+        !att_cols.contains_key("lease_token"),
+        "defective 'lease_token' must not remain in job_attempts"
+    );
+    assert!(
+        !att_cols.contains_key("status"),
+        "defective 'status' must not remain in job_attempts"
+    );
+    assert!(
+        !att_cols.contains_key("heartbeat_at"),
+        "defective 'heartbeat_at' must not remain in job_attempts"
+    );
+    assert!(
+        !att_cols.contains_key("finished_at"),
+        "defective 'finished_at' must not remain in job_attempts"
+    );
+    assert!(
+        !att_cols.contains_key("error_message"),
+        "defective 'error_message' must not remain in job_attempts"
+    );
+    assert!(
+        !att_cols.contains_key("error_details"),
+        "defective 'error_details' must not remain in job_attempts"
+    );
+    assert!(
+        !att_cols.contains_key("metadata"),
+        "defective 'metadata' must not remain in job_attempts"
+    );
 
     // 9. job_dependencies
     let dep_cols = get_table_columns(pool, "job_dependencies").await;
     assert!(dep_cols.contains_key("job_dependency_id"));
     assert!(dep_cols.contains_key("job_id"));
     assert!(dep_cols.contains_key("depends_on_job_id"));
-    assert!(dep_cols.contains_key("workspace_id"));
     assert!(dep_cols.contains_key("created_at"));
+    assert!(
+        !dep_cols.contains_key("workspace_id"),
+        "defective 'workspace_id' must not remain in job_dependencies"
+    );
 
-    // 10. job_progress
+    // 10. job_progress (exact frozen Prompt-12 sequence-event columns)
     let prog_cols = get_table_columns(pool, "job_progress").await;
     assert!(prog_cols.contains_key("job_progress_id"));
     assert!(prog_cols.contains_key("job_id"));
-    assert!(prog_cols.contains_key("workspace_id"));
-    assert!(prog_cols.contains_key("stage"));
-    assert!(prog_cols.contains_key("progress_pct"));
-    assert!(prog_cols.contains_key("message"));
-    assert_eq!(prog_cols["message"].1, "YES");
-    assert!(prog_cols.contains_key("details"));
-    assert_eq!(prog_cols["details"].0, "jsonb");
-    assert!(prog_cols.contains_key("updated_at"));
+    assert!(prog_cols.contains_key("sequence"));
+    assert!(prog_cols.contains_key("stage_code"));
+    assert!(prog_cols.contains_key("current"));
+    assert!(prog_cols.contains_key("total"));
+    assert_eq!(prog_cols["total"].1, "YES");
+    assert!(prog_cols.contains_key("message_code"));
+    assert_eq!(prog_cols["message_code"].1, "YES");
+    assert!(prog_cols.contains_key("created_at"));
+    // Defective mutable-current-row representation must NOT remain.
+    assert!(
+        !prog_cols.contains_key("stage"),
+        "defective 'stage' must not remain in job_progress"
+    );
+    assert!(
+        !prog_cols.contains_key("progress_pct"),
+        "defective 'progress_pct' must not remain in job_progress"
+    );
+    assert!(
+        !prog_cols.contains_key("message"),
+        "defective 'message' must not remain in job_progress"
+    );
+    assert!(
+        !prog_cols.contains_key("details"),
+        "defective 'details' must not remain in job_progress"
+    );
+    assert!(
+        !prog_cols.contains_key("updated_at"),
+        "defective 'updated_at' must not remain in job_progress"
+    );
+    assert!(
+        !prog_cols.contains_key("workspace_id"),
+        "defective 'workspace_id' must not remain in job_progress"
+    );
 
     // 11. dead_letter_entries
     let dl_cols = get_table_columns(pool, "dead_letter_entries").await;
     assert!(dl_cols.contains_key("dead_letter_entry_id"));
     assert!(dl_cols.contains_key("job_id"));
-    assert!(dl_cols.contains_key("workspace_id"));
     assert!(dl_cols.contains_key("queue_name"));
     assert!(dl_cols.contains_key("job_type"));
     assert!(dl_cols.contains_key("failed_at"));
@@ -1304,6 +1365,10 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
     assert_eq!(dl_cols["resolved_by"].1, "YES");
     assert!(dl_cols.contains_key("resolution_notes"));
     assert_eq!(dl_cols["resolution_notes"].1, "YES");
+    assert!(
+        !dl_cols.contains_key("workspace_id"),
+        "defective 'workspace_id' must not remain in dead_letter_entries"
+    );
 
     // 12. parser_artifacts
     let pa_cols = get_table_columns(pool, "parser_artifacts").await;
