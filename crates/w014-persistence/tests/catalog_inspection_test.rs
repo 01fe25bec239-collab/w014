@@ -366,9 +366,17 @@ async fn test_database_catalog_state_and_security_mechanics() {
             "document_version_metadata",
             "fk_doc_ver_metadata_ver_workspace",
         ),
+        ("upload_intents", "fk_upload_intents_document_ws"),
+        ("upload_intents", "fk_upload_intents_artifact_ws"),
+        ("upload_intents", "uq_upload_intents_opaque_object_key"),
         ("upload_intents", "uq_upload_intents_id_workspace"),
+        ("object_artifacts", "uq_object_artifacts_object_key"),
         ("object_artifacts", "uq_object_artifacts_id_workspace"),
+        ("quarantine_records", "fk_quarantine_records_intent_ws"),
+        ("quarantine_records", "fk_quarantine_records_doc_ver_ws"),
+        ("quarantine_records", "fk_quarantine_records_artifact_ws"),
         ("quarantine_records", "uq_quarantine_records_id_workspace"),
+        ("document_versions", "fk_document_versions_artifact_ws"),
         ("jobs", "uq_jobs_id_workspace"),
         ("jobs", "uq_jobs_idempotency_key"),
         ("job_attempts", "uq_job_attempts_job_attempt"),
@@ -383,6 +391,9 @@ async fn test_database_catalog_state_and_security_mechanics() {
         ("parser_blocks", "fk_parser_blocks_page_workspace"),
         ("source_spans", "uq_source_spans_id_workspace"),
         ("source_spans", "fk_source_spans_block_workspace"),
+        // M002R document physical contract repair
+        ("documents", "fk_documents_current_version_workspace"),
+        ("parser_artifacts", "fk_parser_artifacts_artifact_ws"),
         ("dependency_keys", "uq_dependency_keys_id_workspace"),
         ("dependency_keys", "uq_dependency_keys_workspace_hash"),
         ("change_events", "uq_change_events_id_workspace"),
@@ -1099,7 +1110,7 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
 
     let pool = test_db.pool();
 
-    // 1. documents
+    // 1. documents (repaired: deferred current-version pointer is a physical fact)
     let doc_cols = get_table_columns(pool, "documents").await;
     assert!(doc_cols.contains_key("document_id"));
     assert_eq!(doc_cols["document_id"].1, "NO");
@@ -1108,25 +1119,50 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
     assert!(doc_cols.contains_key("title"));
     assert!(doc_cols.contains_key("document_type"));
     assert!(doc_cols.contains_key("status"));
+    assert!(
+        doc_cols.contains_key("current_version_id"),
+        "documents.current_version_id must exist as the frozen deferred pointer"
+    );
+    assert_eq!(
+        doc_cols["current_version_id"].1, "YES",
+        "documents.current_version_id must be nullable"
+    );
     assert!(doc_cols.contains_key("created_by"));
     assert_eq!(doc_cols["created_by"].1, "YES");
     assert!(doc_cols.contains_key("created_at"));
     assert!(doc_cols.contains_key("updated_at"));
     assert!(doc_cols.contains_key("row_version"));
 
-    // 2. document_versions
+    // 2. document_versions (repaired: object binding + original filename are physical facts)
     let ver_cols = get_table_columns(pool, "document_versions").await;
     assert!(ver_cols.contains_key("document_version_id"));
     assert!(ver_cols.contains_key("document_id"));
     assert!(ver_cols.contains_key("workspace_id"));
     assert!(ver_cols.contains_key("version_number"));
+    assert!(
+        ver_cols.contains_key("object_artifact_id"),
+        "document_versions.object_artifact_id must be an explicit authoritative fact"
+    );
+    assert_eq!(
+        ver_cols["object_artifact_id"].1, "NO",
+        "document_versions.object_artifact_id must be NOT NULL (immutable binding)"
+    );
     assert!(ver_cols.contains_key("byte_size"));
     assert!(ver_cols.contains_key("sha256_hash"));
     assert_eq!(ver_cols["sha256_hash"].0, "bytea");
     assert!(ver_cols.contains_key("content_type"));
+    assert!(
+        ver_cols.contains_key("original_filename"),
+        "document_versions.original_filename must be an explicit physical fact, not hidden JSONB"
+    );
+    assert_eq!(ver_cols["original_filename"].1, "NO");
     assert!(ver_cols.contains_key("trust_state"));
-    assert!(ver_cols.contains_key("created_by"));
-    assert_eq!(ver_cols["created_by"].1, "YES");
+    assert!(ver_cols.contains_key("submitted_by"));
+    assert_eq!(ver_cols["submitted_by"].1, "YES");
+    assert!(
+        !ver_cols.contains_key("created_by"),
+        "legacy 'created_by' must not remain in document_versions (frozen name: submitted_by)"
+    );
     assert!(ver_cols.contains_key("created_at"));
 
     // 3. document_version_metadata
@@ -1147,57 +1183,156 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
     assert!(meta_cols.contains_key("word_count"));
     assert_eq!(meta_cols["word_count"].1, "YES");
 
-    // 4. upload_intents
+    // 4. upload_intents (repaired: exact frozen Prompt-12 declaration facts)
     let upload_cols = get_table_columns(pool, "upload_intents").await;
     assert!(upload_cols.contains_key("upload_intent_id"));
     assert!(upload_cols.contains_key("workspace_id"));
-    assert!(upload_cols.contains_key("principal_id"));
+    assert!(upload_cols.contains_key("created_by"));
+    assert_eq!(upload_cols["created_by"].1, "NO");
     assert!(upload_cols.contains_key("document_id"));
     assert_eq!(upload_cols["document_id"].1, "YES");
     assert!(upload_cols.contains_key("filename"));
-    assert!(upload_cols.contains_key("content_type"));
-    assert!(upload_cols.contains_key("expected_size_bytes"));
+    assert!(
+        upload_cols.contains_key("expected_media_type"),
+        "upload_intents.expected_media_type must be an explicit authoritative fact"
+    );
+    assert!(
+        upload_cols.contains_key("expected_length"),
+        "upload_intents.expected_length must be an explicit authoritative fact"
+    );
+    assert!(
+        upload_cols.contains_key("expected_sha256_b64"),
+        "upload_intents.expected_sha256_b64 must be an explicit physical declaration column"
+    );
+    assert_eq!(
+        upload_cols["expected_sha256_b64"].1, "YES",
+        "expected_sha256_b64 must be nullable (declaration is optional)"
+    );
+    assert!(upload_cols.contains_key("object_artifact_id"));
+    assert_eq!(upload_cols["object_artifact_id"].1, "YES");
+    assert!(
+        upload_cols.contains_key("opaque_object_key"),
+        "upload_intents.opaque_object_key must be the server-generated authority column"
+    );
     assert!(upload_cols.contains_key("status"));
-    assert!(upload_cols.contains_key("storage_key"));
     assert!(upload_cols.contains_key("expires_at"));
+    assert!(upload_cols.contains_key("finalized_at"));
+    assert_eq!(upload_cols["finalized_at"].1, "YES");
+    assert!(upload_cols.contains_key("abandoned_at"));
+    assert_eq!(upload_cols["abandoned_at"].1, "YES");
     assert!(upload_cols.contains_key("created_at"));
-    assert!(upload_cols.contains_key("completed_at"));
-    assert_eq!(upload_cols["completed_at"].1, "YES");
+    // Defective substitutes must NOT remain.
+    assert!(
+        !upload_cols.contains_key("principal_id"),
+        "defective 'principal_id' must not remain in upload_intents (frozen name: created_by)"
+    );
+    assert!(
+        !upload_cols.contains_key("content_type"),
+        "defective 'content_type' must not remain in upload_intents (frozen name: expected_media_type)"
+    );
+    assert!(
+        !upload_cols.contains_key("expected_size_bytes"),
+        "defective 'expected_size_bytes' must not remain in upload_intents (frozen name: expected_length)"
+    );
+    assert!(
+        !upload_cols.contains_key("storage_key"),
+        "defective 'storage_key' must not remain in upload_intents (frozen name: opaque_object_key)"
+    );
+    assert!(
+        !upload_cols.contains_key("completed_at"),
+        "defective 'completed_at' must not remain in upload_intents (frozen markers: finalized_at/abandoned_at)"
+    );
 
-    // 5. object_artifacts
+    // 5. object_artifacts (repaired: exact frozen Prompt-12 object facts)
     let obj_cols = get_table_columns(pool, "object_artifacts").await;
     assert!(obj_cols.contains_key("object_artifact_id"));
     assert!(obj_cols.contains_key("workspace_id"));
+    assert!(
+        obj_cols.contains_key("artifact_kind"),
+        "object_artifacts.artifact_kind must be an explicit closed-domain fact"
+    );
     assert!(obj_cols.contains_key("storage_bucket"));
-    assert!(obj_cols.contains_key("storage_key"));
-    assert!(obj_cols.contains_key("byte_size"));
-    assert!(obj_cols.contains_key("sha256_hash"));
-    assert_eq!(obj_cols["sha256_hash"].0, "bytea");
+    assert!(
+        obj_cols.contains_key("object_key"),
+        "object_artifacts.object_key must be the server-owned authority column"
+    );
+    assert!(
+        obj_cols.contains_key("byte_length"),
+        "object_artifacts.byte_length must be an explicit frozen fact"
+    );
+    assert!(obj_cols.contains_key("content_sha256"));
+    assert_eq!(obj_cols["content_sha256"].0, "bytea");
     assert!(obj_cols.contains_key("content_type"));
     assert!(obj_cols.contains_key("storage_tier"));
+    assert!(
+        obj_cols.contains_key("sse_mode"),
+        "object_artifacts.sse_mode must be an explicit encryption-posture fact"
+    );
+    assert!(obj_cols.contains_key("kms_key_ref"));
+    assert_eq!(obj_cols["kms_key_ref"].1, "YES");
     assert!(obj_cols.contains_key("created_at"));
+    // Defective substitutes must NOT remain.
+    assert!(
+        !obj_cols.contains_key("storage_key"),
+        "defective 'storage_key' must not remain in object_artifacts (frozen name: object_key)"
+    );
+    assert!(
+        !obj_cols.contains_key("byte_size"),
+        "defective 'byte_size' must not remain in object_artifacts (frozen name: byte_length)"
+    );
+    assert!(
+        !obj_cols.contains_key("sha256_hash"),
+        "defective 'sha256_hash' must not remain in object_artifacts (frozen name: content_sha256)"
+    );
 
-    // 6. quarantine_records
+    // 6. quarantine_records (repaired: intent tie + frozen outcome domain are physical)
     let qr_cols = get_table_columns(pool, "quarantine_records").await;
     assert!(qr_cols.contains_key("quarantine_record_id"));
     assert!(qr_cols.contains_key("workspace_id"));
+    assert!(
+        qr_cols.contains_key("upload_intent_id"),
+        "quarantine_records.upload_intent_id must be a physical tie to the scanned bytes"
+    );
+    assert_eq!(
+        qr_cols["upload_intent_id"].1, "NO",
+        "quarantine_records.upload_intent_id must be NOT NULL"
+    );
     assert!(qr_cols.contains_key("document_version_id"));
     assert_eq!(qr_cols["document_version_id"].1, "YES");
     assert!(qr_cols.contains_key("object_artifact_id"));
     assert_eq!(qr_cols["object_artifact_id"].1, "YES");
-    assert!(qr_cols.contains_key("quarantine_reason"));
     assert!(qr_cols.contains_key("scanner_name"));
     assert!(qr_cols.contains_key("scanner_version"));
+    assert_eq!(qr_cols["scanner_version"].1, "YES");
+    assert!(
+        qr_cols.contains_key("reason_code"),
+        "quarantine_records.reason_code must be the explicit frozen reason column"
+    );
     assert!(qr_cols.contains_key("threat_details"));
     assert_eq!(qr_cols["threat_details"].0, "jsonb");
     assert!(qr_cols.contains_key("status"));
-    assert!(qr_cols.contains_key("quarantined_at"));
-    assert!(qr_cols.contains_key("reviewed_at"));
-    assert_eq!(qr_cols["reviewed_at"].1, "YES");
-    assert!(qr_cols.contains_key("reviewed_by"));
-    assert_eq!(qr_cols["reviewed_by"].1, "YES");
-    assert!(qr_cols.contains_key("review_decision"));
-    assert_eq!(qr_cols["review_decision"].1, "YES");
+    assert!(qr_cols.contains_key("checked_at"));
+    // Defective substitutes must NOT remain.
+    assert!(
+        !qr_cols.contains_key("quarantine_reason"),
+        "defective 'quarantine_reason' must not remain in quarantine_records (frozen name: reason_code)"
+    );
+    assert!(
+        !qr_cols.contains_key("quarantined_at"),
+        "defective 'quarantined_at' must not remain in quarantine_records (frozen name: checked_at)"
+    );
+    assert!(
+        !qr_cols.contains_key("reviewed_at"),
+        "non-frozen 'reviewed_at' lifecycle projection must not remain in quarantine_records"
+    );
+    assert!(
+        !qr_cols.contains_key("reviewed_by"),
+        "non-frozen 'reviewed_by' lifecycle projection must not remain in quarantine_records"
+    );
+    assert!(
+        !qr_cols.contains_key("review_decision"),
+        "non-frozen 'review_decision' lifecycle projection must not remain in quarantine_records"
+    );
 
     // 7. jobs
     let job_cols = get_table_columns(pool, "jobs").await;
@@ -1370,7 +1505,7 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
         "defective 'workspace_id' must not remain in dead_letter_entries"
     );
 
-    // 12. parser_artifacts
+    // 12. parser_artifacts (repaired: locator identity + object/digest refs + exact lifecycle)
     let pa_cols = get_table_columns(pool, "parser_artifacts").await;
     assert!(pa_cols.contains_key("parser_artifact_id"));
     assert!(pa_cols.contains_key("document_version_id"));
@@ -1379,17 +1514,41 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
     assert_eq!(pa_cols["job_id"].1, "YES");
     assert!(pa_cols.contains_key("parser_name"));
     assert!(pa_cols.contains_key("parser_version"));
+    assert!(
+        pa_cols.contains_key("locator_version"),
+        "parser_artifacts.locator_version must be a REQUIRED physical identity column"
+    );
+    assert_eq!(pa_cols["locator_version"].1, "NO");
     assert!(pa_cols.contains_key("status"));
+    assert!(pa_cols.contains_key("artifact_object_id"));
+    assert_eq!(pa_cols["artifact_object_id"].1, "YES");
+    assert!(pa_cols.contains_key("text_sha256"));
+    assert_eq!(pa_cols["text_sha256"].1, "YES");
     assert!(pa_cols.contains_key("page_count"));
     assert!(pa_cols.contains_key("block_count"));
     assert!(pa_cols.contains_key("span_count"));
     assert!(pa_cols.contains_key("execution_duration_ms"));
     assert_eq!(pa_cols["execution_duration_ms"].1, "YES");
-    assert!(pa_cols.contains_key("error_message"));
-    assert_eq!(pa_cols["error_message"].1, "YES");
-    assert!(pa_cols.contains_key("created_at"));
+    assert!(
+        pa_cols.contains_key("failure_code"),
+        "parser_artifacts.failure_code must be the explicit frozen failure column"
+    );
+    assert_eq!(pa_cols["failure_code"].1, "YES");
+    assert!(
+        pa_cols.contains_key("started_at"),
+        "parser_artifacts.started_at is the exact frozen Prompt-12 start timestamp"
+    );
     assert!(pa_cols.contains_key("completed_at"));
     assert_eq!(pa_cols["completed_at"].1, "YES");
+    // Defective substitutes must NOT remain.
+    assert!(
+        !pa_cols.contains_key("error_message"),
+        "defective 'error_message' must not remain in parser_artifacts (frozen name: failure_code)"
+    );
+    assert!(
+        !pa_cols.contains_key("created_at"),
+        "defective 'created_at' must not remain in parser_artifacts (frozen name: started_at)"
+    );
 
     // 13. parser_pages
     let pp_cols = get_table_columns(pool, "parser_pages").await;

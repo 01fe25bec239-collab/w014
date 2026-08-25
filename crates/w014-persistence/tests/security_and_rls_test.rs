@@ -913,17 +913,37 @@ async fn test_m002r_rls_isolation_and_composite_fk_enforcement() {
         .await
         .unwrap();
 
+    let artifact_a = Uuid::new_v4();
+    let artifact_b = Uuid::new_v4();
+    let dummy_hash = vec![0u8; 32];
+    sqlx::query(
+        "INSERT INTO object_artifacts (object_artifact_id, workspace_id, artifact_kind, storage_bucket, object_key, byte_length, content_sha256, content_type, sse_mode) \
+         VALUES ($1, $2, 'original', 'w014-test', $3, 100, $4, 'application/pdf', 'none'), \
+                ($5, $6, 'original', 'w014-test', $7, 200, $4, 'application/pdf', 'none')",
+    )
+    .bind(artifact_a)
+    .bind(ws_a)
+    .bind(format!("upload-intents/{}", artifact_a.simple()))
+    .bind(&dummy_hash)
+    .bind(artifact_b)
+    .bind(ws_b)
+    .bind(format!("upload-intents/{}", artifact_b.simple()))
+    .execute(pool)
+    .await
+    .unwrap();
+
     let ver_a = Uuid::new_v4();
     let ver_b = Uuid::new_v4();
-    let dummy_hash = vec![0u8; 32];
-    sqlx::query("INSERT INTO document_versions (document_version_id, document_id, workspace_id, version_number, byte_size, sha256_hash, content_type) VALUES ($1, $2, $3, 1, 100, $4, 'application/pdf'), ($5, $6, $7, 1, 200, $4, 'application/pdf')")
+    sqlx::query("INSERT INTO document_versions (document_version_id, document_id, workspace_id, version_number, object_artifact_id, byte_size, sha256_hash, content_type, original_filename) VALUES ($1, $2, $3, 1, $4, 100, $5, 'application/pdf', 'report-a.pdf'), ($6, $7, $8, 1, $9, 200, $5, 'application/pdf', 'report-b.pdf')")
         .bind(ver_a)
         .bind(doc_a)
         .bind(ws_a)
+        .bind(artifact_a)
         .bind(&dummy_hash)
         .bind(ver_b)
         .bind(doc_b)
         .bind(ws_b)
+        .bind(artifact_b)
         .execute(pool)
         .await
         .unwrap();
@@ -1011,12 +1031,13 @@ async fn test_m002r_rls_isolation_and_composite_fk_enforcement() {
     // 4. Test Composite FK Boundary Isolation
     // Attempt to create a document version in WS A referencing doc_b (which is in WS B) -> MUST FAIL
     let cross_ws_ver = sqlx::query(
-        "INSERT INTO document_versions (document_version_id, document_id, workspace_id, version_number, byte_size, sha256_hash, content_type)
-         VALUES ($1, $2, $3, 2, 100, $4, 'application/pdf')"
+        "INSERT INTO document_versions (document_version_id, document_id, workspace_id, version_number, object_artifact_id, byte_size, sha256_hash, content_type, original_filename)
+         VALUES ($1, $2, $3, 2, $4, 100, $5, 'application/pdf', 'cross-ws.pdf')"
     )
     .bind(Uuid::new_v4())
     .bind(doc_b) // Doc B is in WS B
     .bind(ws_a)  // Attempting to attach to WS A
+    .bind(artifact_a)
     .bind(&dummy_hash)
     .execute(pool)
     .await;

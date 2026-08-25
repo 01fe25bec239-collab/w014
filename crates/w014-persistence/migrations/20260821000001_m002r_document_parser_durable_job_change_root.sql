@@ -1,6 +1,23 @@
 -- M002R: Physical Migration for W2 Document Pipeline, Object Storage, Parser Hierarchy,
 -- Durable Job Substrate, and Change Evidence Ledger.
 -- Conforming to exact frozen Prompt-12 specifications and Staged-FK controls.
+--
+-- M002R DOCUMENT PHYSICAL CONTRACT REPAIR (Persistence-State owned):
+-- Frozen authoritative facts that were previously missing from the physical
+-- catalog are realized as explicit columns/constraints (never as JSONB or
+-- caller-supplied context):
+--   documents            : current_version_id (nullable deferred pointer, staged FK)
+--   object_artifacts     : artifact_kind, object_key, content_sha256, byte_length,
+--                          sse_mode, kms_key_ref + immutable object-fact semantics
+--   upload_intents       : opaque_object_key, expected_media_type, expected_length,
+--                          expected_sha256_b64, created_by, finalized_at, abandoned_at,
+--                          object_artifact_id binding + one-way terminal semantics
+--   document_versions    : object_artifact_id, original_filename + immutable row with
+--                          guarded one-way trust_state transitions
+--   quarantine_records   : upload_intent_id, reason_code, checked_at + frozen scan
+--                          outcome domain + insert-only rescan-append semantics
+--   parser_artifacts     : locator_version, artifact_object_id, text_sha256,
+--                          started_at, failure_code + guarded terminal transitions
 
 -- ============================================================================
 -- 1. Document & Object Domain Tables (1-6)
@@ -13,6 +30,7 @@ CREATE TABLE IF NOT EXISTS documents (
     title TEXT NOT NULL,
     document_type TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
+    current_version_id UUID NULL,
     created_by UUID NULL REFERENCES principals(principal_id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -26,35 +44,236 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE INDEX IF NOT EXISTS idx_documents_workspace_id ON documents(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_documents_created_by ON documents(created_by);
 CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
+CREATE INDEX IF NOT EXISTS idx_documents_current_version ON documents(current_version_id);
 
--- 1.2 Document Versions Table
+-- 1.2 Object Artifacts Table
+-- Server-owned immutable object facts: the object key is minted server-side,
+-- never client-selected; digest/length/kind/encryption posture are explicit
+-- frozen physical columns, not JSONB substitutes. Rows are insert-only.
+CREATE TABLE IF NOT EXISTS object_artifacts (
+    object_artifact_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    artifact_kind TEXT NOT NULL,
+    storage_bucket TEXT NOT NULL,
+    object_key TEXT NOT NULL,
+    byte_length BIGINT NOT NULL,
+    content_sha256 BYTEA NOT NULL,
+    content_type TEXT NOT NULL,
+    storage_tier TEXT NOT NULL DEFAULT 'hot',
+    sse_mode TEXT NOT NULL,
+    kms_key_ref TEXT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_object_artifacts_kind CHECK (artifact_kind IN ('original', 'derived')),
+    CONSTRAINT chk_object_artifacts_bucket_non_empty CHECK (length(trim(storage_bucket)) > 0),
+    CONSTRAINT chk_object_artifacts_key_shape CHECK (
+        length(object_key) <= 1024
+        AND object_key ~ '^[!-~]+$'
+        AND position('/' in object_key) <> 1
+        AND position('//' in object_key) = 0
+        AND position('..' in object_key) = 0
+    ),
+    CONSTRAINT chk_object_artifacts_byte_length_non_negative CHECK (byte_length >= 0),
+    CONSTRAINT chk_object_artifacts_content_sha256_len CHECK (octet_length(content_sha256) = 32),
+    CONSTRAINT chk_object_artifacts_content_type_non_empty CHECK (length(trim(content_type)) > 0),
+    CONSTRAINT chk_object_artifacts_tier CHECK (storage_tier IN ('hot', 'warm', 'cold', 'archive')),
+    CONSTRAINT chk_object_artifacts_sse_mode CHECK (sse_mode IN ('none', 'sse_aes256')),
+    CONSTRAINT chk_object_artifacts_kms_ref_non_empty CHECK (kms_key_ref IS NULL OR length(trim(kms_key_ref)) > 0),
+    CONSTRAINT uq_object_artifacts_object_key UNIQUE (object_key),
+    CONSTRAINT uq_object_artifacts_id_workspace UNIQUE (object_artifact_id, workspace_id)
+);
+CREATE INDEX IF NOT EXISTS idx_object_artifacts_workspace_id ON object_artifacts(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_object_artifacts_content_sha256 ON object_artifacts(content_sha256);
+
+CREATE OR REPLACE FUNCTION fn_enforce_object_artifacts_append_only()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        -- Referential-integrity cascades from parent workspaces rows are the
+        -- only permitted deletion path; direct DELETE mutations are prohibited.
+        IF pg_trigger_depth() > 1 THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION 'object_artifacts is append-only: DELETE operations are prohibited';
+    END IF;
+    RAISE EXCEPTION 'object_artifacts rows are immutable object facts: UPDATE operations are prohibited';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_enforce_object_artifacts_append_only
+BEFORE UPDATE OR DELETE ON object_artifacts
+FOR EACH ROW EXECUTE FUNCTION fn_enforce_object_artifacts_append_only();
+
+-- 1.3 Upload Intents Table
+-- Server-generated authority and frozen declaration facts live as explicit
+-- physical columns: opaque_object_key is minted server-side (clients never
+-- choose object authority); expected media type / length / sha256 (base64)
+-- are authoritative declarations; finalized_at and abandoned_at are one-way
+-- mutually-exclusive terminal markers bound to their frozen statuses.
+CREATE TABLE IF NOT EXISTS upload_intents (
+    upload_intent_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    created_by UUID NOT NULL REFERENCES principals(principal_id) ON DELETE CASCADE,
+    document_id UUID NULL,
+    filename TEXT NOT NULL,
+    expected_media_type TEXT NOT NULL,
+    expected_length BIGINT NOT NULL,
+    expected_sha256_b64 TEXT NULL,
+    object_artifact_id UUID NULL,
+    opaque_object_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'initiated',
+    expires_at TIMESTAMPTZ NOT NULL,
+    finalized_at TIMESTAMPTZ NULL,
+    abandoned_at TIMESTAMPTZ NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_upload_intents_document_ws FOREIGN KEY (document_id, workspace_id) REFERENCES documents(document_id, workspace_id) ON DELETE CASCADE,
+    CONSTRAINT fk_upload_intents_artifact_ws FOREIGN KEY (object_artifact_id, workspace_id) REFERENCES object_artifacts(object_artifact_id, workspace_id) ON DELETE CASCADE,
+    CONSTRAINT chk_upload_intents_filename_non_empty CHECK (length(trim(filename)) > 0),
+    CONSTRAINT chk_upload_intents_media_type_non_empty CHECK (length(trim(expected_media_type)) > 0),
+    CONSTRAINT chk_upload_intents_length_positive CHECK (expected_length > 0),
+    CONSTRAINT chk_upload_intents_sha256_b64_shape CHECK (expected_sha256_b64 IS NULL OR expected_sha256_b64 ~ '^[A-Za-z0-9+/]{43}=$'),
+    CONSTRAINT chk_upload_intents_key_shape CHECK (
+        length(opaque_object_key) <= 1024
+        AND opaque_object_key ~ '^[!-~]+$'
+        AND position('/' in opaque_object_key) <> 1
+        AND position('//' in opaque_object_key) = 0
+        AND position('..' in opaque_object_key) = 0
+    ),
+    CONSTRAINT chk_upload_intents_status CHECK (status IN ('initiated', 'uploaded', 'verified', 'expired', 'aborted')),
+    CONSTRAINT chk_upload_intents_expiry CHECK (expires_at > created_at),
+    CONSTRAINT chk_upload_intents_finalized_marker CHECK ((status = 'verified') = (finalized_at IS NOT NULL)),
+    CONSTRAINT chk_upload_intents_abandoned_marker CHECK ((status = 'aborted') = (abandoned_at IS NOT NULL)),
+    CONSTRAINT chk_upload_intents_no_contradiction CHECK (finalized_at IS NULL OR abandoned_at IS NULL),
+    CONSTRAINT chk_upload_intents_finalized_time CHECK (finalized_at IS NULL OR finalized_at >= created_at),
+    CONSTRAINT chk_upload_intents_abandoned_time CHECK (abandoned_at IS NULL OR abandoned_at >= created_at),
+    CONSTRAINT uq_upload_intents_opaque_object_key UNIQUE (opaque_object_key),
+    CONSTRAINT uq_upload_intents_id_workspace UNIQUE (upload_intent_id, workspace_id)
+);
+CREATE INDEX IF NOT EXISTS idx_upload_intents_workspace_id ON upload_intents(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_upload_intents_created_by ON upload_intents(created_by);
+CREATE INDEX IF NOT EXISTS idx_upload_intents_status ON upload_intents(status);
+CREATE INDEX IF NOT EXISTS idx_upload_intents_expires_at ON upload_intents(expires_at);
+
+CREATE OR REPLACE FUNCTION fn_enforce_upload_intents_lifecycle()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.upload_intent_id IS DISTINCT FROM OLD.upload_intent_id
+       OR NEW.workspace_id IS DISTINCT FROM OLD.workspace_id
+       OR NEW.created_by IS DISTINCT FROM OLD.created_by
+       OR NEW.document_id IS DISTINCT FROM OLD.document_id
+       OR NEW.filename IS DISTINCT FROM OLD.filename
+       OR NEW.expected_media_type IS DISTINCT FROM OLD.expected_media_type
+       OR NEW.expected_length IS DISTINCT FROM OLD.expected_length
+       OR NEW.expected_sha256_b64 IS DISTINCT FROM OLD.expected_sha256_b64
+       OR NEW.opaque_object_key IS DISTINCT FROM OLD.opaque_object_key
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN
+        RAISE EXCEPTION 'upload_intents declaration fields are immutable: %', TG_OP;
+    END IF;
+    IF OLD.object_artifact_id IS NOT NULL
+       AND NEW.object_artifact_id IS DISTINCT FROM OLD.object_artifact_id THEN
+        RAISE EXCEPTION 'upload_intents object-artifact binding is immutable once registered';
+    END IF;
+    IF OLD.status IN ('verified', 'expired', 'aborted') THEN
+        RAISE EXCEPTION 'upload_intents reached a terminal state: finalize/abandon/expiry are one-way';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_enforce_upload_intents_lifecycle
+BEFORE UPDATE ON upload_intents
+FOR EACH ROW EXECUTE FUNCTION fn_enforce_upload_intents_lifecycle();
+
+-- 1.4 Document Versions Table
+-- Immutable version history: the object-artifact binding and the original
+-- filename are explicit authoritative physical facts. Only trust_state may
+-- change, and only along the frozen one-way table
+-- pending -> scanning -> { trusted | quarantined | rejected }.
 CREATE TABLE IF NOT EXISTS document_versions (
     document_version_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     document_id UUID NOT NULL,
     workspace_id UUID NOT NULL,
     version_number INT NOT NULL,
+    object_artifact_id UUID NOT NULL,
     byte_size BIGINT NOT NULL,
     sha256_hash BYTEA NOT NULL,
     content_type TEXT NOT NULL,
+    original_filename TEXT NOT NULL,
     trust_state TEXT NOT NULL DEFAULT 'pending',
-    created_by UUID NULL REFERENCES principals(principal_id) ON DELETE SET NULL,
+    submitted_by UUID NULL REFERENCES principals(principal_id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_document_versions_version_positive CHECK (version_number > 0),
     CONSTRAINT chk_document_versions_byte_size_non_negative CHECK (byte_size >= 0),
     CONSTRAINT chk_document_versions_sha256_len CHECK (octet_length(sha256_hash) = 32),
     CONSTRAINT chk_document_versions_content_type_non_empty CHECK (length(trim(content_type)) > 0),
+    CONSTRAINT chk_document_versions_original_filename_non_empty CHECK (length(trim(original_filename)) > 0),
     CONSTRAINT chk_document_versions_trust_state CHECK (trust_state IN ('pending', 'scanning', 'trusted', 'quarantined', 'rejected')),
     CONSTRAINT uq_document_versions_document_version UNIQUE (document_id, version_number),
     CONSTRAINT uq_document_versions_id_workspace UNIQUE (document_version_id, workspace_id),
+    CONSTRAINT uq_document_versions_id_doc_workspace UNIQUE (document_version_id, document_id, workspace_id),
     CONSTRAINT fk_document_versions_document_workspace FOREIGN KEY (document_id, workspace_id) REFERENCES documents(document_id, workspace_id) ON DELETE CASCADE,
-    CONSTRAINT fk_document_versions_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+    CONSTRAINT fk_document_versions_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    CONSTRAINT fk_document_versions_artifact_ws FOREIGN KEY (object_artifact_id, workspace_id) REFERENCES object_artifacts(object_artifact_id, workspace_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_document_versions_document_id ON document_versions(document_id);
 CREATE INDEX IF NOT EXISTS idx_document_versions_workspace_id ON document_versions(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_document_versions_trust_state ON document_versions(trust_state);
 CREATE INDEX IF NOT EXISTS idx_document_versions_sha256_hash ON document_versions(sha256_hash);
+CREATE INDEX IF NOT EXISTS idx_document_versions_object_artifact ON document_versions(object_artifact_id);
 
--- 1.3 Document Version Metadata Table
+CREATE OR REPLACE FUNCTION fn_enforce_document_versions_immutability()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        -- Referential-integrity cascades from parent documents/workspaces rows
+        -- are the only permitted deletion path; version history is evidence.
+        IF pg_trigger_depth() > 1 THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION 'document_versions is append-only history: DELETE operations are prohibited';
+    END IF;
+    IF NEW.document_version_id IS DISTINCT FROM OLD.document_version_id
+       OR NEW.document_id IS DISTINCT FROM OLD.document_id
+       OR NEW.workspace_id IS DISTINCT FROM OLD.workspace_id
+       OR NEW.version_number IS DISTINCT FROM OLD.version_number
+       OR NEW.object_artifact_id IS DISTINCT FROM OLD.object_artifact_id
+       OR NEW.byte_size IS DISTINCT FROM OLD.byte_size
+       OR NEW.sha256_hash IS DISTINCT FROM OLD.sha256_hash
+       OR NEW.content_type IS DISTINCT FROM OLD.content_type
+       OR NEW.original_filename IS DISTINCT FROM OLD.original_filename
+       OR NEW.submitted_by IS DISTINCT FROM OLD.submitted_by
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'document_versions rows are immutable: identity/content fields cannot change';
+    END IF;
+    IF NEW.trust_state IS DISTINCT FROM OLD.trust_state THEN
+        IF NOT (
+               (OLD.trust_state = 'pending'  AND NEW.trust_state = 'scanning')
+            OR (OLD.trust_state = 'scanning' AND NEW.trust_state IN ('trusted', 'quarantined', 'rejected'))
+        ) THEN
+            RAISE EXCEPTION 'document_versions trust_state transition ''%'' -> ''%'' violates the frozen one-way table',
+                OLD.trust_state, NEW.trust_state;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_enforce_document_versions_immutability
+BEFORE UPDATE OR DELETE ON document_versions
+FOR EACH ROW EXECUTE FUNCTION fn_enforce_document_versions_immutability();
+
+-- Staged closure of the deferred current-version pointer: the FK may only be
+-- declared once document_versions exists. The tri-column composite target
+-- physically enforces that the pointer can only reference a version of the
+-- SAME document inside the SAME workspace (the frozen parent-composition
+-- invariant); clearing on version removal preserves nullable semantics.
+ALTER TABLE documents
+    ADD CONSTRAINT fk_documents_current_version_workspace
+    FOREIGN KEY (current_version_id, document_id, workspace_id)
+    REFERENCES document_versions(document_version_id, document_id, workspace_id)
+    ON DELETE SET NULL (current_version_id);
+
+-- 1.5 Document Version Metadata Table
 CREATE TABLE IF NOT EXISTS document_version_metadata (
     document_version_metadata_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     document_version_id UUID NOT NULL,
@@ -76,81 +295,56 @@ CREATE TABLE IF NOT EXISTS document_version_metadata (
 CREATE INDEX IF NOT EXISTS idx_doc_ver_metadata_version_id ON document_version_metadata(document_version_id);
 CREATE INDEX IF NOT EXISTS idx_doc_ver_metadata_workspace_id ON document_version_metadata(workspace_id);
 
--- 1.4 Upload Intents Table
-CREATE TABLE IF NOT EXISTS upload_intents (
-    upload_intent_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    principal_id UUID NOT NULL REFERENCES principals(principal_id) ON DELETE CASCADE,
-    document_id UUID NULL REFERENCES documents(document_id) ON DELETE CASCADE,
-    filename TEXT NOT NULL,
-    content_type TEXT NOT NULL,
-    expected_size_bytes BIGINT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'initiated',
-    storage_key TEXT NOT NULL UNIQUE,
-    expires_at TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMPTZ NULL,
-    CONSTRAINT chk_upload_intents_filename_non_empty CHECK (length(trim(filename)) > 0),
-    CONSTRAINT chk_upload_intents_content_type_non_empty CHECK (length(trim(content_type)) > 0),
-    CONSTRAINT chk_upload_intents_size_positive CHECK (expected_size_bytes > 0),
-    CONSTRAINT chk_upload_intents_status CHECK (status IN ('initiated', 'uploaded', 'verified', 'expired', 'aborted')),
-    CONSTRAINT chk_upload_intents_expiry CHECK (expires_at > created_at),
-    CONSTRAINT chk_upload_intents_completed CHECK (completed_at IS NULL OR completed_at >= created_at),
-    CONSTRAINT uq_upload_intents_id_workspace UNIQUE (upload_intent_id, workspace_id)
-);
-CREATE INDEX IF NOT EXISTS idx_upload_intents_workspace_id ON upload_intents(workspace_id);
-CREATE INDEX IF NOT EXISTS idx_upload_intents_principal_id ON upload_intents(principal_id);
-CREATE INDEX IF NOT EXISTS idx_upload_intents_status ON upload_intents(status);
-CREATE INDEX IF NOT EXISTS idx_upload_intents_expires_at ON upload_intents(expires_at);
-
--- 1.5 Object Artifacts Table
-CREATE TABLE IF NOT EXISTS object_artifacts (
-    object_artifact_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    storage_bucket TEXT NOT NULL,
-    storage_key TEXT NOT NULL UNIQUE,
-    byte_size BIGINT NOT NULL,
-    sha256_hash BYTEA NOT NULL,
-    content_type TEXT NOT NULL,
-    storage_tier TEXT NOT NULL DEFAULT 'hot',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT chk_object_artifacts_bucket_non_empty CHECK (length(trim(storage_bucket)) > 0),
-    CONSTRAINT chk_object_artifacts_key_non_empty CHECK (length(trim(storage_key)) > 0),
-    CONSTRAINT chk_object_artifacts_byte_size_non_negative CHECK (byte_size >= 0),
-    CONSTRAINT chk_object_artifacts_sha256_len CHECK (octet_length(sha256_hash) = 32),
-    CONSTRAINT chk_object_artifacts_content_type_non_empty CHECK (length(trim(content_type)) > 0),
-    CONSTRAINT chk_object_artifacts_tier CHECK (storage_tier IN ('hot', 'warm', 'cold', 'archive')),
-    CONSTRAINT uq_object_artifacts_id_workspace UNIQUE (object_artifact_id, workspace_id)
-);
-CREATE INDEX IF NOT EXISTS idx_object_artifacts_workspace_id ON object_artifacts(workspace_id);
-CREATE INDEX IF NOT EXISTS idx_object_artifacts_sha256_hash ON object_artifacts(sha256_hash);
-
 -- 1.6 Quarantine Records Table
+-- Immutable scan-outcome facts tied physically to the scanned upload intent.
+-- The outcome rides in the frozen closed status domain (never hidden in JSONB).
+-- A rescan is expressed by appending a brand-new record; recorded results are
+-- never rewritten.
 CREATE TABLE IF NOT EXISTS quarantine_records (
     quarantine_record_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    document_version_id UUID NULL REFERENCES document_versions(document_version_id) ON DELETE CASCADE,
-    object_artifact_id UUID NULL REFERENCES object_artifacts(object_artifact_id) ON DELETE SET NULL,
-    quarantine_reason TEXT NOT NULL,
+    upload_intent_id UUID NOT NULL,
+    document_version_id UUID NULL,
+    object_artifact_id UUID NULL,
     scanner_name TEXT NOT NULL,
     scanner_version TEXT NULL,
+    reason_code TEXT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     threat_details JSONB NOT NULL DEFAULT '{}'::jsonb,
-    status TEXT NOT NULL DEFAULT 'quarantined',
-    quarantined_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    reviewed_at TIMESTAMPTZ NULL,
-    reviewed_by UUID NULL REFERENCES principals(principal_id) ON DELETE SET NULL,
-    review_decision TEXT NULL,
-    CONSTRAINT chk_quarantine_records_reason_non_empty CHECK (length(trim(quarantine_reason)) > 0),
+    CONSTRAINT fk_quarantine_records_intent_ws FOREIGN KEY (upload_intent_id, workspace_id) REFERENCES upload_intents(upload_intent_id, workspace_id) ON DELETE CASCADE,
+    CONSTRAINT fk_quarantine_records_doc_ver_ws FOREIGN KEY (document_version_id, workspace_id) REFERENCES document_versions(document_version_id, workspace_id) ON DELETE CASCADE,
+    CONSTRAINT fk_quarantine_records_artifact_ws FOREIGN KEY (object_artifact_id, workspace_id) REFERENCES object_artifacts(object_artifact_id, workspace_id) ON DELETE SET NULL (object_artifact_id),
     CONSTRAINT chk_quarantine_records_scanner_non_empty CHECK (length(trim(scanner_name)) > 0),
-    CONSTRAINT chk_quarantine_records_status CHECK (status IN ('quarantined', 'released', 'purged')),
-    CONSTRAINT chk_quarantine_records_decision CHECK (review_decision IS NULL OR review_decision IN ('false_positive', 'confirmed_threat', 'overridden')),
-    CONSTRAINT chk_quarantine_records_review_time CHECK (reviewed_at IS NULL OR reviewed_at >= quarantined_at),
+    CONSTRAINT chk_quarantine_records_scanner_version_non_empty CHECK (scanner_version IS NULL OR length(trim(scanner_version)) > 0),
+    CONSTRAINT chk_quarantine_records_reason_code_non_empty CHECK (reason_code IS NULL OR length(trim(reason_code)) > 0),
+    CONSTRAINT chk_quarantine_records_status CHECK (status IN ('pending', 'clean', 'malware', 'integrity_failed', 'unsupported')),
     CONSTRAINT uq_quarantine_records_id_workspace UNIQUE (quarantine_record_id, workspace_id)
 );
 CREATE INDEX IF NOT EXISTS idx_quarantine_records_workspace_id ON quarantine_records(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_quarantine_records_intent ON quarantine_records(upload_intent_id);
 CREATE INDEX IF NOT EXISTS idx_quarantine_records_doc_ver ON quarantine_records(document_version_id);
 CREATE INDEX IF NOT EXISTS idx_quarantine_records_object ON quarantine_records(object_artifact_id);
 CREATE INDEX IF NOT EXISTS idx_quarantine_records_status ON quarantine_records(status);
+
+CREATE OR REPLACE FUNCTION fn_enforce_quarantine_records_insert_only()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        -- Referential-integrity cascades from parent workspaces/upload_intents
+        -- rows are the only permitted deletion path; rescans append new records.
+        IF pg_trigger_depth() > 1 THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION 'quarantine_records is insert-only: DELETE operations are prohibited (rescan appends a new record)';
+    END IF;
+    RAISE EXCEPTION 'quarantine_records results are immutable once recorded: UPDATE operations are prohibited';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_enforce_quarantine_records_insert_only
+BEFORE UPDATE OR DELETE ON quarantine_records
+FOR EACH ROW EXECUTE FUNCTION fn_enforce_quarantine_records_insert_only();
 
 -- ============================================================================
 -- 2. Durable Job Substrate Tables (7-11)
@@ -343,6 +537,11 @@ CREATE INDEX IF NOT EXISTS idx_dead_letter_queue_name ON dead_letter_entries(que
 -- ============================================================================
 
 -- 3.1 Parser Artifacts Table
+-- Frozen physical facts include the canonical span-algorithm identity
+-- (locator_version, REQUIRED), the optional derived-text object reference and
+-- full-text digest, plus the exact Prompt-12 lifecycle timestamps
+-- (started_at / completed_at) and failure_code. Terminal transitions are
+-- guarded: processing -> { completed | failed } exactly once.
 CREATE TABLE IF NOT EXISTS parser_artifacts (
     parser_artifact_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     document_version_id UUID NOT NULL,
@@ -350,30 +549,68 @@ CREATE TABLE IF NOT EXISTS parser_artifacts (
     job_id UUID NULL REFERENCES jobs(job_id) ON DELETE SET NULL,
     parser_name TEXT NOT NULL,
     parser_version TEXT NOT NULL,
+    locator_version TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'processing',
+    artifact_object_id UUID NULL,
+    text_sha256 BYTEA NULL,
     page_count INT NOT NULL DEFAULT 0,
     block_count INT NOT NULL DEFAULT 0,
     span_count INT NOT NULL DEFAULT 0,
     execution_duration_ms BIGINT NULL,
-    error_message TEXT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    failure_code TEXT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMPTZ NULL,
     CONSTRAINT chk_parser_artifacts_name_non_empty CHECK (length(trim(parser_name)) > 0),
     CONSTRAINT chk_parser_artifacts_version_non_empty CHECK (length(trim(parser_version)) > 0),
+    CONSTRAINT chk_parser_artifacts_locator_version_non_empty CHECK (length(trim(locator_version)) > 0),
     CONSTRAINT chk_parser_artifacts_status CHECK (status IN ('processing', 'completed', 'failed')),
+    CONSTRAINT chk_parser_artifacts_text_sha256_len CHECK (text_sha256 IS NULL OR octet_length(text_sha256) = 32),
     CONSTRAINT chk_parser_artifacts_page_count_non_negative CHECK (page_count >= 0),
     CONSTRAINT chk_parser_artifacts_block_count_non_negative CHECK (block_count >= 0),
     CONSTRAINT chk_parser_artifacts_span_count_non_negative CHECK (span_count >= 0),
     CONSTRAINT chk_parser_artifacts_duration_non_negative CHECK (execution_duration_ms IS NULL OR execution_duration_ms >= 0),
-    CONSTRAINT chk_parser_artifacts_completed CHECK (completed_at IS NULL OR completed_at >= created_at),
+    CONSTRAINT chk_parser_artifacts_completed_time CHECK (completed_at IS NULL OR completed_at >= started_at),
+    CONSTRAINT chk_parser_artifacts_terminal_completion CHECK ((status = 'processing') = (completed_at IS NULL)),
+    CONSTRAINT chk_parser_artifacts_failed_failure_code CHECK (status <> 'failed' OR failure_code IS NOT NULL),
     CONSTRAINT uq_parser_artifacts_id_workspace UNIQUE (parser_artifact_id, workspace_id),
     CONSTRAINT fk_parser_artifacts_doc_version_ws FOREIGN KEY (document_version_id, workspace_id) REFERENCES document_versions(document_version_id, workspace_id) ON DELETE CASCADE,
-    CONSTRAINT fk_parser_artifacts_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+    CONSTRAINT fk_parser_artifacts_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    CONSTRAINT fk_parser_artifacts_artifact_ws FOREIGN KEY (artifact_object_id, workspace_id) REFERENCES object_artifacts(object_artifact_id, workspace_id) ON DELETE SET NULL (artifact_object_id)
 );
 CREATE INDEX IF NOT EXISTS idx_parser_artifacts_workspace_id ON parser_artifacts(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_parser_artifacts_doc_version ON parser_artifacts(document_version_id);
 CREATE INDEX IF NOT EXISTS idx_parser_artifacts_job_id ON parser_artifacts(job_id);
 CREATE INDEX IF NOT EXISTS idx_parser_artifacts_status ON parser_artifacts(status);
+CREATE INDEX IF NOT EXISTS idx_parser_artifacts_artifact_object ON parser_artifacts(artifact_object_id);
+
+CREATE OR REPLACE FUNCTION fn_enforce_parser_artifacts_transitions()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.parser_artifact_id IS DISTINCT FROM OLD.parser_artifact_id
+       OR NEW.document_version_id IS DISTINCT FROM OLD.document_version_id
+       OR NEW.workspace_id IS DISTINCT FROM OLD.workspace_id
+       OR NEW.job_id IS DISTINCT FROM OLD.job_id
+       OR NEW.parser_name IS DISTINCT FROM OLD.parser_name
+       OR NEW.parser_version IS DISTINCT FROM OLD.parser_version
+       OR NEW.locator_version IS DISTINCT FROM OLD.locator_version
+       OR NEW.artifact_object_id IS DISTINCT FROM OLD.artifact_object_id
+       OR NEW.text_sha256 IS DISTINCT FROM OLD.text_sha256
+       OR NEW.started_at IS DISTINCT FROM OLD.started_at THEN
+        RAISE EXCEPTION 'parser_artifacts identity fields are immutable';
+    END IF;
+    IF OLD.status <> 'processing' THEN
+        RAISE EXCEPTION 'parser_artifacts row is finalized: terminal-state behavior permits exactly one completion transition';
+    END IF;
+    IF NEW.status = 'processing' THEN
+        RAISE EXCEPTION 'parser_artifacts UPDATE must transition status to a terminal value';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_enforce_parser_artifacts_transitions
+BEFORE UPDATE ON parser_artifacts
+FOR EACH ROW EXECUTE FUNCTION fn_enforce_parser_artifacts_transitions();
 
 -- 3.2 Parser Pages Table
 CREATE TABLE IF NOT EXISTS parser_pages (
@@ -707,8 +944,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON documents TO w014_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON document_versions TO w014_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON document_version_metadata TO w014_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON upload_intents TO w014_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON object_artifacts TO w014_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON quarantine_records TO w014_app;
+GRANT SELECT, INSERT ON object_artifacts TO w014_app;
+GRANT SELECT, INSERT ON quarantine_records TO w014_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON jobs TO w014_app;
 -- job_attempts: append-only attempt history (no DELETE; single terminal transition via UPDATE)
 GRANT SELECT, INSERT, UPDATE ON job_attempts TO w014_app;
@@ -729,8 +966,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON documents TO w014_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON document_versions TO w014_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON document_version_metadata TO w014_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON upload_intents TO w014_worker;
-GRANT SELECT, INSERT, UPDATE, DELETE ON object_artifacts TO w014_worker;
-GRANT SELECT, INSERT, UPDATE, DELETE ON quarantine_records TO w014_worker;
+GRANT SELECT, INSERT ON object_artifacts TO w014_worker;
+GRANT SELECT, INSERT ON quarantine_records TO w014_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON jobs TO w014_worker;
 -- job_attempts: append-only attempt history (no DELETE; single terminal transition via UPDATE)
 GRANT SELECT, INSERT, UPDATE ON job_attempts TO w014_worker;
