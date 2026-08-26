@@ -38,4 +38,12 @@ pub enum DomainError {
     /// The principal is deactivated and cannot perform the operation.
     #[error("Principal '{0}' is inactive")]
     InactivePrincipal(String),
+
+    /// A SHA-256 digest was not exactly 32 bytes.
+    #[error("Invalid SHA-256 digest for {field}: expected 32 bytes, got {actual}")]
+    InvalidSha256Length { field: &'static str, actual: usize },
+
+    /// A composition would pair entities across workspace boundaries.
+    #[error("Cross-workspace composition rejected for {field}")]
+    CrossWorkspaceComposition { field: &'static str },
 }

@@ -33,6 +33,23 @@ pub fn validate_slug(slug: &str) -> Result<String, DomainError> {
     Ok(trimmed.to_string())
 }
 
+/// Validates that a string is non-empty after trimming and within a frozen
+/// byte-length bound. Returns the trimmed value.
+pub fn validate_bounded_non_empty<'a>(
+    field_name: &'static str,
+    val: &'a str,
+    max_bytes: usize,
+) -> Result<&'a str, DomainError> {
+    let trimmed = validate_non_empty(field_name, val)?;
+    if trimmed.len() > max_bytes {
+        return Err(DomainError::ValidationError {
+            field: field_name,
+            reason: format!("length {} exceeds frozen bound {max_bytes}", trimmed.len()),
+        });
+    }
+    Ok(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +66,13 @@ mod tests {
         assert!(validate_slug("Org-123").is_err());
         assert!(validate_slug("org 123").is_err());
         assert!(validate_slug("   ").is_err());
+    }
+
+    #[test]
+    fn test_validate_bounded_non_empty() {
+        assert!(validate_bounded_non_empty("f", "  ", 8).is_err());
+        assert_eq!(validate_bounded_non_empty("f", " ok ", 8).unwrap(), "ok");
+        let big = "x".repeat(9);
+        assert!(validate_bounded_non_empty("f", &big, 8).is_err());
     }
 }

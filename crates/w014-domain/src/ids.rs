@@ -112,6 +112,46 @@ define_id!(
     MembershipId,
     "Authoritative identifier for a Principal's Membership in a Workspace."
 );
+define_id!(
+    DocumentId,
+    "Authoritative identifier for a logical Document within a Workspace."
+);
+define_id!(
+    DocumentVersionId,
+    "Authoritative identifier for one immutable Document Version."
+);
+define_id!(
+    DocumentVersionMetadataId,
+    "Authoritative identifier for an immutable Document Version Metadata snapshot."
+);
+define_id!(
+    UploadIntentId,
+    "Authoritative identifier for an Upload Intent within a Workspace."
+);
+define_id!(
+    ObjectArtifactId,
+    "Authoritative identifier for an immutable stored Object Artifact."
+);
+define_id!(
+    QuarantineRecordId,
+    "Authoritative identifier for an immutable Quarantine scan-outcome record."
+);
+define_id!(
+    ParserArtifactId,
+    "Authoritative identifier for a Parser Artifact run over one Document Version."
+);
+define_id!(
+    ParserPageId,
+    "Authoritative identifier for one Parser Page within a Parser Artifact."
+);
+define_id!(
+    ParserBlockId,
+    "Authoritative identifier for one Parser Block within a Parser Page."
+);
+define_id!(
+    SourceSpanId,
+    "Authoritative identifier for one canonical citable Source Span."
+);
 
 #[cfg(test)]
 mod tests {
