@@ -2689,7 +2689,9 @@ dependencies = [
  "uuid",
  "w014-authn",
  "w014-authz",
+ "w014-document-processing",
  "w014-domain",
+ "w014-jobs",
  "w014-persistence",
 ]
 

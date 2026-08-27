@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod capability_grants;
+pub mod documents;
 pub mod health;
 pub mod memberships;
 pub mod programs;
@@ -14,6 +15,13 @@ pub use auth::{
 pub use capability_grants::{
     CapabilityGrantDto, RevokeGrantDto, create_capability_grant_handler,
     revoke_capability_grant_handler,
+};
+pub use documents::{
+    CreateDocumentDto, CreateUploadIntentDto, DocumentDto, DocumentPage, DocumentVersionDto,
+    DocumentVersionPage, DownloadDto, PresignedPutDto, UploadIntentDto, accept_version_handler,
+    create_document_handler, create_upload_intent_handler, document_routes,
+    download_version_handler, finalize_upload_intent_handler, get_document_handler,
+    get_document_version_handler, list_document_versions_handler, list_documents_handler,
 };
 pub use health::{HealthResponse, health_alias_handler, healthz_handler};
 pub use memberships::{

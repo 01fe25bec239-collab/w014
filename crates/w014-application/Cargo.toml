@@ -8,6 +8,8 @@ w014-domain = { path = "../w014-domain" }
 w014-authn = { path = "../w014-authn" }
 w014-authz = { path = "../w014-authz" }
 w014-persistence = { path = "../w014-persistence" }
+w014-document-processing = { path = "../w014-document-processing" }
+w014-jobs = { path = "../w014-jobs" }
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "uuid", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 uuid = { version = "1", features = ["v4", "serde"] }

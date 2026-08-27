@@ -1,0 +1,520 @@
+//! Persistence repository implementations for Document Pipeline entities.
+
+use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256 as Sha256Hasher};
+use sqlx::{PgConnection, Row};
+use uuid::Uuid;
+use w014_document_processing::document_versions_row::{
+    DocumentVersionRow, INSERT_DOCUMENT_VERSION, new_row_from_version, version_from_row,
+};
+use w014_document_processing::documents_row::{
+    DocumentRow, INSERT_DOCUMENT, UPDATE_CURRENT_VERSION, document_from_row, new_row_from_document,
+};
+use w014_document_processing::object_artifacts_row::{
+    INSERT_OBJECT_ARTIFACT, ObjectArtifactRow, artifact_from_row, new_row_from_artifact,
+};
+use w014_document_processing::upload_intents_row::{
+    INSERT_UPLOAD_INTENT, UPDATE_INTENT_STATUS, UploadIntentRow, intent_from_row,
+    new_row_from_intent,
+};
+use w014_domain::ids::{
+    DocumentId, DocumentVersionId, ObjectArtifactId, UploadIntentId, WorkspaceId,
+};
+use w014_domain::{Document, DocumentVersion, IntentStatus, ObjectArtifact, UploadIntent};
+use w014_persistence::error::PersistenceError;
+
+const SELECT_DOCUMENT_BY_ID: &str = "SELECT document_id, workspace_id, title, document_type, status, current_version_id, created_by, created_at, updated_at, row_version \
+     FROM documents WHERE workspace_id = $1 AND document_id = $2";
+
+const SELECT_DOCUMENT_BY_ID_FOR_UPDATE: &str = "SELECT document_id, workspace_id, title, document_type, status, current_version_id, created_by, created_at, updated_at, row_version \
+     FROM documents WHERE workspace_id = $1 AND document_id = $2 FOR UPDATE";
+
+const SELECT_DOCUMENTS_BY_WORKSPACE: &str = "SELECT document_id, workspace_id, title, document_type, status, current_version_id, created_by, created_at, updated_at, row_version \
+     FROM documents WHERE workspace_id = $1 ORDER BY document_id ASC LIMIT $2";
+
+const SELECT_DOCUMENTS_BY_WORKSPACE_PAGINATED: &str = "SELECT document_id, workspace_id, title, document_type, status, current_version_id, created_by, created_at, updated_at, row_version \
+     FROM documents WHERE workspace_id = $1 AND document_id > $2 ORDER BY document_id ASC LIMIT $3";
+
+const SELECT_VERSION_BY_ID: &str = "SELECT document_version_id, document_id, workspace_id, version_number, object_artifact_id, byte_size, sha256_hash, content_type, original_filename, trust_state, submitted_by, created_at \
+     FROM document_versions WHERE workspace_id = $1 AND document_version_id = $2";
+
+const SELECT_VERSIONS_BY_DOCUMENT: &str = "SELECT document_version_id, document_id, workspace_id, version_number, object_artifact_id, byte_size, sha256_hash, content_type, original_filename, trust_state, submitted_by, created_at \
+     FROM document_versions WHERE workspace_id = $1 AND document_id = $2 ORDER BY version_number ASC, document_version_id ASC LIMIT $3";
+
+const SELECT_VERSIONS_BY_DOCUMENT_PAGINATED: &str = "SELECT document_version_id, document_id, workspace_id, version_number, object_artifact_id, byte_size, sha256_hash, content_type, original_filename, trust_state, submitted_by, created_at \
+     FROM document_versions WHERE workspace_id = $1 AND document_id = $2 AND document_version_id > $3 ORDER BY version_number ASC, document_version_id ASC LIMIT $4";
+
+const SELECT_UPLOAD_INTENT_BY_ID: &str = "SELECT upload_intent_id, workspace_id, created_by, document_id, filename, expected_media_type, expected_length, expected_sha256_b64, object_artifact_id, opaque_object_key, status, expires_at, finalized_at, abandoned_at, created_at \
+     FROM upload_intents WHERE workspace_id = $1 AND upload_intent_id = $2";
+
+const SELECT_OBJECT_ARTIFACT_BY_ID: &str = "SELECT object_artifact_id, workspace_id, artifact_kind, storage_bucket, object_key, byte_length, content_sha256, content_type, storage_tier, sse_mode, kms_key_ref, created_at \
+     FROM object_artifacts WHERE workspace_id = $1 AND object_artifact_id = $2";
+
+/// Repository operations for logical Documents.
+pub struct DocumentRepository;
+
+impl DocumentRepository {
+    /// Inserts a new logical document.
+    pub async fn insert(tx: &mut PgConnection, doc: &Document) -> Result<(), PersistenceError> {
+        let new_row =
+            new_row_from_document(doc).map_err(|e| PersistenceError::Operation(e.to_string()))?;
+
+        sqlx::query(INSERT_DOCUMENT)
+            .bind(new_row.document_id)
+            .bind(new_row.workspace_id)
+            .bind(&new_row.title)
+            .bind(&new_row.document_type)
+            .bind(&new_row.status)
+            .bind(new_row.current_version_id)
+            .bind(new_row.created_by)
+            .bind(new_row.created_at)
+            .bind(new_row.updated_at)
+            .bind(new_row.row_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(())
+    }
+
+    /// Fetches a document by workspace and document ID.
+    pub async fn get_by_id(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        document_id: DocumentId,
+    ) -> Result<Option<Document>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, DocumentRow>(SELECT_DOCUMENT_BY_ID)
+            .bind(workspace_id.as_uuid())
+            .bind(document_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let doc = document_from_row(&row)
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(doc))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetches and locks a document row FOR UPDATE by workspace and document ID.
+    pub async fn get_by_id_for_update(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        document_id: DocumentId,
+    ) -> Result<Option<Document>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, DocumentRow>(SELECT_DOCUMENT_BY_ID_FOR_UPDATE)
+            .bind(workspace_id.as_uuid())
+            .bind(document_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let doc = document_from_row(&row)
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(doc))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Lists documents within a workspace with cursor-based pagination.
+    pub async fn list_by_workspace(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        cursor_uuid: Option<Uuid>,
+        limit: i64,
+    ) -> Result<(Vec<Document>, Option<String>, bool), PersistenceError> {
+        let fetch_limit = limit + 1;
+        let rows: Vec<DocumentRow> = if let Some(cursor) = cursor_uuid {
+            sqlx::query_as::<_, DocumentRow>(SELECT_DOCUMENTS_BY_WORKSPACE_PAGINATED)
+                .bind(workspace_id.as_uuid())
+                .bind(cursor)
+                .bind(fetch_limit)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(PersistenceError::Connection)?
+        } else {
+            sqlx::query_as::<_, DocumentRow>(SELECT_DOCUMENTS_BY_WORKSPACE)
+                .bind(workspace_id.as_uuid())
+                .bind(fetch_limit)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(PersistenceError::Connection)?
+        };
+
+        let has_more = rows.len() > limit as usize;
+        let page_rows = if has_more {
+            &rows[..limit as usize]
+        } else {
+            &rows[..]
+        };
+
+        let mut items = Vec::with_capacity(page_rows.len());
+        for row in page_rows {
+            let doc =
+                document_from_row(row).map_err(|e| PersistenceError::Operation(e.to_string()))?;
+            items.push(doc);
+        }
+
+        let next_cursor = if has_more {
+            items.last().map(|d| d.id.to_string())
+        } else {
+            None
+        };
+
+        Ok((items, next_cursor, has_more))
+    }
+
+    /// Updates the current version pointer and advances row_version under optimistic concurrency.
+    pub async fn update_current_version(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        document_id: DocumentId,
+        version_id: DocumentVersionId,
+        expected_row_version: i32,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, PersistenceError> {
+        let res = sqlx::query(UPDATE_CURRENT_VERSION)
+            .bind(version_id.as_uuid())
+            .bind(updated_at)
+            .bind(document_id.as_uuid())
+            .bind(workspace_id.as_uuid())
+            .bind(expected_row_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(res.rows_affected() == 1)
+    }
+}
+
+/// Repository operations for immutable Document Versions.
+pub struct DocumentVersionRepository;
+
+impl DocumentVersionRepository {
+    /// Inserts an immutable document version.
+    pub async fn insert(
+        tx: &mut PgConnection,
+        version: &DocumentVersion,
+    ) -> Result<(), PersistenceError> {
+        let new_row = new_row_from_version(version)
+            .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+
+        sqlx::query(INSERT_DOCUMENT_VERSION)
+            .bind(new_row.document_version_id)
+            .bind(new_row.document_id)
+            .bind(new_row.workspace_id)
+            .bind(new_row.version_number)
+            .bind(new_row.object_artifact_id)
+            .bind(new_row.byte_size)
+            .bind(&new_row.sha256_hash)
+            .bind(&new_row.content_type)
+            .bind(&new_row.original_filename)
+            .bind(&new_row.trust_state)
+            .bind(new_row.submitted_by)
+            .bind(new_row.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(())
+    }
+
+    /// Fetches an immutable version by workspace and version ID.
+    pub async fn get_by_id(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        version_id: DocumentVersionId,
+    ) -> Result<Option<DocumentVersion>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, DocumentVersionRow>(SELECT_VERSION_BY_ID)
+            .bind(workspace_id.as_uuid())
+            .bind(version_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let v = version_from_row(&row)
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(v))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Lists immutable versions for a document in workspace with cursor pagination.
+    pub async fn list_by_document(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        document_id: DocumentId,
+        cursor_uuid: Option<Uuid>,
+        limit: i64,
+    ) -> Result<(Vec<DocumentVersion>, Option<String>, bool), PersistenceError> {
+        let fetch_limit = limit + 1;
+        let rows: Vec<DocumentVersionRow> = if let Some(cursor) = cursor_uuid {
+            sqlx::query_as::<_, DocumentVersionRow>(SELECT_VERSIONS_BY_DOCUMENT_PAGINATED)
+                .bind(workspace_id.as_uuid())
+                .bind(document_id.as_uuid())
+                .bind(cursor)
+                .bind(fetch_limit)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(PersistenceError::Connection)?
+        } else {
+            sqlx::query_as::<_, DocumentVersionRow>(SELECT_VERSIONS_BY_DOCUMENT)
+                .bind(workspace_id.as_uuid())
+                .bind(document_id.as_uuid())
+                .bind(fetch_limit)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(PersistenceError::Connection)?
+        };
+
+        let has_more = rows.len() > limit as usize;
+        let page_rows = if has_more {
+            &rows[..limit as usize]
+        } else {
+            &rows[..]
+        };
+
+        let mut items = Vec::with_capacity(page_rows.len());
+        for row in page_rows {
+            let v =
+                version_from_row(row).map_err(|e| PersistenceError::Operation(e.to_string()))?;
+            items.push(v);
+        }
+
+        let next_cursor = if has_more {
+            items.last().map(|v| v.id.to_string())
+        } else {
+            None
+        };
+
+        Ok((items, next_cursor, has_more))
+    }
+}
+
+/// Repository operations for Upload Intents.
+pub struct UploadIntentRepository;
+
+impl UploadIntentRepository {
+    /// Inserts a new upload intent.
+    pub async fn insert(
+        tx: &mut PgConnection,
+        intent: &UploadIntent,
+    ) -> Result<(), PersistenceError> {
+        let new_row =
+            new_row_from_intent(intent).map_err(|e| PersistenceError::Operation(e.to_string()))?;
+
+        sqlx::query(INSERT_UPLOAD_INTENT)
+            .bind(new_row.upload_intent_id)
+            .bind(new_row.workspace_id)
+            .bind(new_row.created_by)
+            .bind(new_row.document_id)
+            .bind(&new_row.filename)
+            .bind(&new_row.expected_media_type)
+            .bind(new_row.expected_length)
+            .bind(new_row.expected_sha256_b64.as_deref())
+            .bind(new_row.object_artifact_id)
+            .bind(&new_row.opaque_object_key)
+            .bind(&new_row.status)
+            .bind(new_row.expires_at)
+            .bind(new_row.finalized_at)
+            .bind(new_row.abandoned_at)
+            .bind(new_row.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(())
+    }
+
+    /// Fetches an upload intent by workspace and intent ID.
+    pub async fn get_by_id(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        intent_id: UploadIntentId,
+    ) -> Result<Option<UploadIntent>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, UploadIntentRow>(SELECT_UPLOAD_INTENT_BY_ID)
+            .bind(workspace_id.as_uuid())
+            .bind(intent_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let intent = intent_from_row(&row)
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(intent))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Updates the terminal status of an upload intent.
+    pub async fn update_status(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        intent_id: UploadIntentId,
+        status: IntentStatus,
+        finalized_at: Option<DateTime<Utc>>,
+        abandoned_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, PersistenceError> {
+        let res = sqlx::query(UPDATE_INTENT_STATUS)
+            .bind(status.as_str())
+            .bind(finalized_at)
+            .bind(abandoned_at)
+            .bind(intent_id.as_uuid())
+            .bind(workspace_id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(res.rows_affected() == 1)
+    }
+}
+
+/// Repository operations for Object Artifacts.
+pub struct ObjectArtifactRepository;
+
+impl ObjectArtifactRepository {
+    /// Inserts an immutable object artifact.
+    pub async fn insert(
+        tx: &mut PgConnection,
+        artifact: &ObjectArtifact,
+    ) -> Result<(), PersistenceError> {
+        let new_row = new_row_from_artifact(artifact)
+            .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+
+        sqlx::query(INSERT_OBJECT_ARTIFACT)
+            .bind(new_row.object_artifact_id)
+            .bind(new_row.workspace_id)
+            .bind(&new_row.artifact_kind)
+            .bind(&new_row.storage_bucket)
+            .bind(&new_row.object_key)
+            .bind(new_row.byte_length)
+            .bind(&new_row.content_sha256)
+            .bind(&new_row.content_type)
+            .bind(&new_row.storage_tier)
+            .bind(&new_row.sse_mode)
+            .bind(new_row.kms_key_ref.as_deref())
+            .bind(new_row.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(())
+    }
+
+    /// Fetches an object artifact by workspace and artifact ID.
+    pub async fn get_by_id(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        artifact_id: ObjectArtifactId,
+    ) -> Result<Option<ObjectArtifact>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, ObjectArtifactRow>(SELECT_OBJECT_ARTIFACT_BY_ID)
+            .bind(workspace_id.as_uuid())
+            .bind(artifact_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let artifact = artifact_from_row(&row)
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(artifact))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// Repository operations for Dependency Keys.
+pub struct DependencyKeyRepository;
+
+impl DependencyKeyRepository {
+    /// Resolves or creates a canonical DependencyKey in the given workspace.
+    pub async fn get_or_create(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        key_type: &str,
+        key_value: &str,
+    ) -> Result<Uuid, PersistenceError> {
+        let mut hasher = Sha256Hasher::new();
+        hasher.update(format!("{key_type}:{key_value}").as_bytes());
+        let hash_arr: [u8; 32] = hasher.finalize().into();
+
+        let new_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let row = sqlx::query(
+            "INSERT INTO dependency_keys (dependency_key_id, workspace_id, key_type, key_value, key_hash, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (workspace_id, key_hash) DO UPDATE SET key_type = EXCLUDED.key_type \
+             RETURNING dependency_key_id",
+        )
+        .bind(new_id)
+        .bind(workspace_id.as_uuid())
+        .bind(key_type)
+        .bind(key_value)
+        .bind(hash_arr.as_slice())
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        let dep_key_id: Uuid = row.get("dependency_key_id");
+        Ok(dep_key_id)
+    }
+}
+
+/// Repository operations for Change Events.
+pub struct ChangeEventRepository;
+
+impl ChangeEventRepository {
+    /// Appends a change event associated with a dependency key.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        dependency_key_id: Option<Uuid>,
+        event_type: &str,
+        entity_type: &str,
+        entity_id: &str,
+        change_payload: serde_json::Value,
+        detected_at: DateTime<Utc>,
+    ) -> Result<Uuid, PersistenceError> {
+        let change_event_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let row = sqlx::query(
+            "INSERT INTO change_events (change_event_id, workspace_id, dependency_key_id, event_type, entity_type, entity_id, change_payload, detected_at, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             RETURNING change_event_id",
+        )
+        .bind(change_event_id)
+        .bind(workspace_id.as_uuid())
+        .bind(dependency_key_id)
+        .bind(event_type)
+        .bind(entity_type)
+        .bind(entity_id)
+        .bind(change_payload)
+        .bind(detected_at)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        let id: Uuid = row.get("change_event_id");
+        Ok(id)
+    }
+}
