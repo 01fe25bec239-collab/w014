@@ -11,7 +11,7 @@ pub use authn_repo::{
 pub use capability_repo::CapabilityGrantRepository;
 pub use document_repo::{
     ChangeEventRepository, DependencyKeyRepository, DocumentRepository, DocumentVersionRepository,
-    ObjectArtifactRepository, UploadIntentRepository,
+    ObjectArtifactRepository, QuarantineRecordRepository, UploadIntentRepository,
 };
 pub use identity_repo::{
     MembershipRepository, OrganizationRepository, PrincipalRepository, ProgramRepository,

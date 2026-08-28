@@ -13,14 +13,20 @@ use w014_document_processing::documents_row::{
 use w014_document_processing::object_artifacts_row::{
     INSERT_OBJECT_ARTIFACT, ObjectArtifactRow, artifact_from_row, new_row_from_artifact,
 };
+use w014_document_processing::quarantine_records_row::{
+    INSERT_QUARANTINE_RECORD, QuarantineRecordRow, new_row_from_record, record_from_row,
+};
 use w014_document_processing::upload_intents_row::{
     INSERT_UPLOAD_INTENT, UPDATE_INTENT_STATUS, UploadIntentRow, intent_from_row,
     new_row_from_intent,
 };
 use w014_domain::ids::{
-    DocumentId, DocumentVersionId, ObjectArtifactId, UploadIntentId, WorkspaceId,
+    DocumentId, DocumentVersionId, ObjectArtifactId, QuarantineRecordId, UploadIntentId,
+    WorkspaceId,
 };
-use w014_domain::{Document, DocumentVersion, IntentStatus, ObjectArtifact, UploadIntent};
+use w014_domain::{
+    Document, DocumentVersion, IntentStatus, ObjectArtifact, QuarantineRecord, UploadIntent,
+};
 use w014_persistence::error::PersistenceError;
 
 const SELECT_DOCUMENT_BY_ID: &str = "SELECT document_id, workspace_id, title, document_type, status, current_version_id, created_by, created_at, updated_at, row_version \
@@ -47,8 +53,21 @@ const SELECT_VERSIONS_BY_DOCUMENT_PAGINATED: &str = "SELECT document_version_id,
 const SELECT_UPLOAD_INTENT_BY_ID: &str = "SELECT upload_intent_id, workspace_id, created_by, document_id, filename, expected_media_type, expected_length, expected_sha256_b64, object_artifact_id, opaque_object_key, status, expires_at, finalized_at, abandoned_at, created_at \
      FROM upload_intents WHERE workspace_id = $1 AND upload_intent_id = $2";
 
+const SELECT_UPLOAD_INTENT_BY_ID_FOR_UPDATE: &str = "SELECT upload_intent_id, workspace_id, created_by, document_id, filename, expected_media_type, expected_length, expected_sha256_b64, object_artifact_id, opaque_object_key, status, expires_at, finalized_at, abandoned_at, created_at \
+     FROM upload_intents WHERE workspace_id = $1 AND upload_intent_id = $2 FOR UPDATE";
+
+const FINALIZE_UPLOAD_INTENT: &str = "UPDATE upload_intents \
+     SET object_artifact_id = $1, status = 'verified', finalized_at = $2 \
+     WHERE workspace_id = $3 AND upload_intent_id = $4 AND status IN ('initiated', 'uploaded')";
+
 const SELECT_OBJECT_ARTIFACT_BY_ID: &str = "SELECT object_artifact_id, workspace_id, artifact_kind, storage_bucket, object_key, byte_length, content_sha256, content_type, storage_tier, sse_mode, kms_key_ref, created_at \
      FROM object_artifacts WHERE workspace_id = $1 AND object_artifact_id = $2";
+
+const SELECT_QUARANTINE_RECORD_BY_ID: &str = "SELECT quarantine_record_id, workspace_id, upload_intent_id, document_version_id, object_artifact_id, scanner_name, scanner_version, reason_code, status, checked_at, threat_details \
+     FROM quarantine_records WHERE workspace_id = $1 AND quarantine_record_id = $2";
+
+const SELECT_QUARANTINE_RECORD_BY_INTENT: &str = "SELECT quarantine_record_id, workspace_id, upload_intent_id, document_version_id, object_artifact_id, scanner_name, scanner_version, reason_code, status, checked_at, threat_details \
+     FROM quarantine_records WHERE workspace_id = $1 AND upload_intent_id = $2 ORDER BY checked_at DESC LIMIT 1";
 
 /// Repository operations for logical Documents.
 pub struct DocumentRepository;
@@ -299,6 +318,26 @@ impl DocumentVersionRepository {
 
         Ok((items, next_cursor, has_more))
     }
+
+    /// Gets the next version ordinal number for a document in a workspace.
+    pub async fn get_next_version_number(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        document_id: DocumentId,
+    ) -> Result<u32, PersistenceError> {
+        let row = sqlx::query(
+            "SELECT COALESCE(MAX(version_number), 0) + 1 AS next_ver \
+             FROM document_versions WHERE workspace_id = $1 AND document_id = $2",
+        )
+        .bind(workspace_id.as_uuid())
+        .bind(document_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        let next_ver: i32 = row.get("next_ver");
+        Ok(next_ver as u32)
+    }
 }
 
 /// Repository operations for Upload Intents.
@@ -357,6 +396,49 @@ impl UploadIntentRepository {
             }
             None => Ok(None),
         }
+    }
+
+    /// Fetches and locks an upload intent FOR UPDATE by workspace and intent ID.
+    pub async fn get_by_id_for_update(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        intent_id: UploadIntentId,
+    ) -> Result<Option<UploadIntent>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, UploadIntentRow>(SELECT_UPLOAD_INTENT_BY_ID_FOR_UPDATE)
+            .bind(workspace_id.as_uuid())
+            .bind(intent_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let intent = intent_from_row(&row)
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(intent))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Finalizes an upload intent by binding an object artifact and setting verified status with finalized_at timestamp.
+    pub async fn finalize_intent(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        intent_id: UploadIntentId,
+        artifact_id: ObjectArtifactId,
+        finalized_at: DateTime<Utc>,
+    ) -> Result<bool, PersistenceError> {
+        let res = sqlx::query(FINALIZE_UPLOAD_INTENT)
+            .bind(artifact_id.as_uuid())
+            .bind(finalized_at)
+            .bind(workspace_id.as_uuid())
+            .bind(intent_id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(res.rows_affected() == 1)
     }
 
     /// Updates the terminal status of an upload intent.
@@ -516,5 +598,83 @@ impl ChangeEventRepository {
 
         let id: Uuid = row.get("change_event_id");
         Ok(id)
+    }
+}
+
+/// Repository operations for Quarantine Records.
+pub struct QuarantineRecordRepository;
+
+impl QuarantineRecordRepository {
+    /// Inserts an immutable quarantine record.
+    pub async fn insert(
+        tx: &mut PgConnection,
+        record: &QuarantineRecord,
+    ) -> Result<(), PersistenceError> {
+        let new_row =
+            new_row_from_record(record).map_err(|e| PersistenceError::Operation(e.to_string()))?;
+
+        sqlx::query(INSERT_QUARANTINE_RECORD)
+            .bind(new_row.quarantine_record_id)
+            .bind(new_row.workspace_id)
+            .bind(new_row.upload_intent_id)
+            .bind(new_row.document_version_id)
+            .bind(new_row.object_artifact_id)
+            .bind(&new_row.scanner_name)
+            .bind(new_row.scanner_version.as_deref())
+            .bind(new_row.reason_code.as_deref())
+            .bind(&new_row.status)
+            .bind(new_row.checked_at)
+            .bind(&new_row.threat_details)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(())
+    }
+
+    /// Fetches a quarantine record by workspace and record ID.
+    pub async fn get_by_id(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        record_id: QuarantineRecordId,
+    ) -> Result<Option<QuarantineRecord>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, QuarantineRecordRow>(SELECT_QUARANTINE_RECORD_BY_ID)
+            .bind(workspace_id.as_uuid())
+            .bind(record_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let rec = record_from_row(&row)
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(rec))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetches the latest quarantine record for an upload intent.
+    pub async fn get_latest_by_intent(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        intent_id: UploadIntentId,
+    ) -> Result<Option<QuarantineRecord>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, QuarantineRecordRow>(SELECT_QUARANTINE_RECORD_BY_INTENT)
+            .bind(workspace_id.as_uuid())
+            .bind(intent_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let rec = record_from_row(&row)
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(rec))
+            }
+            None => Ok(None),
+        }
     }
 }

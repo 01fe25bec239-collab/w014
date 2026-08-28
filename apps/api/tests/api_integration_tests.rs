@@ -446,12 +446,12 @@ async fn test_production_router_activates_wi0202_document_endpoints() {
     )
     .await;
 
-    // E21: POST /api/v1/workspaces/{workspace_id}/upload-intents/{intent_id}/finalize -> 501 Not Implemented (deferred to WI-0203, not 404)
+    // E21: POST /api/v1/workspaces/{workspace_id}/upload-intents/{intent_id}/finalize -> 401 Unauthenticated (route is registered, not 404)
     check_route(
         "POST",
         &format!("/api/v1/workspaces/{ws_id}/upload-intents/{intent_id}/finalize"),
         None,
-        StatusCode::NOT_IMPLEMENTED,
+        StatusCode::UNAUTHORIZED,
     )
     .await;
 

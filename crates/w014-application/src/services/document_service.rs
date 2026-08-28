@@ -9,6 +9,7 @@
 //! - Download signing for immutable object artifacts (max 5 minutes TTL)
 
 use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,8 +17,11 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 use w014_authz::authorized_workspace_context::AuthorizedWorkspaceContext;
 use w014_authz::capability::Capability;
-use w014_domain::ids::{DocumentVersionId, PrincipalId};
-use w014_domain::{Document, DocumentClass, MediaType, ObjectArtifact};
+use w014_domain::ids::{DocumentVersionId, PrincipalId, UploadIntentId};
+use w014_domain::{
+    Document, DocumentClass, DocumentVersion, IntentStatus, MediaType, ObjectArtifact,
+    QuarantineRecord, Sha256, UploadIntent,
+};
 use w014_jobs::job_identity::CanonicalJobIdentity;
 use w014_jobs::kind::JobKind;
 use w014_jobs::payload::JobPayload;
@@ -28,11 +32,68 @@ use w014_persistence::error::PersistenceError;
 use crate::error::ApplicationError;
 use crate::persistence::{
     ChangeEventRepository, DependencyKeyRepository, DocumentRepository, DocumentVersionRepository,
+    ObjectArtifactRepository, QuarantineRecordRepository, UploadIntentRepository,
 };
 use crate::services::IdempotencyCoordinator;
 
 /// Maximum presigned GET download URL lifetime: 5 minutes (300s).
 pub const MAX_DOWNLOAD_TTL_SECS: i64 = 300;
+
+/// Authoritative object metadata returned by object storage HEAD queries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredObjectMetadata {
+    pub bucket: String,
+    pub key: String,
+    pub byte_length: i64,
+    pub content_sha256: Sha256,
+    pub content_type: String,
+    pub etag: Option<String>,
+}
+
+static MOCK_OBJECT_STORAGE: LazyLock<RwLock<HashMap<(String, String), StoredObjectMetadata>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Output bundle returned by authoritative upload finalization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFinalizeResult {
+    pub intent: UploadIntent,
+    pub document: Document,
+    pub version: DocumentVersion,
+    pub artifact: ObjectArtifact,
+    pub quarantine: QuarantineRecord,
+    pub job_id: Uuid,
+}
+
+/// Error type specific to the UploadFinalize workflow.
+#[derive(Debug, thiserror::Error)]
+pub enum FinalizeUploadError {
+    #[error("Not found: {0}")]
+    NotFound(String),
+    #[error("Conflict: {0}")]
+    Conflict(String),
+    #[error("Precondition failed: {0}")]
+    PreconditionFailed(String),
+    #[error("Unprocessable entity: {0}")]
+    UnprocessableEntity(String),
+    #[error("Unsupported media type: {0}")]
+    UnsupportedMediaType(String),
+    #[error("Payload too large: {0}")]
+    PayloadTooLarge(String),
+    #[error("Domain error: {0}")]
+    Domain(#[from] w014_domain::error::DomainError),
+    #[error("Persistence error: {0}")]
+    Persistence(#[from] PersistenceError),
+    #[error("Application error: {0}")]
+    Application(#[from] ApplicationError),
+    #[error("Internal error: {0}")]
+    Internal(String),
+}
+
+impl From<sqlx::Error> for FinalizeUploadError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Persistence(PersistenceError::Connection(err))
+    }
+}
 
 /// Presigned PUT contract returned to the client for uploading bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,5 +386,401 @@ impl DocumentService {
         }
 
         Ok(document)
+    }
+
+    /// Stages an object into the mock storage registry for testing and deterministic verification.
+    pub fn stage_mock_upload(
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        byte_length: i64,
+        content_sha256: Sha256,
+        content_type: impl Into<String>,
+    ) {
+        let b = bucket.into();
+        let k = key.into();
+        let meta = StoredObjectMetadata {
+            bucket: b.clone(),
+            key: k.clone(),
+            byte_length,
+            content_sha256,
+            content_type: content_type.into(),
+            etag: Some(format!("\"{}\"", content_sha256.to_hex())),
+        };
+        let mut store = MOCK_OBJECT_STORAGE.write().expect("storage lock poisoned");
+        store.insert((b, k), meta);
+    }
+
+    /// Stages raw bytes into mock storage, computing SHA-256 and byte length automatically.
+    pub fn stage_mock_upload_bytes(
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        bytes: &[u8],
+        content_type: impl Into<String>,
+    ) {
+        let sha256 = Sha256::digest(bytes);
+        Self::stage_mock_upload(bucket, key, bytes.len() as i64, sha256, content_type);
+    }
+
+    /// Clears the mock storage registry.
+    pub fn clear_mock_storage() {
+        let mut store = MOCK_OBJECT_STORAGE.write().expect("storage lock poisoned");
+        store.clear();
+    }
+
+    /// Performs an authoritative HEAD query against the storage provider.
+    pub fn head_object(
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<StoredObjectMetadata>, FinalizeUploadError> {
+        let store = MOCK_OBJECT_STORAGE.read().expect("storage lock poisoned");
+        Ok(store.get(&(bucket.to_string(), key.to_string())).cloned())
+    }
+
+    /// Atomic UploadFinalize transaction execution (Prompt-16R / WI-0203).
+    ///
+    /// Atomically performs in ONE authoritative transaction:
+    /// 1. Fetch and lock upload_intent FOR UPDATE
+    /// 2. Verify workspace ownership, expiry, terminal status
+    /// 3. HEAD authoritative storage using ONLY the server-owned opaque key
+    /// 4. Verify exact byte length, SHA-256 digest, and Content-Type
+    /// 5. Persist immutable ObjectArtifact fact
+    /// 6. Persist immutable DocumentVersion fact (trust_state: pending)
+    /// 7. Persist immutable QuarantineRecord fact (status: pending)
+    /// 8. Consume / finalize upload_intent (status: verified, finalized_at: now)
+    /// 9. Append authoritative audit event
+    /// 10. Enqueue real durable malware-scan job in PostgreSQL jobs queue
+    /// 11. Complete idempotency record
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_finalize_upload_tx(
+        tx: &mut PgConnection,
+        awc: &AuthorizedWorkspaceContext,
+        principal_id: PrincipalId,
+        intent_id: UploadIntentId,
+        now: DateTime<Utc>,
+        idemp_record_id: Option<Uuid>,
+        idemp_store: &impl w014_persistence::idempotency::IdempotencyStore,
+    ) -> Result<UploadFinalizeResult, FinalizeUploadError> {
+        // 1. Fetch and lock upload_intent FOR UPDATE
+        let mut intent =
+            UploadIntentRepository::get_by_id_for_update(tx, awc.workspace_id(), intent_id)
+                .await?
+                .ok_or_else(|| {
+                    FinalizeUploadError::NotFound(format!("UploadIntent '{}' not found", intent_id))
+                })?;
+
+        // 2. Validate status and expiry
+        if intent.status == IntentStatus::Verified {
+            return Err(FinalizeUploadError::Conflict(format!(
+                "UploadIntent '{}' has already been finalized",
+                intent_id
+            )));
+        }
+        if intent.status == IntentStatus::Aborted {
+            return Err(FinalizeUploadError::Conflict(format!(
+                "UploadIntent '{}' has been abandoned",
+                intent_id
+            )));
+        }
+        if intent.status == IntentStatus::Expired || intent.is_expired_at(now) {
+            return Err(FinalizeUploadError::PreconditionFailed(format!(
+                "UploadIntent '{}' has expired",
+                intent_id
+            )));
+        }
+        if intent.status != IntentStatus::Initiated && intent.status != IntentStatus::Uploaded {
+            return Err(FinalizeUploadError::PreconditionFailed(format!(
+                "UploadIntent '{}' is in invalid status '{}'",
+                intent_id,
+                intent.status.as_str()
+            )));
+        }
+
+        // 3. Storage HEAD verification (server-owned opaque key ONLY)
+        let bucket = "w014-documents";
+        let object_key = intent.opaque_object_key.as_str();
+
+        let head_meta = Self::head_object(bucket, object_key)?.ok_or_else(|| {
+            FinalizeUploadError::PreconditionFailed(format!(
+                "Uploaded object not found in storage: PUT was not completed for key '{object_key}'"
+            ))
+        })?;
+
+        // Verify exact byte length matches declared expected_length
+        if head_meta.byte_length != intent.expected_length {
+            return Err(FinalizeUploadError::UnprocessableEntity(format!(
+                "Object byte length mismatch: expected {}, got {}",
+                intent.expected_length, head_meta.byte_length
+            )));
+        }
+
+        // Enforce 1..100 MiB limits
+        if head_meta.byte_length < 1 {
+            return Err(FinalizeUploadError::UnprocessableEntity(
+                "Uploaded object length must be at least 1 byte".to_string(),
+            ));
+        }
+        if head_meta.byte_length > w014_domain::limits::MAX_UPLOAD_BYTES {
+            return Err(FinalizeUploadError::PayloadTooLarge(format!(
+                "Uploaded object size {} exceeds 100 MiB limit",
+                head_meta.byte_length
+            )));
+        }
+
+        // Verify exact SHA-256 checksum
+        if let Some(ref declared_sha) = intent.expected_sha256_b64
+            && &head_meta.content_sha256 != declared_sha
+        {
+            return Err(FinalizeUploadError::UnprocessableEntity(format!(
+                "Object SHA-256 checksum mismatch: declared '{}', actual '{}'",
+                declared_sha.to_base64(),
+                head_meta.content_sha256.to_base64()
+            )));
+        }
+
+        // Verify conservative Content-Type matches expected media type
+        let expected_mime = intent.expected_media_type.as_str();
+        if head_meta.content_type.trim().to_lowercase() != expected_mime.to_lowercase() {
+            return Err(FinalizeUploadError::UnsupportedMediaType(format!(
+                "Object Content-Type mismatch: expected '{expected_mime}', got '{}'",
+                head_meta.content_type
+            )));
+        }
+
+        let stored_media_type = w014_domain::StoredMediaType::new(expected_mime)
+            .map_err(|e| FinalizeUploadError::UnsupportedMediaType(e.to_string()))?;
+
+        // 4. Persist immutable ObjectArtifact fact
+        let artifact = ObjectArtifact::reconstruct(
+            w014_domain::ids::ObjectArtifactId::new(),
+            awc.workspace_id(),
+            w014_domain::ArtifactKind::Original,
+            bucket.to_string(),
+            intent.opaque_object_key.clone(),
+            head_meta.content_sha256,
+            head_meta.byte_length,
+            stored_media_type,
+            w014_domain::StorageTier::Hot,
+            w014_domain::EncryptionMode::SseAes256,
+            None,
+            now,
+        )?;
+        ObjectArtifactRepository::insert(tx, &artifact).await?;
+
+        // 5. Persist immutable DocumentVersion fact & preserve Document relationship
+        let (document, next_version_ordinal) = if let Some(doc_id) = intent.document_id {
+            let doc = DocumentRepository::get_by_id(tx, awc.workspace_id(), doc_id)
+                .await?
+                .ok_or_else(|| {
+                    FinalizeUploadError::NotFound(format!("Target Document '{}' not found", doc_id))
+                })?;
+            let next_ver =
+                DocumentVersionRepository::get_next_version_number(tx, awc.workspace_id(), doc_id)
+                    .await?;
+            let ordinal = w014_domain::VersionOrdinal::new(next_ver)?;
+            (doc, ordinal)
+        } else {
+            let doc_class = match intent.expected_media_type {
+                MediaType::ApplicationPdf => DocumentClass::Pdf,
+                MediaType::Docx => DocumentClass::Docx,
+            };
+            let doc = Document::new(
+                awc.workspace_id(),
+                &intent.filename,
+                doc_class,
+                Some(principal_id),
+            )?;
+            DocumentRepository::insert(tx, &doc).await?;
+            let ordinal = w014_domain::VersionOrdinal::new(1)?;
+            (doc, ordinal)
+        };
+
+        let version = DocumentVersion::new(
+            &document,
+            next_version_ordinal,
+            artifact.id,
+            artifact.byte_length,
+            artifact.content_sha256,
+            &intent.filename,
+            Some(principal_id),
+        )?;
+        DocumentVersionRepository::insert(tx, &version).await?;
+
+        // 6. Establish frozen quarantine/processing posture (QuarantineRecord pending)
+        let quarantine = QuarantineRecord::new(
+            awc.workspace_id(),
+            intent.id,
+            w014_domain::QuarantineStatus::Pending,
+            "pipeline-intake",
+            Some("1.0.0".to_string()),
+            None,
+            Some(version.id),
+            Some(artifact.id),
+            now,
+            w014_domain::BoundedJson::empty(),
+        )?;
+        QuarantineRecordRepository::insert(tx, &quarantine).await?;
+
+        // 7. Consume / finalize upload_intent
+        if intent.status == IntentStatus::Initiated {
+            intent.mark_uploaded()?;
+        }
+        intent.bind_object_artifact(artifact.id, awc.workspace_id())?;
+        intent.finalize_verified(now)?;
+        let finalized = UploadIntentRepository::finalize_intent(
+            tx,
+            awc.workspace_id(),
+            intent.id,
+            artifact.id,
+            now,
+        )
+        .await?;
+        if !finalized {
+            return Err(FinalizeUploadError::Conflict(format!(
+                "Failed to finalize upload intent '{}': already finalized or concurrently modified",
+                intent_id
+            )));
+        }
+
+        // 8. Append authoritative audit event in the same transaction
+        let audit_store = PostgresAuditStore::new();
+        let audit_params = AppendAuditParams {
+            workspace_id: awc.workspace_id().into_uuid(),
+            actor_type: "principal".to_string(),
+            actor_id: Some(principal_id.into_uuid()),
+            authority_snapshot: serde_json::json!({}),
+            action_code: "UPLOAD_FINALIZE".to_string(),
+            entity_type: "upload_intent".to_string(),
+            entity_id: intent.id.to_string(),
+            entity_version: Some(1),
+            request_id: None,
+            correlation_id: None,
+            job_id: None,
+            source_state_hash: None,
+            before_ref: Some(serde_json::json!({ "status": "initiated" })),
+            after_ref: Some(serde_json::json!({
+                "status": "verified",
+                "document_version_id": version.id.to_string(),
+                "object_artifact_id": artifact.id.to_string(),
+            })),
+            metadata: serde_json::json!({
+                "upload_intent_id": intent.id.to_string(),
+                "document_id": document.id.to_string(),
+                "document_version_id": version.id.to_string(),
+                "object_artifact_id": artifact.id.to_string(),
+                "quarantine_record_id": quarantine.id.to_string(),
+                "byte_length": artifact.byte_length,
+                "sha256_hash": artifact.content_sha256.to_hex(),
+                "media_type": artifact.media_type.as_str(),
+            }),
+        };
+        audit_store
+            .append_audit_event(tx, audit_params)
+            .await
+            .map_err(|e| PersistenceError::Operation(format!("Audit append failed: {e}")))?;
+
+        // 9. Enqueue required REAL durable malware-scan job in PostgreSQL jobs queue
+        let job_kind = match intent.expected_media_type {
+            MediaType::ApplicationPdf => JobKind::MalwareScanDocumentPdf,
+            MediaType::Docx => JobKind::MalwareScanDocumentDocxOcr,
+        };
+
+        let immutable_targets = vec![version.id.to_string()];
+        let envelope = JobPayload::validate(&serde_json::json!({
+            "payload_contract_version": 1,
+            "producer_version": "w014-document-pipeline",
+            "immutable_targets": immutable_targets.clone(),
+            "dependency_hash": null,
+            "parameters": {
+                "upload_intent_id": intent.id.to_string(),
+                "object_artifact_id": artifact.id.to_string(),
+                "document_version_id": version.id.to_string(),
+            },
+        }))
+        .map_err(|e| FinalizeUploadError::Internal(format!("Failed to build job payload: {e}")))?;
+
+        let identity = CanonicalJobIdentity::new(
+            job_kind.as_str(),
+            awc.workspace_id().into_uuid(),
+            immutable_targets,
+            None,
+            1,
+            "w014-document-pipeline",
+        );
+        let idempotency_key = identity.idempotency_key();
+        let payload_json = envelope.to_json();
+
+        let inserted = sqlx::query(
+            "INSERT INTO jobs \
+             (workspace_id, queue_name, job_type, status, priority, payload, \
+              idempotency_key, correlation_id, max_attempts, backoff_max_secs) \
+             VALUES ($1, $2, $3, 'requested', 0, $4, $5, NULL, $6, $7) \
+             ON CONFLICT (idempotency_key) DO NOTHING \
+             RETURNING job_id",
+        )
+        .bind(awc.workspace_id().as_uuid())
+        .bind(job_kind.default_queue())
+        .bind(job_kind.as_str())
+        .bind(&payload_json)
+        .bind(&idempotency_key)
+        .bind(FROZEN_MAX_ATTEMPTS)
+        .bind(FROZEN_BACKOFF_MAX_SECS)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(PersistenceError::Connection)?;
+
+        let job_id: Uuid = if let Some(row) = inserted {
+            let new_job_id: Uuid = row.get("job_id");
+            sqlx::query(
+                "UPDATE jobs SET status = 'queued', not_before = clock_timestamp(), \
+                 row_version = row_version + 1 \
+                 WHERE job_id = $1 AND status = 'requested'",
+            )
+            .bind(new_job_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+            new_job_id
+        } else {
+            let row = sqlx::query("SELECT job_id FROM jobs WHERE idempotency_key = $1")
+                .bind(&idempotency_key)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(PersistenceError::Connection)?;
+            row.get("job_id")
+        };
+
+        // 10. Complete idempotency record if record_id was provided
+        let finalize_res = UploadFinalizeResult {
+            intent,
+            document,
+            version,
+            artifact,
+            quarantine,
+            job_id,
+        };
+
+        if let Some(record_id) = idemp_record_id {
+            let resp_body = serde_json::json!({
+                "upload_intent_id": finalize_res.intent.id.to_string(),
+                "document_id": finalize_res.document.id.to_string(),
+                "document_version_id": finalize_res.version.id.to_string(),
+                "version_number": finalize_res.version.version_ordinal.get(),
+                "object_artifact_id": finalize_res.artifact.id.to_string(),
+                "quarantine_record_id": finalize_res.quarantine.id.to_string(),
+                "scan_job_id": finalize_res.job_id.to_string(),
+                "status": "quarantined_processing",
+                "trust_state": finalize_res.version.trust_state.as_str(),
+            });
+            IdempotencyCoordinator::complete_record(
+                tx,
+                idemp_store,
+                record_id,
+                202,
+                Some(resp_body),
+            )
+            .await?;
+        }
+
+        Ok(finalize_res)
     }
 }

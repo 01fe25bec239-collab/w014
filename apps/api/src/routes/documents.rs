@@ -202,6 +202,20 @@ pub struct DownloadDto {
     pub original_filename: String,
 }
 
+/// Upload finalization response (E21).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UploadFinalizeDto {
+    pub upload_intent_id: String,
+    pub document_id: String,
+    pub document_version_id: String,
+    pub version_number: u32,
+    pub object_artifact_id: String,
+    pub quarantine_record_id: String,
+    pub scan_job_id: String,
+    pub status: String,
+    pub trust_state: String,
+}
+
 // ============================================================================
 // Problem Details Helper Constructors & Authentication
 // ============================================================================
@@ -238,6 +252,18 @@ fn precondition_failed(detail: impl Into<String>, instance: Option<String>) -> P
         detail: Some(detail.into()),
         instance,
         code: Some("PRECONDITION_FAILED".to_string()),
+        correlation_id: None,
+    }
+}
+
+fn unprocessable_entity(detail: impl Into<String>, instance: Option<String>) -> ProblemDetails {
+    ProblemDetails {
+        type_uri: "urn:w014:error:unprocessable-entity".to_string(),
+        title: "Unprocessable Entity".to_string(),
+        status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+        detail: Some(detail.into()),
+        instance,
+        code: Some("UNPROCESSABLE_ENTITY".to_string()),
         correlation_id: None,
     }
 }
@@ -1155,7 +1181,6 @@ pub async fn create_upload_intent_handler(
 }
 
 /// E21: POST /api/v1/workspaces/{workspace_id}/upload-intents/{intent_id}/finalize
-/// Authoritative implementation deferred to WI-0203.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/upload-intents/{intent_id}/finalize",
@@ -1164,23 +1189,211 @@ pub async fn create_upload_intent_handler(
         ("intent_id" = String, Path, description = "Upload intent identifier (UUID)")
     ),
     responses(
-        (status = 501, description = "Deferred to WI-0203", body = ProblemDetails)
+        (status = 202, description = "Upload finalized and scan job enqueued", body = UploadFinalizeDto),
+        (status = 400, description = "Bad Request (Missing Idempotency-Key)", body = ProblemDetails),
+        (status = 401, description = "Unauthenticated", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 404, description = "Upload intent or workspace not found", body = ProblemDetails),
+        (status = 409, description = "Conflict", body = ProblemDetails),
+        (status = 412, description = "Precondition Failed", body = ProblemDetails),
+        (status = 413, description = "Payload Too Large", body = ProblemDetails),
+        (status = 415, description = "Unsupported Media Type", body = ProblemDetails),
+        (status = 422, description = "Unprocessable Entity", body = ProblemDetails),
+        (status = 501, description = "Not Implemented (Deferred)", body = ProblemDetails)
     ),
     tag = "Documents"
 )]
 pub async fn finalize_upload_intent_handler(
-    State(_state): State<AppState>,
-    Path((_workspace_id_str, _intent_id_str)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Path((workspace_id_str, intent_id_str)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, ProblemDetails> {
-    Err(ProblemDetails {
-        type_uri: "urn:w014:error:deferred-wi0203".to_string(),
-        title: "Not Implemented".to_string(),
-        status: StatusCode::NOT_IMPLEMENTED.as_u16(),
-        detail: Some("Authoritative UploadFinalize is deferred to WI-0203".to_string()),
-        instance: None,
-        code: Some("DEFERRED_TO_WI0203".to_string()),
-        correlation_id: None,
-    })
+    let req_path =
+        format!("/api/v1/workspaces/{workspace_id_str}/upload-intents/{intent_id_str}/finalize");
+    let (session, principal) = authenticate_caller(&state, &headers, &req_path).await?;
+
+    state
+        .csrf_protector
+        .validate_request(
+            &Method::POST,
+            &headers,
+            true,
+            Some(&session.rotation_identity()),
+        )
+        .map_err(ProblemDetails::from)?;
+
+    let ws_uuid = Uuid::parse_str(&workspace_id_str).map_err(|_| {
+        ProblemDetails::not_found(
+            format!("Workspace '{workspace_id_str}' was not found"),
+            Some(req_path.clone()),
+        )
+    })?;
+
+    let intent_uuid = Uuid::parse_str(&intent_id_str).map_err(|_| {
+        ProblemDetails::not_found(
+            format!("UploadIntent '{intent_id_str}' was not found"),
+            Some(req_path.clone()),
+        )
+    })?;
+
+    let pool = state
+        .pool
+        .as_ref()
+        .ok_or_else(|| ProblemDetails::internal_server_error(Some(req_path.clone())))?;
+
+    let now = Utc::now();
+    let mut setup_tx = pool
+        .begin()
+        .await
+        .map_err(|_| ProblemDetails::internal_server_error(Some(req_path.clone())))?;
+
+    let awc = WorkspaceAuthzResolver::resolve(
+        &mut setup_tx,
+        WorkspaceId::from_uuid(ws_uuid),
+        principal.id,
+        now,
+    )
+    .await
+    .map_err(|_| {
+        ProblemDetails::not_found(
+            "Workspace not found or access denied",
+            Some(req_path.clone()),
+        )
+    })?;
+
+    setup_tx
+        .commit()
+        .await
+        .map_err(|_| ProblemDetails::internal_server_error(Some(req_path.clone())))?;
+
+    if !can_upload_documents(&awc) {
+        return Err(ProblemDetails::forbidden(
+            "DOCUMENT_UPLOAD capability required",
+            Some(req_path),
+        ));
+    }
+
+    let idemp_header = headers.get("idempotency-key").ok_or_else(|| {
+        ProblemDetails::bad_request("Idempotency-Key header is required", Some(req_path.clone()))
+    })?;
+    let idemp_key_raw = idemp_header.to_str().map_err(|_| {
+        ProblemDetails::bad_request("Invalid Idempotency-Key header", Some(req_path.clone()))
+    })?;
+
+    let tx_opts = WorkspaceTxOptions::new()
+        .with_client_workspace(awc.workspace_id())
+        .with_role(DatabaseRole::App);
+    let mut ws_tx = WorkspaceTransaction::begin(pool, &awc, tx_opts).await?;
+
+    let payload_val = serde_json::json!({
+        "workspace_id": workspace_id_str,
+        "intent_id": intent_id_str,
+    });
+
+    let req_hash = IdempotencyCoordinator::compute_payload_hash(&payload_val);
+    let idemp_store = PostgresIdempotencyStore::new();
+    let key_hash = IdempotencyCoordinator::compute_key_hash(
+        &state.config.session.active_hmac_secret,
+        idemp_key_raw,
+    );
+
+    let eval = IdempotencyCoordinator::evaluate_key(
+        ws_tx.conn(),
+        &idemp_store,
+        Some(awc.workspace_id()),
+        principal.id,
+        "UPLOAD_FINALIZE",
+        &key_hash,
+        &req_hash,
+        86400,
+    )
+    .await
+    .map_err(ProblemDetails::from)?;
+
+    let idemp_record_id = match eval {
+        IdempotencyCheckResult::Replay {
+            status_code, body, ..
+        } => {
+            ws_tx.commit().await?;
+            let sc = StatusCode::from_u16(status_code).unwrap_or(StatusCode::ACCEPTED);
+            return Ok((sc, Json(body.unwrap_or(payload_val))).into_response());
+        }
+        IdempotencyCheckResult::Mismatch {
+            expected_hash,
+            actual_hash,
+        } => {
+            return Err(ProblemDetails::conflict(
+                format!(
+                    "Idempotency key reused with different request payload (expected: {expected_hash}, actual: {actual_hash})"
+                ),
+                Some(req_path),
+            ));
+        }
+        IdempotencyCheckResult::InProgress => {
+            return Err(ProblemDetails::conflict(
+                "Request with this idempotency key is currently in progress",
+                Some(req_path),
+            ));
+        }
+        IdempotencyCheckResult::Acquired { record_id } => record_id,
+    };
+
+    let result = DocumentService::execute_finalize_upload_tx(
+        ws_tx.conn(),
+        &awc,
+        principal.id,
+        w014_domain::ids::UploadIntentId::from_uuid(intent_uuid),
+        now,
+        Some(idemp_record_id),
+        &idemp_store,
+    )
+    .await
+    .map_err(|e| match e {
+        w014_application::services::FinalizeUploadError::Conflict(msg) => {
+            ProblemDetails::conflict(msg, Some(req_path.clone()))
+        }
+        w014_application::services::FinalizeUploadError::PreconditionFailed(msg) => {
+            precondition_failed(msg, Some(req_path.clone()))
+        }
+        w014_application::services::FinalizeUploadError::UnprocessableEntity(msg) => {
+            unprocessable_entity(msg, Some(req_path.clone()))
+        }
+        w014_application::services::FinalizeUploadError::UnsupportedMediaType(msg) => {
+            unsupported_media_type(msg, Some(req_path.clone()))
+        }
+        w014_application::services::FinalizeUploadError::PayloadTooLarge(msg) => {
+            payload_too_large(msg, Some(req_path.clone()))
+        }
+        w014_application::services::FinalizeUploadError::NotFound(msg) => {
+            ProblemDetails::not_found(msg, Some(req_path.clone()))
+        }
+        w014_application::services::FinalizeUploadError::Domain(dom_err) => {
+            ProblemDetails::bad_request(dom_err.to_string(), Some(req_path.clone()))
+        }
+        w014_application::services::FinalizeUploadError::Application(app_err) => {
+            ProblemDetails::from(app_err)
+        }
+        w014_application::services::FinalizeUploadError::Persistence(_)
+        | w014_application::services::FinalizeUploadError::Internal(_) => {
+            ProblemDetails::internal_server_error(Some(req_path.clone()))
+        }
+    })?;
+
+    ws_tx.commit().await?;
+
+    let dto = UploadFinalizeDto {
+        upload_intent_id: result.intent.id.to_string(),
+        document_id: result.document.id.to_string(),
+        document_version_id: result.version.id.to_string(),
+        version_number: result.version.version_ordinal.get(),
+        object_artifact_id: result.artifact.id.to_string(),
+        quarantine_record_id: result.quarantine.id.to_string(),
+        scan_job_id: result.job_id.to_string(),
+        status: "quarantined_processing".to_string(),
+        trust_state: result.version.trust_state.as_str().to_string(),
+    };
+
+    Ok((StatusCode::ACCEPTED, Json(dto)).into_response())
 }
 
 /// E22: GET /api/v1/workspaces/{workspace_id}/document-versions/{version_id}

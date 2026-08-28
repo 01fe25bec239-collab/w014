@@ -20,16 +20,18 @@ use http_body_util::BodyExt;
 use serde_json::json;
 use sqlx::{PgPool, Row};
 use tower::ServiceExt;
-use uuid::Uuid;
 
 use w014_api::config::ApiConfig;
 use w014_api::create_app_with_pool;
-use w014_api::routes::documents::{DocumentDto, DocumentPage, DownloadDto, UploadIntentDto};
+use w014_api::routes::documents::{
+    DocumentDto, DocumentPage, DownloadDto, UploadFinalizeDto, UploadIntentDto,
+};
 use w014_application::persistence::{
     DocumentRepository, DocumentVersionRepository, MembershipRepository, ObjectArtifactRepository,
     OrganizationRepository, PrincipalRepository, ProgramRepository, SessionRepository,
     WorkspaceRepository,
 };
+use w014_application::services::DocumentService;
 use w014_authn::csrf::{CSRF_HEADER_NAME, CsrfConfig, derive_csrf_token};
 use w014_authn::session::{Session, generate_session_token};
 use w014_domain::ids::{OrganizationId, PrincipalId, WorkspaceId};
@@ -607,7 +609,7 @@ async fn test_e20_upload_intent_presign_put_security_gates() {
 }
 
 #[tokio::test]
-async fn test_e21_finalize_upload_intent_deferred_wi0203() {
+async fn test_e21_finalize_upload_intent_full_flow() {
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -620,21 +622,78 @@ async fn test_e21_finalize_upload_intent_deferred_wi0203() {
     add_membership(&db, ws.id, user.id, MembershipRole::Operator).await;
     let (cookie, csrf) = create_session_and_csrf(&db, user.id, &config).await;
 
-    let intent_id = Uuid::new_v4();
+    // 1. Create document & upload intent
+    let doc = {
+        let mut tx = db.pool().begin().await.unwrap();
+        let doc = Document::new(ws.id, "Spec Doc", DocumentClass::Pdf, Some(user.id)).unwrap();
+        DocumentRepository::insert(&mut tx, &doc).await.unwrap();
+        tx.commit().await.unwrap();
+        doc
+    };
+
+    let sample_bytes = b"%PDF-1.7 sample content";
+    let sha256_val = Sha256::digest(sample_bytes);
+    let sha256_b64 = sha256_val.to_base64();
+
+    let create_intent_payload = json!({
+        "filename": "spec.pdf",
+        "media_type": "application/pdf",
+        "byte_length": sample_bytes.len() as i64,
+        "sha256_b64": sha256_b64,
+    });
+
     let req = Request::builder()
         .uri(format!(
-            "/api/v1/workspaces/{}/upload-intents/{}/finalize",
-            ws.id, intent_id
+            "/api/v1/workspaces/{}/documents/{}/upload-intents",
+            ws.id, doc.id
         ))
         .method("POST")
         .header(COOKIE, &cookie)
         .header(CSRF_HEADER_NAME, &csrf)
         .header(ORIGIN, "http://127.0.0.1:3000")
+        .header("idempotency-key", "intent-key-21")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(create_intent_payload.to_string()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let intent_dto: UploadIntentDto = serde_json::from_slice(&body_bytes).unwrap();
+
+    // 2. Stage object in mock storage
+    DocumentService::stage_mock_upload_bytes(
+        "w014-documents",
+        &intent_dto.opaque_object_key,
+        sample_bytes,
+        "application/pdf",
+    );
+
+    // 3. Finalize upload intent via E21
+    let idemp_key = "finalize-key-21";
+    let req = Request::builder()
+        .uri(format!(
+            "/api/v1/workspaces/{}/upload-intents/{}/finalize",
+            ws.id, intent_dto.id
+        ))
+        .method("POST")
+        .header(COOKIE, &cookie)
+        .header(CSRF_HEADER_NAME, &csrf)
+        .header(ORIGIN, "http://127.0.0.1:3000")
+        .header("idempotency-key", idemp_key)
         .body(Body::empty())
         .unwrap();
 
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let finalize_dto: UploadFinalizeDto = serde_json::from_slice(&body_bytes).unwrap();
+
+    assert_eq!(finalize_dto.upload_intent_id, intent_dto.id);
+    assert_eq!(finalize_dto.document_id, doc.id.to_string());
+    assert_eq!(finalize_dto.version_number, 1);
+    assert_eq!(finalize_dto.trust_state, "pending");
+    assert_eq!(finalize_dto.status, "quarantined_processing");
 }
 
 #[tokio::test]
