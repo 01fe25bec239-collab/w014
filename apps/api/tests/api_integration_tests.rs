@@ -266,7 +266,7 @@ async fn test_correlation_id_in_rfc9457_error_response() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_openapi_endpoint_exposes_health_surface_only() {
+async fn test_openapi_endpoint_exposes_production_surface() {
     let app = setup_test_app();
 
     let request = Request::builder()
@@ -307,13 +307,189 @@ async fn test_openapi_endpoint_exposes_health_surface_only() {
     assert!(schemas.get("MembershipDto").is_some());
     assert!(schemas.get("CapabilityGrantDto").is_some());
 
+    // Verify WI-0202 endpoints and schemas are present (E16-E24)
+    assert!(
+        paths
+            .get("/api/v1/workspaces/{workspace_id}/documents")
+            .is_some()
+    );
+    assert!(
+        paths
+            .get("/api/v1/workspaces/{workspace_id}/documents/{document_id}")
+            .is_some()
+    );
+    assert!(
+        paths
+            .get("/api/v1/workspaces/{workspace_id}/documents/{document_id}/versions")
+            .is_some()
+    );
+    assert!(
+        paths
+            .get("/api/v1/workspaces/{workspace_id}/documents/{document_id}/upload-intents")
+            .is_some()
+    );
+    assert!(
+        paths
+            .get("/api/v1/workspaces/{workspace_id}/upload-intents/{intent_id}/finalize")
+            .is_some()
+    );
+    assert!(
+        paths
+            .get("/api/v1/workspaces/{workspace_id}/document-versions/{version_id}")
+            .is_some()
+    );
+    assert!(
+        paths
+            .get("/api/v1/workspaces/{workspace_id}/document-versions/{version_id}/accept")
+            .is_some()
+    );
+    assert!(
+        paths
+            .get("/api/v1/workspaces/{workspace_id}/document-versions/{version_id}/download")
+            .is_some()
+    );
+
+    assert!(schemas.get("DocumentDto").is_some());
+    assert!(schemas.get("CreateDocumentDto").is_some());
+    assert!(schemas.get("DocumentPage").is_some());
+    assert!(schemas.get("DocumentVersionDto").is_some());
+    assert!(schemas.get("DocumentVersionPage").is_some());
+    assert!(schemas.get("CreateUploadIntentDto").is_some());
+    assert!(schemas.get("PresignedPutDto").is_some());
+    assert!(schemas.get("UploadIntentDto").is_some());
+    assert!(schemas.get("DownloadDto").is_some());
+
     // Strictly verify forbidden/deferred domain endpoints or models are NOT present
     let json_str = json.to_string();
     assert!(!json_str.contains("source-state"));
-    assert!(!json_str.contains("/api/v1/documents"));
     assert!(!json_str.contains("/api/v1/requirements"));
     assert!(!json_str.contains("/api/v1/findings"));
-    assert!(!json_str.contains("DocumentDto"));
+    assert!(!json_str.contains("findings"));
+    assert!(!json_str.contains("cdrl"));
+}
+
+#[tokio::test]
+async fn test_production_router_activates_wi0202_document_endpoints() {
+    let ws_id = Uuid::new_v4();
+    let doc_id = Uuid::new_v4();
+    let intent_id = Uuid::new_v4();
+    let ver_id = Uuid::new_v4();
+
+    async fn check_route(
+        method: &str,
+        uri: &str,
+        body_str: Option<&str>,
+        expected_status: StatusCode,
+    ) {
+        let app = setup_test_app();
+        let body = match body_str {
+            Some(b) => Body::from(b.to_string()),
+            None => Body::empty(),
+        };
+        let mut req_builder = Request::builder().method(method).uri(uri);
+        if body_str.is_some() {
+            req_builder = req_builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        let request = req_builder.body(body).unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            expected_status,
+            "Route {method} {uri} expected status {expected_status}, got {}",
+            response.status()
+        );
+    }
+
+    // E16: GET /api/v1/workspaces/{workspace_id}/documents -> 401 Unauthenticated (route is registered, not 404)
+    check_route(
+        "GET",
+        &format!("/api/v1/workspaces/{ws_id}/documents"),
+        None,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    // E17: POST /api/v1/workspaces/{workspace_id}/documents -> 401 Unauthenticated (route is registered, not 404)
+    check_route(
+        "POST",
+        &format!("/api/v1/workspaces/{ws_id}/documents"),
+        Some(r#"{"title":"Test Document","document_class":"INCOMING"}"#),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    // E18: GET /api/v1/workspaces/{workspace_id}/documents/{document_id} -> 401 Unauthenticated (route is registered, not 404)
+    check_route(
+        "GET",
+        &format!("/api/v1/workspaces/{ws_id}/documents/{doc_id}"),
+        None,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    // E19: GET /api/v1/workspaces/{workspace_id}/documents/{document_id}/versions -> 401 Unauthenticated (route is registered, not 404)
+    check_route(
+        "GET",
+        &format!("/api/v1/workspaces/{ws_id}/documents/{doc_id}/versions"),
+        None,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    // E20: POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/upload-intents -> 401 Unauthenticated (route is registered, not 404)
+    check_route(
+        "POST",
+        &format!("/api/v1/workspaces/{ws_id}/documents/{doc_id}/upload-intents"),
+        Some(r#"{"filename":"test.pdf","media_type":"application/pdf","byte_length":1024}"#),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    // E21: POST /api/v1/workspaces/{workspace_id}/upload-intents/{intent_id}/finalize -> 501 Not Implemented (deferred to WI-0203, not 404)
+    check_route(
+        "POST",
+        &format!("/api/v1/workspaces/{ws_id}/upload-intents/{intent_id}/finalize"),
+        None,
+        StatusCode::NOT_IMPLEMENTED,
+    )
+    .await;
+
+    // E22: GET /api/v1/workspaces/{workspace_id}/document-versions/{version_id} -> 401 Unauthenticated (route is registered, not 404)
+    check_route(
+        "GET",
+        &format!("/api/v1/workspaces/{ws_id}/document-versions/{ver_id}"),
+        None,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    // E23: POST /api/v1/workspaces/{workspace_id}/document-versions/{version_id}/accept -> 401 Unauthenticated (route is registered, not 404)
+    check_route(
+        "POST",
+        &format!("/api/v1/workspaces/{ws_id}/document-versions/{ver_id}/accept"),
+        None,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    // E24: POST /api/v1/workspaces/{workspace_id}/document-versions/{version_id}/download -> 401 Unauthenticated (route is registered, not 404)
+    check_route(
+        "POST",
+        &format!("/api/v1/workspaces/{ws_id}/document-versions/{ver_id}/download"),
+        None,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    // Unregistered path returns 404 Not Found via global fallback
+    check_route(
+        "GET",
+        &format!("/api/v1/workspaces/{ws_id}/unregistered-surface"),
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
 }
 
 #[tokio::test]

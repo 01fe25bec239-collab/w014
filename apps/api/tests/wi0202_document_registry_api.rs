@@ -22,12 +22,9 @@ use sqlx::{PgPool, Row};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use w014_api::AppState;
 use w014_api::config::ApiConfig;
 use w014_api::create_app_with_pool;
-use w014_api::routes::documents::{
-    DocumentDto, DocumentPage, DownloadDto, UploadIntentDto, document_routes,
-};
+use w014_api::routes::documents::{DocumentDto, DocumentPage, DownloadDto, UploadIntentDto};
 use w014_application::persistence::{
     DocumentRepository, DocumentVersionRepository, MembershipRepository, ObjectArtifactRepository,
     OrganizationRepository, PrincipalRepository, ProgramRepository, SessionRepository,
@@ -67,8 +64,7 @@ fn create_test_config() -> ApiConfig {
 }
 
 fn create_test_app(config: &ApiConfig, pool: PgPool) -> axum::Router {
-    let state = AppState::new(config.clone(), Some(pool.clone()));
-    create_app_with_pool(config, pool).merge(document_routes().with_state(state))
+    create_app_with_pool(config, pool)
 }
 
 async fn create_org(db: &TestDatabase, name: &str, slug: &str) -> Organization {
