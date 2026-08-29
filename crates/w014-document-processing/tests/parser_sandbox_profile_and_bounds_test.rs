@@ -1,0 +1,465 @@
+//! Unit and contract test suite for parser sandbox profile, ceilings, and bounds (WI-0205).
+//!
+//! Validates:
+//! - Hard frozen resource ceilings (<= 2 vCPU, <= 2 GiB RAM, <= 1 GiB tmpfs, <= 64 PIDs, <= 10 min wall clock, <= 10 MiB output)
+//! - Out-of-bounds ceilings fail validation
+//! - Network isolation policy (no public ingress, no general egress, no AI access, no external URLs)
+//! - Filesystem boundary policy (read-only root, bounded tmpfs, no host mounts, no secret mounts)
+//! - Process isolation policy (non-root UID/GID 65534, drop all capabilities, no-new-privileges)
+//! - Credentials scrubbing: zero DB/AI/S3/KMS/audit/session credentials in sandbox environment
+//! - Scoped single-object handoff integrity validation
+//! - Typed bounded output validation and tamper detection
+//! - Fail-closed error taxonomy and retryability classification
+//! - Mock sandbox runner deterministic execution modes
+
+use uuid::Uuid;
+use w014_document_processing::sandbox::{
+    FROZEN_MAX_CPU_CORES, FROZEN_MAX_MEMORY_BYTES, FROZEN_MAX_OUTPUT_BYTES, FROZEN_MAX_PIDS,
+    FROZEN_MAX_TMPFS_BYTES, FROZEN_MAX_WALL_CLOCK_SECS, MockSandboxBehavior, MockSandboxRunner,
+    NON_ROOT_GID, NON_ROOT_UID, OutputValidationError, SANDBOX_PROTOCOL_VERSION,
+    SandboxCredentialsPolicy, SandboxError, SandboxFilesystemPolicy, SandboxInput,
+    SandboxNetworkPolicy, SandboxOutput, SandboxProcessPolicy, SandboxResourceCeilings,
+    SandboxRunner, SandboxSecurityProfile, SandboxStatus,
+};
+use w014_domain::ids::{DocumentVersionId, ObjectArtifactId, WorkspaceId};
+use w014_domain::{LocatorVersion, Sha256, StoredMediaType};
+
+#[test]
+fn test_default_sandbox_profile_satisfies_all_frozen_ceilings() {
+    let profile = SandboxSecurityProfile::frozen_default();
+    assert!(profile.validate().is_ok());
+
+    assert_eq!(profile.ceilings.max_cpu_cores, FROZEN_MAX_CPU_CORES);
+    assert_eq!(profile.ceilings.max_memory_bytes, FROZEN_MAX_MEMORY_BYTES);
+    assert_eq!(profile.ceilings.max_tmpfs_bytes, FROZEN_MAX_TMPFS_BYTES);
+    assert_eq!(profile.ceilings.max_pids, FROZEN_MAX_PIDS);
+    assert_eq!(
+        profile.ceilings.max_wall_clock_seconds,
+        FROZEN_MAX_WALL_CLOCK_SECS
+    );
+    assert_eq!(profile.ceilings.max_output_bytes, FROZEN_MAX_OUTPUT_BYTES);
+
+    assert!(!profile.network.allow_public_ingress);
+    assert!(!profile.network.allow_general_egress);
+    assert!(!profile.network.allow_ai_provider_access);
+    assert!(!profile.network.allow_external_urls);
+
+    assert!(profile.filesystem.root_readonly);
+    assert_eq!(profile.filesystem.tmpfs_max_bytes, FROZEN_MAX_TMPFS_BYTES);
+    assert!(!profile.filesystem.allow_host_mounts);
+    assert!(!profile.filesystem.allow_secret_mounts);
+    assert!(!profile.filesystem.allow_docker_socket);
+
+    assert!(profile.process.run_as_non_root);
+    assert_eq!(profile.process.uid, NON_ROOT_UID);
+    assert_eq!(profile.process.gid, NON_ROOT_GID);
+    assert!(profile.process.drop_all_capabilities);
+    assert!(profile.process.no_new_privileges);
+
+    assert!(!profile.credentials.has_database_credentials);
+    assert!(!profile.credentials.has_ai_credentials);
+    assert!(!profile.credentials.has_s3_credentials);
+    assert!(!profile.credentials.has_kms_credentials);
+    assert!(!profile.credentials.has_audit_signing_credentials);
+    assert!(!profile.credentials.has_audit_hmac_keys);
+    assert!(!profile.credentials.has_session_credentials);
+}
+
+#[test]
+fn test_resource_ceilings_fail_closed_on_excess() {
+    // Excessive CPU
+    let c = SandboxResourceCeilings {
+        max_cpu_cores: 2.1,
+        ..Default::default()
+    };
+    assert!(c.validate().is_err());
+
+    // Excessive Memory (> 2 GiB)
+    let c = SandboxResourceCeilings {
+        max_memory_bytes: 2 * 1024 * 1024 * 1024 + 1,
+        ..Default::default()
+    };
+    assert!(c.validate().is_err());
+
+    // Excessive TMPFS (> 1 GiB)
+    let c = SandboxResourceCeilings {
+        max_tmpfs_bytes: 1024 * 1024 * 1024 + 1,
+        ..Default::default()
+    };
+    assert!(c.validate().is_err());
+
+    // Excessive PIDs (> 64)
+    let c = SandboxResourceCeilings {
+        max_pids: 65,
+        ..Default::default()
+    };
+    assert!(c.validate().is_err());
+
+    // Excessive Wall Clock (> 600s)
+    let c = SandboxResourceCeilings {
+        max_wall_clock_seconds: 601,
+        ..Default::default()
+    };
+    assert!(c.validate().is_err());
+
+    // Excessive Output (> 10 MiB)
+    let c = SandboxResourceCeilings {
+        max_output_bytes: 10 * 1024 * 1024 + 1,
+        ..Default::default()
+    };
+    assert!(c.validate().is_err());
+}
+
+#[test]
+fn test_security_policies_reject_permissive_settings() {
+    let net = SandboxNetworkPolicy {
+        allow_public_ingress: true,
+        ..Default::default()
+    };
+    assert!(net.validate().is_err());
+
+    let net = SandboxNetworkPolicy {
+        allow_general_egress: true,
+        ..Default::default()
+    };
+    assert!(net.validate().is_err());
+
+    let net = SandboxNetworkPolicy {
+        allow_ai_provider_access: true,
+        ..Default::default()
+    };
+    assert!(net.validate().is_err());
+
+    let fs = SandboxFilesystemPolicy {
+        root_readonly: false,
+        ..Default::default()
+    };
+    assert!(fs.validate().is_err());
+
+    let fs = SandboxFilesystemPolicy {
+        allow_host_mounts: true,
+        ..Default::default()
+    };
+    assert!(fs.validate().is_err());
+
+    let proc = SandboxProcessPolicy {
+        run_as_non_root: false,
+        ..Default::default()
+    };
+    assert!(proc.validate().is_err());
+
+    let proc = SandboxProcessPolicy {
+        uid: 0, // root
+        ..Default::default()
+    };
+    assert!(proc.validate().is_err());
+
+    let creds = SandboxCredentialsPolicy {
+        has_database_credentials: true,
+        ..Default::default()
+    };
+    assert!(creds.validate().is_err());
+
+    let creds = SandboxCredentialsPolicy {
+        has_ai_credentials: true,
+        ..Default::default()
+    };
+    assert!(creds.validate().is_err());
+
+    let creds = SandboxCredentialsPolicy {
+        has_s3_credentials: true,
+        ..Default::default()
+    };
+    assert!(creds.validate().is_err());
+}
+
+#[test]
+fn test_credentials_scrubbing_removes_sensitive_environment() {
+    let raw_env = vec![
+        ("PATH", "/usr/bin:/bin"),
+        ("LANG", "en_US.UTF-8"),
+        ("DATABASE_URL", "postgres://user:pass@localhost/db"),
+        ("SQLX_OFFLINE", "true"),
+        ("POSTGRES_PASSWORD", "secret123"),
+        ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+        (
+            "AWS_SECRET_ACCESS_KEY",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        ),
+        ("S3_BUCKET_NAME", "w014-documents"),
+        ("OPENAI_API_KEY", "sk-proj-test-123456"),
+        ("ANTHROPIC_API_KEY", "sk-ant-test-123456"),
+        ("GEMINI_API_KEY", "AIzaSyTest123"),
+        ("APP_SESSION_TOKEN", "sess_xyz789"),
+        ("KMS_KEY_ARN", "arn:aws:kms:us-east-1:123456:key/abc"),
+        ("AUDIT_HMAC_SECRET", "super-secret-hmac-key"),
+        ("SAFE_VAR", "benign_non_sensitive_value"),
+    ];
+
+    let scrubbed = SandboxCredentialsPolicy::scrub_environment(raw_env);
+
+    assert_eq!(scrubbed.get("PATH").unwrap(), "/usr/bin:/bin");
+    assert_eq!(scrubbed.get("LANG").unwrap(), "en_US.UTF-8");
+    assert_eq!(
+        scrubbed.get("SAFE_VAR").unwrap(),
+        "benign_non_sensitive_value"
+    );
+
+    assert!(!scrubbed.contains_key("DATABASE_URL"));
+    assert!(!scrubbed.contains_key("SQLX_OFFLINE"));
+    assert!(!scrubbed.contains_key("POSTGRES_PASSWORD"));
+    assert!(!scrubbed.contains_key("AWS_ACCESS_KEY_ID"));
+    assert!(!scrubbed.contains_key("AWS_SECRET_ACCESS_KEY"));
+    assert!(!scrubbed.contains_key("S3_BUCKET_NAME"));
+    assert!(!scrubbed.contains_key("OPENAI_API_KEY"));
+    assert!(!scrubbed.contains_key("ANTHROPIC_API_KEY"));
+    assert!(!scrubbed.contains_key("GEMINI_API_KEY"));
+    assert!(!scrubbed.contains_key("APP_SESSION_TOKEN"));
+    assert!(!scrubbed.contains_key("KMS_KEY_ARN"));
+    assert!(!scrubbed.contains_key("AUDIT_HMAC_SECRET"));
+}
+
+#[test]
+fn test_scoped_single_object_handoff_input_validation() {
+    let ws_id = WorkspaceId::new();
+    let dv_id = DocumentVersionId::new();
+    let oa_id = ObjectArtifactId::new();
+    let job_id = Uuid::new_v4();
+    let media_type = StoredMediaType::new("application/pdf").unwrap();
+    let sample_bytes = b"%PDF-1.7 scoped test document bytes".to_vec();
+    let expected_sha = Sha256::digest(&sample_bytes);
+    let expected_len = sample_bytes.len() as i64;
+
+    // Valid handoff
+    let input = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type.clone(),
+        expected_sha,
+        expected_len,
+        sample_bytes.clone(),
+    );
+    assert!(input.is_ok());
+    let valid_input = input.unwrap();
+    assert!(valid_input.is_single_object());
+    assert!(valid_input.verify_integrity().is_ok());
+
+    // Length mismatch
+    let bad_len = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type.clone(),
+        expected_sha,
+        expected_len + 10,
+        sample_bytes.clone(),
+    );
+    assert!(bad_len.is_err());
+
+    // SHA-256 mismatch
+    let tampered_bytes = b"%PDF-1.7 tampered bytes".to_vec();
+    let bad_sha = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type,
+        expected_sha,
+        tampered_bytes.len() as i64,
+        tampered_bytes,
+    );
+    assert!(bad_sha.is_err());
+}
+
+#[test]
+fn test_typed_bounded_output_validation() {
+    let ws_id = WorkspaceId::new();
+    let dv_id = DocumentVersionId::new();
+    let oa_id = ObjectArtifactId::new();
+    let job_id = Uuid::new_v4();
+    let media_type = StoredMediaType::new("application/pdf").unwrap();
+    let sample_bytes = b"%PDF-1.7 scoped test document bytes".to_vec();
+    let expected_sha = Sha256::digest(&sample_bytes);
+    let expected_len = sample_bytes.len() as i64;
+
+    let input = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type,
+        expected_sha,
+        expected_len,
+        sample_bytes,
+    )
+    .unwrap();
+
+    let locator = LocatorVersion::new("w014-loc-v1").unwrap();
+
+    // Valid output matching input
+    let valid_output = SandboxOutput {
+        protocol_version: SANDBOX_PROTOCOL_VERSION.to_string(),
+        document_version_id: dv_id,
+        object_artifact_id: oa_id,
+        input_sha256: expected_sha,
+        status: SandboxStatus::Success,
+        parser_name: "test-parser".to_string(),
+        parser_version: "1.0.0".to_string(),
+        locator_version: locator.clone(),
+        page_count: 5,
+        block_count: 50,
+        span_count: 100,
+        text_sha256: Some(expected_sha),
+        execution_duration_ms: 120,
+        failure_code: None,
+        failure_detail: None,
+    };
+    assert!(valid_output.validate_against_input(&input).is_ok());
+
+    // Protocol version mismatch
+    let mut bad_protocol = valid_output.clone();
+    bad_protocol.protocol_version = "parser-sandbox-v99".to_string();
+    assert!(matches!(
+        bad_protocol.validate_against_input(&input),
+        Err(OutputValidationError::ProtocolMismatch { .. })
+    ));
+
+    // DocumentVersionId mismatch
+    let mut bad_dv = valid_output.clone();
+    bad_dv.document_version_id = DocumentVersionId::new();
+    assert!(matches!(
+        bad_dv.validate_against_input(&input),
+        Err(OutputValidationError::DocumentVersionMismatch { .. })
+    ));
+
+    // ObjectArtifactId mismatch
+    let mut bad_oa = valid_output.clone();
+    bad_oa.object_artifact_id = ObjectArtifactId::new();
+    assert!(matches!(
+        bad_oa.validate_against_input(&input),
+        Err(OutputValidationError::ObjectArtifactMismatch { .. })
+    ));
+
+    // Input SHA-256 mismatch
+    let mut bad_hash = valid_output.clone();
+    bad_hash.input_sha256 = Sha256::digest(b"different content");
+    assert!(matches!(
+        bad_hash.validate_against_input(&input),
+        Err(OutputValidationError::InputHashMismatch { .. })
+    ));
+
+    // Out of bounds page count (< 0 or > 10,000)
+    let mut bad_pages = valid_output.clone();
+    bad_pages.page_count = -1;
+    assert!(matches!(
+        bad_pages.validate_against_input(&input),
+        Err(OutputValidationError::PageCountOutOfBounds { .. })
+    ));
+
+    let mut bad_pages = valid_output.clone();
+    bad_pages.page_count = 10_001;
+    assert!(matches!(
+        bad_pages.validate_against_input(&input),
+        Err(OutputValidationError::PageCountOutOfBounds { .. })
+    ));
+
+    // Failed status requires failure_code
+    let mut failed_without_code = valid_output.clone();
+    failed_without_code.status = SandboxStatus::Failed;
+    failed_without_code.failure_code = None;
+    assert!(matches!(
+        failed_without_code.validate_against_input(&input),
+        Err(OutputValidationError::MissingFailureCode)
+    ));
+}
+
+#[test]
+fn test_sandbox_error_retryability_and_codes() {
+    let timeout = SandboxError::Timeout {
+        elapsed_secs: 601,
+        limit_secs: 600,
+    };
+    assert!(timeout.is_retryable());
+    assert_eq!(timeout.error_code(), "SANDBOX_TIMEOUT");
+
+    let oom = SandboxError::OutOfMemory {
+        detail: "Killed by OOM killer".into(),
+    };
+    assert!(oom.is_retryable());
+    assert_eq!(oom.error_code(), "SANDBOX_OOM");
+
+    let crash = SandboxError::ProcessCrash {
+        exit_code: Some(1),
+        signal: None,
+        stderr: "Segfault".into(),
+    };
+    assert!(crash.is_retryable());
+    assert_eq!(crash.error_code(), "SANDBOX_CRASH");
+
+    let violation = SandboxError::SandboxViolation {
+        violation_type: "NETWORK_EGRESS".into(),
+        detail: "Attempted socket connect to 8.8.8.8".into(),
+    };
+    assert!(!violation.is_retryable());
+    assert_eq!(violation.error_code(), "SANDBOX_VIOLATION");
+
+    let malformed = SandboxError::MalformedOutput {
+        detail: "Truncated JSON".into(),
+    };
+    assert!(!malformed.is_retryable());
+    assert_eq!(malformed.error_code(), "SANDBOX_MALFORMED_OUTPUT");
+}
+
+#[tokio::test]
+async fn test_mock_sandbox_runner_deterministic_execution() {
+    let ws_id = WorkspaceId::new();
+    let dv_id = DocumentVersionId::new();
+    let oa_id = ObjectArtifactId::new();
+    let job_id = Uuid::new_v4();
+    let media_type = StoredMediaType::new("application/pdf").unwrap();
+    let sample_bytes = b"%PDF-1.7 test".to_vec();
+    let expected_sha = Sha256::digest(&sample_bytes);
+    let expected_len = sample_bytes.len() as i64;
+
+    let input = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type,
+        expected_sha,
+        expected_len,
+        sample_bytes,
+    )
+    .unwrap();
+    let profile = SandboxSecurityProfile::frozen_default();
+
+    // 1. Automatic success
+    let runner = MockSandboxRunner::new();
+    let res = runner.run(&profile, &input).await.unwrap();
+    assert_eq!(res.status, SandboxStatus::Success);
+    assert_eq!(res.document_version_id, dv_id);
+    assert_eq!(res.object_artifact_id, oa_id);
+    assert_eq!(res.input_sha256, expected_sha);
+    assert_eq!(runner.execution_count(), 1);
+
+    // 2. Timeout behavior
+    let runner = MockSandboxRunner::new().with_behavior(MockSandboxBehavior::Timeout(601));
+    let err = runner.run(&profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::Timeout { .. }));
+
+    // 3. OOM behavior
+    let runner = MockSandboxRunner::new().with_behavior(MockSandboxBehavior::OutOfMemory);
+    let err = runner.run(&profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::OutOfMemory { .. }));
+
+    // 4. Security violation behavior
+    let runner = MockSandboxRunner::new().with_behavior(MockSandboxBehavior::SandboxViolation(
+        "Network connect attempted".into(),
+    ));
+    let err = runner.run(&profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+}

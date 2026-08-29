@@ -69,6 +69,9 @@ const SELECT_QUARANTINE_RECORD_BY_ID: &str = "SELECT quarantine_record_id, works
 const SELECT_QUARANTINE_RECORD_BY_INTENT: &str = "SELECT quarantine_record_id, workspace_id, upload_intent_id, document_version_id, object_artifact_id, scanner_name, scanner_version, reason_code, status, checked_at, threat_details \
      FROM quarantine_records WHERE workspace_id = $1 AND upload_intent_id = $2 ORDER BY checked_at DESC LIMIT 1";
 
+const SELECT_QUARANTINE_RECORD_BY_VERSION: &str = "SELECT quarantine_record_id, workspace_id, upload_intent_id, document_version_id, object_artifact_id, scanner_name, scanner_version, reason_code, status, checked_at, threat_details \
+     FROM quarantine_records WHERE workspace_id = $1 AND document_version_id = $2 ORDER BY checked_at DESC LIMIT 1";
+
 /// Repository operations for logical Documents.
 pub struct DocumentRepository;
 
@@ -664,6 +667,29 @@ impl QuarantineRecordRepository {
         let row_opt = sqlx::query_as::<_, QuarantineRecordRow>(SELECT_QUARANTINE_RECORD_BY_INTENT)
             .bind(workspace_id.as_uuid())
             .bind(intent_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let rec = record_from_row(&row)
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(rec))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetches the latest quarantine record for a document version.
+    pub async fn get_latest_by_document_version(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        version_id: DocumentVersionId,
+    ) -> Result<Option<QuarantineRecord>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, QuarantineRecordRow>(SELECT_QUARANTINE_RECORD_BY_VERSION)
+            .bind(workspace_id.as_uuid())
+            .bind(version_id.as_uuid())
             .fetch_optional(&mut *tx)
             .await
             .map_err(PersistenceError::Connection)?;

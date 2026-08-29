@@ -32,6 +32,7 @@ pub mod parser_artifacts_row;
 pub mod parser_blocks_row;
 pub mod parser_pages_row;
 pub mod quarantine_records_row;
+pub mod sandbox;
 pub mod scanner;
 pub mod source_spans_row;
 pub mod upload_intents_row;
@@ -47,6 +48,15 @@ pub use parser_artifacts_row::{NewParserArtifactRow, ParserArtifactRow};
 pub use parser_blocks_row::{NewParserBlockRow, ParserBlockRow};
 pub use parser_pages_row::{NewParserPageRow, ParserPageRow};
 pub use quarantine_records_row::{NewQuarantineRecordRow, QuarantineRecordRow};
+pub use sandbox::{
+    FROZEN_MAX_CPU_CORES, FROZEN_MAX_MEMORY_BYTES, FROZEN_MAX_OUTPUT_BYTES, FROZEN_MAX_PIDS,
+    FROZEN_MAX_TMPFS_BYTES, FROZEN_MAX_WALL_CLOCK_SECS, MAX_BOUNDED_BLOCK_COUNT,
+    MAX_BOUNDED_PAGE_COUNT, MAX_BOUNDED_SPAN_COUNT, MAX_EXECUTION_DURATION_MS, MockSandboxBehavior,
+    MockSandboxRunner, NON_ROOT_GID, NON_ROOT_UID, OutputValidationError, ProcessSandboxRunner,
+    SANDBOX_PROTOCOL_VERSION, SandboxCredentialsPolicy, SandboxError, SandboxFilesystemPolicy,
+    SandboxInput, SandboxNetworkPolicy, SandboxOutput, SandboxProcessPolicy,
+    SandboxResourceCeilings, SandboxRunner, SandboxSecurityProfile, SandboxStatus,
+};
 pub use scanner::{
     ClamAvClient, ClamAvConfig, EICAR_TEST_SIGNATURE, EICAR_THREAT_NAME, MalwareScanner,
     MockClamAvScanner, MockScanMode, ScanOutcome, ScanVerdict, ScannerError, SignatureHealth,

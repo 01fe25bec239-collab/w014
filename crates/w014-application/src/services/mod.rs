@@ -6,6 +6,7 @@ pub mod idempotency_service;
 pub mod malware_scan_executor;
 pub mod membership_service;
 pub mod oidc_service;
+pub mod parser_sandbox_executor;
 pub mod session_service;
 pub mod workspace_init;
 
@@ -19,5 +20,6 @@ pub use idempotency_service::IdempotencyCoordinator;
 pub use malware_scan_executor::MalwareScanJobExecutor;
 pub use membership_service::MembershipService;
 pub use oidc_service::OidcPersistenceService;
+pub use parser_sandbox_executor::ParserSandboxJobExecutor;
 pub use session_service::SessionService;
 pub use workspace_init::WorkspaceInitializationService;
