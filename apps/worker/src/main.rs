@@ -10,10 +10,10 @@ use std::process::ExitCode;
 
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use w014_jobs::{
-    DurableJobLoop, DurableJobLoopConfig, ExecutorRegistry, PgJobQueue, WorkerConfig, WorkerId,
-    WorkerRunner,
+    DurableJobLoop, DurableJobLoopConfig, PgJobQueue, WorkerConfig, WorkerId, WorkerRunner,
 };
 use w014_persistence::DatabaseConfig;
+use w014_worker::{build_production_executor_registry, create_default_sandbox_runner};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -74,9 +74,10 @@ async fn main() -> ExitCode {
         }
     };
 
-    // 0201-C and later phases register real scan/parse executors here.
-    // With an empty registry the loop claims nothing and stays truthfully idle.
-    let registry = ExecutorRegistry::new();
+    // Construct the parser sandbox runner and register the authoritative WI-0205
+    // parser executor for ParseDocumentPdf and ParseDocumentDocxOcr.
+    let sandbox_runner = create_default_sandbox_runner();
+    let registry = build_production_executor_registry(pool.clone(), sandbox_runner);
     let loop_runner = DurableJobLoop::new(
         PgJobQueue::new(pool),
         registry,

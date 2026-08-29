@@ -2832,10 +2832,18 @@ version = "0.1.0"
 name = "w014-worker"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "libc",
+ "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+ "w014-application",
+ "w014-authz",
+ "w014-document-processing",
+ "w014-domain",
  "w014-jobs",
  "w014-persistence",
 ]
