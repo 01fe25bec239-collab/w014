@@ -48,6 +48,8 @@ pub struct StoredObjectMetadata {
     pub content_sha256: Sha256,
     pub content_type: String,
     pub etag: Option<String>,
+    #[serde(skip)]
+    pub bytes: Option<Vec<u8>>,
 }
 
 static MOCK_OBJECT_STORAGE: LazyLock<RwLock<HashMap<(String, String), StoredObjectMetadata>>> =
@@ -405,6 +407,7 @@ impl DocumentService {
             content_sha256,
             content_type: content_type.into(),
             etag: Some(format!("\"{}\"", content_sha256.to_hex())),
+            bytes: None,
         };
         let mut store = MOCK_OBJECT_STORAGE.write().expect("storage lock poisoned");
         store.insert((b, k), meta);
@@ -417,8 +420,20 @@ impl DocumentService {
         bytes: &[u8],
         content_type: impl Into<String>,
     ) {
+        let b = bucket.into();
+        let k = key.into();
         let sha256 = Sha256::digest(bytes);
-        Self::stage_mock_upload(bucket, key, bytes.len() as i64, sha256, content_type);
+        let meta = StoredObjectMetadata {
+            bucket: b.clone(),
+            key: k.clone(),
+            byte_length: bytes.len() as i64,
+            content_sha256: sha256,
+            content_type: content_type.into(),
+            etag: Some(format!("\"{}\"", sha256.to_hex())),
+            bytes: Some(bytes.to_vec()),
+        };
+        let mut store = MOCK_OBJECT_STORAGE.write().expect("storage lock poisoned");
+        store.insert((b, k), meta);
     }
 
     /// Clears the mock storage registry.
@@ -434,6 +449,17 @@ impl DocumentService {
     ) -> Result<Option<StoredObjectMetadata>, FinalizeUploadError> {
         let store = MOCK_OBJECT_STORAGE.read().expect("storage lock poisoned");
         Ok(store.get(&(bucket.to_string(), key.to_string())).cloned())
+    }
+
+    /// Performs an authoritative byte retrieval query against the storage provider.
+    pub fn get_object_bytes(
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, FinalizeUploadError> {
+        let store = MOCK_OBJECT_STORAGE.read().expect("storage lock poisoned");
+        Ok(store
+            .get(&(bucket.to_string(), key.to_string()))
+            .and_then(|m| m.bytes.clone()))
     }
 
     /// Atomic UploadFinalize transaction execution (Prompt-16R / WI-0203).

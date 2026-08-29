@@ -32,6 +32,7 @@ pub mod parser_artifacts_row;
 pub mod parser_blocks_row;
 pub mod parser_pages_row;
 pub mod quarantine_records_row;
+pub mod scanner;
 pub mod source_spans_row;
 pub mod upload_intents_row;
 
@@ -46,6 +47,11 @@ pub use parser_artifacts_row::{NewParserArtifactRow, ParserArtifactRow};
 pub use parser_blocks_row::{NewParserBlockRow, ParserBlockRow};
 pub use parser_pages_row::{NewParserPageRow, ParserPageRow};
 pub use quarantine_records_row::{NewQuarantineRecordRow, QuarantineRecordRow};
+pub use scanner::{
+    ClamAvClient, ClamAvConfig, EICAR_TEST_SIGNATURE, EICAR_THREAT_NAME, MalwareScanner,
+    MockClamAvScanner, MockScanMode, ScanOutcome, ScanVerdict, ScannerError, SignatureHealth,
+    SignatureHealthPolicy, SignatureStatus,
+};
 pub use source_spans_row::{NewSourceSpanRow, SourceSpanRow, SpanProvenanceJoin};
 pub use upload_intents_row::{NewUploadIntentRow, UploadIntentRow};
 
