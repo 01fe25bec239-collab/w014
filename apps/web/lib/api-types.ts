@@ -93,3 +93,98 @@ export interface WorkspacePage {
   next_cursor?: string;
   has_more: boolean;
 }
+
+export interface CreateDocumentDto {
+  title: string;
+  document_class: string;
+}
+
+export interface DocumentDto {
+  id: string;
+  workspace_id: string;
+  title: string;
+  document_class: string;
+  status: string;
+  current_version_id?: string;
+  created_by?: string;
+  created_at: string;
+  updated_at: string;
+  row_version: number;
+}
+
+export interface DocumentPage {
+  items: DocumentDto[];
+  next_cursor?: string;
+  has_more: boolean;
+}
+
+export interface DocumentVersionDto {
+  id: string;
+  document_id: string;
+  workspace_id: string;
+  version_number: number;
+  object_artifact_id: string;
+  byte_size: number;
+  sha256_hash: string;
+  content_type: string;
+  original_filename: string;
+  trust_state: string;
+  submitted_by?: string;
+  created_at: string;
+}
+
+export interface DocumentVersionPage {
+  items: DocumentVersionDto[];
+  next_cursor?: string;
+  has_more: boolean;
+}
+
+export interface CreateUploadIntentDto {
+  filename: string;
+  media_type: string;
+  byte_length: number;
+  sha256_b64?: string;
+}
+
+export interface PresignedPutDto {
+  upload_url: string;
+  method: string;
+  expires_at: string;
+  headers: Record<string, string>;
+}
+
+export interface UploadIntentDto {
+  id: string;
+  workspace_id: string;
+  document_id?: string;
+  filename: string;
+  expected_media_type: string;
+  expected_length: number;
+  expected_sha256_b64?: string;
+  opaque_object_key: string;
+  status: string;
+  expires_at: string;
+  created_at: string;
+  presigned_put: PresignedPutDto;
+}
+
+export interface UploadFinalizeDto {
+  upload_intent_id: string;
+  document_id: string;
+  document_version_id: string;
+  version_number: number;
+  object_artifact_id: string;
+  quarantine_record_id: string;
+  scan_job_id: string;
+  status: string;
+  trust_state: string;
+}
+
+export interface DownloadDto {
+  download_url: string;
+  expires_at: string;
+  content_type: string;
+  byte_size: number;
+  sha256_hash: string;
+  original_filename: string;
+}

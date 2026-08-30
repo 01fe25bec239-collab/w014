@@ -314,4 +314,317 @@ describe("apiClient", () => {
       expect(apiErr.problem.detail).toContain("Connection refused");
     }
   });
+
+  it("E16: listDocuments sends GET /api/v1/workspaces/{workspace_id}/documents with cursor and limit", async () => {
+    const mockPage = {
+      items: [
+        {
+          id: "doc_1",
+          workspace_id: "ws_1",
+          title: "Architecture Spec",
+          document_class: "pdf",
+          status: "active",
+          created_at: "2026-08-30T10:00:00Z",
+          updated_at: "2026-08-30T10:00:00Z",
+          row_version: 1,
+        },
+      ],
+      next_cursor: "cur_2",
+      has_more: true,
+    };
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => mockPage,
+    } as unknown as Response);
+
+    const res = await apiClient.listDocuments("ws_1", "cur_1", 20);
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/v1/workspaces/ws_1/documents?cursor=cur_1&limit=20",
+      expect.any(Object)
+    );
+    expect(res).toEqual(mockPage);
+  });
+
+  it("E17: createDocument sends POST /api/v1/workspaces/{workspace_id}/documents with CSRF and Idempotency-Key", async () => {
+    const mockDoc = {
+      id: "doc_1",
+      workspace_id: "ws_1",
+      title: "Requirements Doc",
+      document_class: "docx",
+      status: "active",
+      created_at: "2026-08-30T10:00:00Z",
+      updated_at: "2026-08-30T10:00:00Z",
+      row_version: 1,
+    };
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => mockDoc,
+    } as unknown as Response);
+
+    const res = await apiClient.createDocument(
+      "ws_1",
+      { title: "Requirements Doc", document_class: "docx" },
+      "csrf_token",
+      "idemp_key_1"
+    );
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/v1/workspaces/ws_1/documents",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ title: "Requirements Doc", document_class: "docx" }),
+      })
+    );
+    const headers = vi.mocked(global.fetch).mock.calls[0][1]?.headers as Headers;
+    expect(headers.get("X-W014-CSRF")).toBe("csrf_token");
+    expect(headers.get("Idempotency-Key")).toBe("idemp_key_1");
+    expect(res).toEqual(mockDoc);
+  });
+
+  it("E18: getDocument sends GET /api/v1/workspaces/{workspace_id}/documents/{document_id}", async () => {
+    const mockDoc = {
+      id: "doc_1",
+      workspace_id: "ws_1",
+      title: "System Spec",
+      document_class: "pdf",
+      status: "active",
+      created_at: "2026-08-30T10:00:00Z",
+      updated_at: "2026-08-30T10:00:00Z",
+      row_version: 1,
+    };
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => mockDoc,
+    } as unknown as Response);
+
+    const res = await apiClient.getDocument("ws_1", "doc_1");
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/v1/workspaces/ws_1/documents/doc_1",
+      expect.any(Object)
+    );
+    expect(res).toEqual(mockDoc);
+  });
+
+  it("E19: listDocumentVersions sends GET /api/v1/workspaces/{workspace_id}/documents/{document_id}/versions", async () => {
+    const mockPage = {
+      items: [
+        {
+          id: "ver_1",
+          document_id: "doc_1",
+          workspace_id: "ws_1",
+          version_number: 1,
+          object_artifact_id: "art_1",
+          byte_size: 1024,
+          sha256_hash: "abcd",
+          content_type: "application/pdf",
+          original_filename: "doc.pdf",
+          trust_state: "pending",
+          created_at: "2026-08-30T10:00:00Z",
+        },
+      ],
+      has_more: false,
+    };
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => mockPage,
+    } as unknown as Response);
+
+    const res = await apiClient.listDocumentVersions("ws_1", "doc_1");
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/v1/workspaces/ws_1/documents/doc_1/versions",
+      expect.any(Object)
+    );
+    expect(res).toEqual(mockPage);
+  });
+
+  it("E20: createUploadIntent sends POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/upload-intents", async () => {
+    const mockIntent = {
+      id: "intent_1",
+      workspace_id: "ws_1",
+      document_id: "doc_1",
+      filename: "doc.pdf",
+      expected_media_type: "application/pdf",
+      expected_length: 2048,
+      opaque_object_key: "k1",
+      status: "pending",
+      expires_at: "2026-08-30T10:10:00Z",
+      created_at: "2026-08-30T10:00:00Z",
+      presigned_put: {
+        upload_url: "https://storage.example.com/put",
+        method: "PUT",
+        expires_at: "2026-08-30T10:10:00Z",
+        headers: { "Content-Type": "application/pdf" },
+      },
+    };
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => mockIntent,
+    } as unknown as Response);
+
+    const res = await apiClient.createUploadIntent(
+      "ws_1",
+      "doc_1",
+      { filename: "doc.pdf", media_type: "application/pdf", byte_length: 2048 },
+      "csrf_token",
+      "idemp_intent"
+    );
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/v1/workspaces/ws_1/documents/doc_1/upload-intents",
+      expect.objectContaining({
+        method: "POST",
+      })
+    );
+    expect(res).toEqual(mockIntent);
+  });
+
+  it("E21: finalizeUploadIntent sends POST /api/v1/workspaces/{workspace_id}/upload-intents/{intent_id}/finalize", async () => {
+    const mockFinalize = {
+      upload_intent_id: "intent_1",
+      document_id: "doc_1",
+      document_version_id: "ver_1",
+      version_number: 1,
+      object_artifact_id: "art_1",
+      quarantine_record_id: "q_1",
+      scan_job_id: "job_1",
+      status: "quarantined_processing",
+      trust_state: "pending",
+    };
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: async () => mockFinalize,
+    } as unknown as Response);
+
+    const res = await apiClient.finalizeUploadIntent("ws_1", "intent_1", "csrf_token", "idemp_fin");
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/v1/workspaces/ws_1/upload-intents/intent_1/finalize",
+      expect.objectContaining({
+        method: "POST",
+      })
+    );
+    expect(res).toEqual(mockFinalize);
+  });
+
+  it("E22: getDocumentVersion sends GET /api/v1/workspaces/{workspace_id}/document-versions/{version_id}", async () => {
+    const mockVersion = {
+      id: "ver_1",
+      document_id: "doc_1",
+      workspace_id: "ws_1",
+      version_number: 1,
+      object_artifact_id: "art_1",
+      byte_size: 1024,
+      sha256_hash: "hash123",
+      content_type: "application/pdf",
+      original_filename: "test.pdf",
+      trust_state: "pending",
+      created_at: "2026-08-30T10:00:00Z",
+    };
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => mockVersion,
+    } as unknown as Response);
+
+    const res = await apiClient.getDocumentVersion("ws_1", "ver_1");
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/v1/workspaces/ws_1/document-versions/ver_1",
+      expect.any(Object)
+    );
+    expect(res).toEqual(mockVersion);
+  });
+
+  it("E23: acceptVersion sends POST /api/v1/workspaces/{workspace_id}/document-versions/{version_id}/accept with If-Match", async () => {
+    const mockDoc = {
+      id: "doc_1",
+      workspace_id: "ws_1",
+      title: "System Spec",
+      document_class: "pdf",
+      status: "active",
+      current_version_id: "ver_1",
+      created_at: "2026-08-30T10:00:00Z",
+      updated_at: "2026-08-30T10:05:00Z",
+      row_version: 2,
+    };
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => mockDoc,
+    } as unknown as Response);
+
+    const res = await apiClient.acceptVersion("ws_1", "ver_1", 1, "csrf_token", "idemp_acc");
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/v1/workspaces/ws_1/document-versions/ver_1/accept",
+      expect.objectContaining({
+        method: "POST",
+      })
+    );
+    const headers = vi.mocked(global.fetch).mock.calls[0][1]?.headers as Headers;
+    expect(headers.get("If-Match")).toBe('"1"');
+    expect(headers.get("X-W014-CSRF")).toBe("csrf_token");
+    expect(headers.get("Idempotency-Key")).toBe("idemp_acc");
+    expect(res).toEqual(mockDoc);
+  });
+
+  it("E24: downloadVersion sends POST /api/v1/workspaces/{workspace_id}/document-versions/{version_id}/download", async () => {
+    const mockDownload = {
+      download_url: "https://storage.example.com/get/file.pdf?sig=xyz",
+      expires_at: "2026-08-30T10:05:00Z",
+      content_type: "application/pdf",
+      byte_size: 1024,
+      sha256_hash: "hash_abc",
+      original_filename: "file.pdf",
+    };
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => mockDownload,
+    } as unknown as Response);
+
+    const res = await apiClient.downloadVersion("ws_1", "ver_1", "csrf_token");
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/v1/workspaces/ws_1/document-versions/ver_1/download",
+      expect.objectContaining({
+        method: "POST",
+      })
+    );
+    const headers = vi.mocked(global.fetch).mock.calls[0][1]?.headers as Headers;
+    expect(headers.get("X-W014-CSRF")).toBe("csrf_token");
+    expect(res).toEqual(mockDownload);
+  });
+
+  it("uploadFileToStorage executes direct storage PUT with headers", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+    } as unknown as Response);
+
+    const blob = new Blob(["hello"], { type: "application/pdf" });
+    await apiClient.uploadFileToStorage(
+      "https://s3.example.com/upload",
+      "PUT",
+      { "Content-Type": "application/pdf" },
+      blob
+    );
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      "https://s3.example.com/upload",
+      expect.objectContaining({
+        method: "PUT",
+        body: blob,
+      })
+    );
+  });
 });

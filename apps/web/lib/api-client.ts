@@ -1,12 +1,21 @@
 import type {
+  CreateDocumentDto,
   CreateProgramDto,
+  CreateUploadIntentDto,
   CreateWorkspaceDto,
+  DocumentDto,
+  DocumentPage,
+  DocumentVersionDto,
+  DocumentVersionPage,
+  DownloadDto,
   LoginResponse,
   LogoutResponse,
   ProblemDetails,
   ProgramDto,
   ProgramPage,
   SessionResponse,
+  UploadFinalizeDto,
+  UploadIntentDto,
   WorkspaceDto,
   WorkspacePage,
 } from "./api-types";
@@ -242,5 +251,186 @@ export const apiClient = {
    */
   async getWorkspace(workspaceId: string): Promise<WorkspaceDto> {
     return request<WorkspaceDto>(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}`);
+  },
+
+  /**
+   * E16: GET /api/v1/workspaces/{workspace_id}/documents
+   */
+  async listDocuments(
+    workspaceId: string,
+    cursor?: string,
+    limit?: number
+  ): Promise<DocumentPage> {
+    const params = new URLSearchParams();
+    if (cursor) params.set("cursor", cursor);
+    if (limit !== undefined) params.set("limit", String(limit));
+    const qs = params.toString();
+    return request<DocumentPage>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/documents${qs ? `?${qs}` : ""}`
+    );
+  },
+
+  /**
+   * E17: POST /api/v1/workspaces/{workspace_id}/documents
+   */
+  async createDocument(
+    workspaceId: string,
+    dto: CreateDocumentDto,
+    csrfToken?: string,
+    idempotencyKey?: string
+  ): Promise<DocumentDto> {
+    return request<DocumentDto>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/documents`,
+      {
+        method: "POST",
+        body: JSON.stringify(dto),
+        csrfToken,
+        idempotencyKey,
+      }
+    );
+  },
+
+  /**
+   * E18: GET /api/v1/workspaces/{workspace_id}/documents/{document_id}
+   */
+  async getDocument(
+    workspaceId: string,
+    documentId: string
+  ): Promise<DocumentDto> {
+    return request<DocumentDto>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/documents/${encodeURIComponent(documentId)}`
+    );
+  },
+
+  /**
+   * E19: GET /api/v1/workspaces/{workspace_id}/documents/{document_id}/versions
+   */
+  async listDocumentVersions(
+    workspaceId: string,
+    documentId: string,
+    cursor?: string,
+    limit?: number
+  ): Promise<DocumentVersionPage> {
+    const params = new URLSearchParams();
+    if (cursor) params.set("cursor", cursor);
+    if (limit !== undefined) params.set("limit", String(limit));
+    const qs = params.toString();
+    return request<DocumentVersionPage>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/documents/${encodeURIComponent(documentId)}/versions${qs ? `?${qs}` : ""}`
+    );
+  },
+
+  /**
+   * E20: POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/upload-intents
+   */
+  async createUploadIntent(
+    workspaceId: string,
+    documentId: string,
+    dto: CreateUploadIntentDto,
+    csrfToken?: string,
+    idempotencyKey?: string
+  ): Promise<UploadIntentDto> {
+    return request<UploadIntentDto>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/documents/${encodeURIComponent(documentId)}/upload-intents`,
+      {
+        method: "POST",
+        body: JSON.stringify(dto),
+        csrfToken,
+        idempotencyKey,
+      }
+    );
+  },
+
+  /**
+   * E21: POST /api/v1/workspaces/{workspace_id}/upload-intents/{intent_id}/finalize
+   */
+  async finalizeUploadIntent(
+    workspaceId: string,
+    intentId: string,
+    csrfToken?: string,
+    idempotencyKey?: string
+  ): Promise<UploadFinalizeDto> {
+    return request<UploadFinalizeDto>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/upload-intents/${encodeURIComponent(intentId)}/finalize`,
+      {
+        method: "POST",
+        csrfToken,
+        idempotencyKey,
+      }
+    );
+  },
+
+  /**
+   * E22: GET /api/v1/workspaces/{workspace_id}/document-versions/{version_id}
+   */
+  async getDocumentVersion(
+    workspaceId: string,
+    versionId: string
+  ): Promise<DocumentVersionDto> {
+    return request<DocumentVersionDto>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/document-versions/${encodeURIComponent(versionId)}`
+    );
+  },
+
+  /**
+   * E23: POST /api/v1/workspaces/{workspace_id}/document-versions/{version_id}/accept
+   */
+  async acceptVersion(
+    workspaceId: string,
+    versionId: string,
+    rowVersion: number,
+    csrfToken?: string,
+    idempotencyKey?: string
+  ): Promise<DocumentDto> {
+    const headers: Record<string, string> = {
+      "If-Match": `"${rowVersion}"`,
+    };
+    return request<DocumentDto>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/document-versions/${encodeURIComponent(versionId)}/accept`,
+      {
+        method: "POST",
+        headers,
+        csrfToken,
+        idempotencyKey,
+      }
+    );
+  },
+
+  /**
+   * E24: POST /api/v1/workspaces/{workspace_id}/document-versions/{version_id}/download
+   */
+  async downloadVersion(
+    workspaceId: string,
+    versionId: string,
+    csrfToken?: string
+  ): Promise<DownloadDto> {
+    return request<DownloadDto>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/document-versions/${encodeURIComponent(versionId)}/download`,
+      {
+        method: "POST",
+        csrfToken,
+      }
+    );
+  },
+
+  /**
+   * Helper for direct object-storage bytes upload using presigned contract.
+   * Client-side byte transfer only. Does NOT imply document trust.
+   */
+  async uploadFileToStorage(
+    uploadUrl: string,
+    method: string,
+    headers: Record<string, string>,
+    body: BodyInit | Blob | File | ArrayBuffer
+  ): Promise<void> {
+    const reqHeaders = new Headers(headers);
+    const response = await fetch(uploadUrl, {
+      method: method || "PUT",
+      headers: reqHeaders,
+      body,
+    });
+    if (!response.ok) {
+      throw new Error(`Direct storage upload failed with HTTP status ${response.status}`);
+    }
   },
 };
