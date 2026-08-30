@@ -21,18 +21,35 @@ use w014_document_processing::scanner::{
     SignatureStatus, sanitize_threat_name,
 };
 
-/// Helper to spin up a mock TCP clamd server responding with custom payloads.
+/// Helper to spin up a mock TCP clamd server responding with custom payloads and default fresh version.
 async fn spawn_mock_clamd_server<F>(handler: F) -> (String, u16, tokio::task::JoinHandle<()>)
+where
+    F: Fn(Vec<u8>) -> (Option<Vec<u8>>, Vec<u8>) + Send + Sync + 'static,
+{
+    let fresh_date = (Utc::now() - ChronoDuration::hours(1))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_resp = format!("ClamAV 1.3.0/27200/{fresh_date}\0").into_bytes();
+    spawn_mock_clamd_server_with_version(version_resp, handler).await
+}
+
+/// Helper to spin up a mock TCP clamd server responding with a specific custom VERSION response.
+async fn spawn_mock_clamd_server_with_version<F>(
+    version_response_bytes: Vec<u8>,
+    handler: F,
+) -> (String, u16, tokio::task::JoinHandle<()>)
 where
     F: Fn(Vec<u8>) -> (Option<Vec<u8>>, Vec<u8>) + Send + Sync + 'static,
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let handler = std::sync::Arc::new(handler);
+    let version_bytes = std::sync::Arc::new(version_response_bytes);
 
     let handle = tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
             let handler = handler.clone();
+            let v_bytes = version_bytes.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut temp = [0u8; 1024];
@@ -46,9 +63,7 @@ where
 
                     // Check if command is VERSION or INSTREAM complete
                     if buf.starts_with(b"zVERSION") || buf.starts_with(b"nVERSION") {
-                        let _ = socket
-                            .write_all(b"ClamAV 1.3.0/27200/Mon Aug 29 12:00:00 2026\0")
-                            .await;
+                        let _ = socket.write_all(&v_bytes).await;
                         let _ = socket.flush().await;
                         break;
                     }
@@ -80,8 +95,7 @@ async fn test_clamav_instream_wire_protocol_clean() {
     .await;
 
     let config = ClamAvConfig::new(host, port);
-    let now = Utc::now();
-    let client = ClamAvClient::new(config).with_signature_timestamp(now);
+    let client = ClamAvClient::new(config);
 
     let test_bytes = b"%PDF-1.7 harmless sample document content for clean scan verification";
     let outcome = client.scan(test_bytes).await.expect("scan must succeed");
@@ -110,8 +124,7 @@ async fn test_clamav_instream_wire_protocol_eicar_malware_detection() {
     .await;
 
     let config = ClamAvConfig::new(host, port);
-    let now = Utc::now();
-    let client = ClamAvClient::new(config).with_signature_timestamp(now);
+    let client = ClamAvClient::new(config);
 
     let outcome = client
         .scan(EICAR_TEST_SIGNATURE)
@@ -155,8 +168,7 @@ async fn test_clamav_instream_chunking_and_framing() {
 
     let mut config = ClamAvConfig::new(host, port);
     config.chunk_size = 32 * 1024; // 32 KiB chunks
-    let now = Utc::now();
-    let client = ClamAvClient::new(config).with_signature_timestamp(now);
+    let client = ClamAvClient::new(config);
 
     let payload = vec![0x41u8; 150_000]; // 150 KB payload spanning multiple chunks
     let outcome = client
@@ -172,8 +184,7 @@ async fn test_clamav_instream_error_response_fails_closed() {
         spawn_mock_clamd_server(|_| (None, b"stream: size limit exceeded ERROR\0".to_vec())).await;
 
     let config = ClamAvConfig::new(host, port);
-    let now = Utc::now();
-    let client = ClamAvClient::new(config).with_signature_timestamp(now);
+    let client = ClamAvClient::new(config);
 
     let res = client.scan(b"test").await;
     assert!(res.is_err());
@@ -186,8 +197,7 @@ async fn test_clamav_instream_malformed_response_never_clean() {
         spawn_mock_clamd_server(|_| (None, b"UNEXPECTED GARBAGE RESPONSE\0".to_vec())).await;
 
     let config = ClamAvConfig::new(host, port);
-    let now = Utc::now();
-    let client = ClamAvClient::new(config).with_signature_timestamp(now);
+    let client = ClamAvClient::new(config);
 
     let res = client.scan(b"test").await;
     assert!(res.is_err());
@@ -213,8 +223,7 @@ async fn test_clamav_instream_timeout_enforced_120s() {
 
     let mut config = ClamAvConfig::new("127.0.0.1", port);
     config.timeout = Duration::from_millis(100); // Test timeout with short duration
-    let now = Utc::now();
-    let client = ClamAvClient::new(config).with_signature_timestamp(now);
+    let client = ClamAvClient::new(config).with_signature_timestamp(Utc::now());
 
     let res = client.scan(b"test").await;
     assert!(res.is_err());
@@ -255,6 +264,224 @@ async fn test_clamav_degraded_signatures_observable() {
     assert_eq!(outcome.signature_health.status, SignatureStatus::Degraded);
     assert!(outcome.signature_health.is_degraded());
     assert!(outcome.signature_health.is_acceptable());
+}
+
+#[tokio::test]
+async fn test_production_version_response_valid_fresh_timestamp_healthy() {
+    let fresh_date = (Utc::now() - ChronoDuration::hours(2))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{fresh_date}\0").into_bytes();
+
+    let (host, port, _server) =
+        spawn_mock_clamd_server_with_version(version_bytes, |_| (None, b"stream: OK\0".to_vec()))
+            .await;
+
+    let config = ClamAvConfig::new(host, port);
+    let client = ClamAvClient::new(config);
+
+    let health = client.check_signatures().await.unwrap();
+    assert_eq!(health.status, SignatureStatus::Healthy);
+    assert!(health.is_healthy());
+    assert!(health.is_acceptable());
+
+    let scan_res = client.scan(b"sample bytes").await.unwrap();
+    assert_eq!(scan_res.verdict, ScanVerdict::Clean);
+    assert!(scan_res.signature_health.is_healthy());
+}
+
+#[tokio::test]
+async fn test_production_version_response_valid_degraded_timestamp_degraded() {
+    let degraded_date = (Utc::now() - ChronoDuration::hours(12))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{degraded_date}\0").into_bytes();
+
+    let (host, port, _server) =
+        spawn_mock_clamd_server_with_version(version_bytes, |_| (None, b"stream: OK\0".to_vec()))
+            .await;
+
+    let config = ClamAvConfig::new(host, port);
+    let client = ClamAvClient::new(config);
+
+    let health = client.check_signatures().await.unwrap();
+    assert_eq!(health.status, SignatureStatus::Degraded);
+    assert!(health.is_degraded());
+    assert!(health.is_acceptable());
+
+    let scan_res = client.scan(b"sample bytes").await.unwrap();
+    assert_eq!(scan_res.verdict, ScanVerdict::Clean);
+    assert_eq!(scan_res.signature_health.status, SignatureStatus::Degraded);
+}
+
+#[tokio::test]
+async fn test_production_version_response_valid_gt_24h_timestamp_unhealthy() {
+    let stale_date = (Utc::now() - ChronoDuration::hours(28))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{stale_date}\0").into_bytes();
+
+    let (host, port, _server) =
+        spawn_mock_clamd_server_with_version(version_bytes, |_| (None, b"stream: OK\0".to_vec()))
+            .await;
+
+    let config = ClamAvConfig::new(host, port);
+    let client = ClamAvClient::new(config);
+
+    let health = client.check_signatures().await.unwrap();
+    assert_eq!(health.status, SignatureStatus::Unhealthy);
+    assert!(health.is_unhealthy());
+    assert!(!health.is_acceptable());
+
+    let scan_res = client.scan(b"sample bytes").await;
+    assert!(scan_res.is_err());
+    assert!(matches!(
+        scan_res.unwrap_err(),
+        ScannerError::UnhealthySignature(_)
+    ));
+}
+
+#[tokio::test]
+async fn test_production_version_response_missing_timestamp_fails_closed() {
+    let version_bytes = b"ClamAV 1.3.0/27200\0".to_vec();
+
+    let (host, port, _server) =
+        spawn_mock_clamd_server_with_version(version_bytes, |_| (None, b"stream: OK\0".to_vec()))
+            .await;
+
+    let config = ClamAvConfig::new(host, port);
+    let client = ClamAvClient::new(config);
+
+    let health_res = client.check_signatures().await;
+    assert!(health_res.is_err());
+    assert!(matches!(health_res.unwrap_err(), ScannerError::Protocol(_)));
+
+    let scan_res = client.scan(b"sample bytes").await;
+    assert!(scan_res.is_err());
+    assert!(matches!(scan_res.unwrap_err(), ScannerError::Protocol(_)));
+}
+
+#[tokio::test]
+async fn test_production_version_response_unparseable_timestamp_fails_closed() {
+    let version_bytes = b"ClamAV 1.3.0/27200/INVALID_DATE_STRING\0".to_vec();
+
+    let (host, port, _server) =
+        spawn_mock_clamd_server_with_version(version_bytes, |_| (None, b"stream: OK\0".to_vec()))
+            .await;
+
+    let config = ClamAvConfig::new(host, port);
+    let client = ClamAvClient::new(config);
+
+    let health_res = client.check_signatures().await;
+    assert!(health_res.is_err());
+    assert!(matches!(health_res.unwrap_err(), ScannerError::Protocol(_)));
+
+    let scan_res = client.scan(b"sample bytes").await;
+    assert!(scan_res.is_err());
+    assert!(matches!(scan_res.unwrap_err(), ScannerError::Protocol(_)));
+}
+
+#[tokio::test]
+async fn test_production_version_response_malformed_fails_closed() {
+    let version_bytes = b"ClamAV 1.3.0/27200/ \0".to_vec();
+
+    let (host, port, _server) =
+        spawn_mock_clamd_server_with_version(version_bytes, |_| (None, b"stream: OK\0".to_vec()))
+            .await;
+
+    let config = ClamAvConfig::new(host, port);
+    let client = ClamAvClient::new(config);
+
+    let health_res = client.check_signatures().await;
+    assert!(health_res.is_err());
+    assert!(matches!(health_res.unwrap_err(), ScannerError::Protocol(_)));
+
+    let scan_res = client.scan(b"sample bytes").await;
+    assert!(scan_res.is_err());
+    assert!(matches!(scan_res.unwrap_err(), ScannerError::Protocol(_)));
+}
+
+#[tokio::test]
+async fn test_production_version_response_unknown_format_fails_closed() {
+    let version_bytes = b"UNKNOWN SERVER ERROR OR PONG\0".to_vec();
+
+    let (host, port, _server) =
+        spawn_mock_clamd_server_with_version(version_bytes, |_| (None, b"stream: OK\0".to_vec()))
+            .await;
+
+    let config = ClamAvConfig::new(host, port);
+    let client = ClamAvClient::new(config);
+
+    let health_res = client.check_signatures().await;
+    assert!(health_res.is_err());
+    assert!(matches!(health_res.unwrap_err(), ScannerError::Protocol(_)));
+
+    let scan_res = client.scan(b"sample bytes").await;
+    assert!(scan_res.is_err());
+    assert!(matches!(scan_res.unwrap_err(), ScannerError::Protocol(_)));
+}
+
+#[tokio::test]
+async fn test_clean_scan_plus_missing_timestamp_rejected() {
+    // Daemon returns Clean on scan, but VERSION response has missing timestamp
+    let version_bytes = b"ClamAV 1.3.0\0".to_vec();
+
+    let (host, port, _server) =
+        spawn_mock_clamd_server_with_version(version_bytes, |_| (None, b"stream: OK\0".to_vec()))
+            .await;
+
+    let config = ClamAvConfig::new(host, port);
+    let client = ClamAvClient::new(config);
+
+    let scan_res = client.scan(b"%PDF-1.7 clean bytes").await;
+    assert!(scan_res.is_err());
+    assert!(
+        matches!(scan_res.unwrap_err(), ScannerError::Protocol(_)),
+        "Clean scan with missing version timestamp must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn test_clean_scan_plus_malformed_timestamp_rejected() {
+    // Daemon returns Clean on scan, but VERSION response has malformed timestamp
+    let version_bytes = b"ClamAV 1.3.0/27200/NOT_A_REAL_TIMESTAMP\0".to_vec();
+
+    let (host, port, _server) =
+        spawn_mock_clamd_server_with_version(version_bytes, |_| (None, b"stream: OK\0".to_vec()))
+            .await;
+
+    let config = ClamAvConfig::new(host, port);
+    let client = ClamAvClient::new(config);
+
+    let scan_res = client.scan(b"%PDF-1.7 clean bytes").await;
+    assert!(scan_res.is_err());
+    assert!(
+        matches!(scan_res.unwrap_err(), ScannerError::Protocol(_)),
+        "Clean scan with malformed version timestamp must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn test_clean_scan_plus_unhealthy_timestamp_rejected() {
+    // Daemon returns Clean on scan, but VERSION response has >24h timestamp
+    let stale_date = (Utc::now() - ChronoDuration::hours(30))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{stale_date}\0").into_bytes();
+
+    let (host, port, _server) =
+        spawn_mock_clamd_server_with_version(version_bytes, |_| (None, b"stream: OK\0".to_vec()))
+            .await;
+
+    let config = ClamAvConfig::new(host, port);
+    let client = ClamAvClient::new(config);
+
+    let scan_res = client.scan(b"%PDF-1.7 clean bytes").await;
+    assert!(scan_res.is_err());
+    assert!(
+        matches!(scan_res.unwrap_err(), ScannerError::UnhealthySignature(_)),
+        "Clean scan with unhealthy version timestamp must fail closed"
+    );
 }
 
 #[test]

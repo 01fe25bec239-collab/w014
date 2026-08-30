@@ -27,6 +27,17 @@ use crate::scanner::verdict::{ScanOutcome, ScanVerdict, ScannerError};
 /// Default scanner identity.
 pub const SCANNER_NAME_CLAMAV: &str = "clamav";
 
+/// Parsed information from an authoritative ClamAV VERSION response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClamAvVersionInfo {
+    /// Scanner engine version (e.g. "ClamAV 1.3.0").
+    pub version: String,
+    /// Signature database version/patch (e.g. "27200").
+    pub signature_version: Option<String>,
+    /// Authoritative parsed signature timestamp.
+    pub signature_timestamp: DateTime<Utc>,
+}
+
 /// Real ClamAV clamd INSTREAM client.
 #[derive(Debug, Clone)]
 pub struct ClamAvClient {
@@ -67,7 +78,7 @@ impl ClamAvClient {
     }
 
     /// Queries clamd for version and signature timestamp information.
-    async fn query_version_raw(&self) -> Result<(String, Option<DateTime<Utc>>), ScannerError> {
+    pub async fn query_version_raw(&self) -> Result<ClamAvVersionInfo, ScannerError> {
         let fut = async {
             let mut stream = self.connect().await?;
 
@@ -88,36 +99,72 @@ impl ClamAvClient {
                 .trim_matches(|c| c == '\0' || c == '\r' || c == '\n')
                 .to_string();
 
-            if raw.is_empty() {
-                return Err(ScannerError::Protocol(
-                    "Empty VERSION response from ClamAV".to_string(),
-                ));
-            }
-
-            // Standard ClamAV response format: "ClamAV 1.3.0/27200/Mon Aug 29 12:00:00 2026"
-            let parts: Vec<&str> = raw.split('/').collect();
-            let version_str = parts.first().unwrap_or(&raw.as_str()).trim().to_string();
-
-            let parsed_date = if parts.len() >= 3 {
-                let date_str = parts[2].trim();
-                DateTime::parse_from_rfc2822(date_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .or_else(|_| {
-                        DateTime::parse_from_str(date_str, "%a %b %d %H:%M:%S %Y")
-                            .map(|dt| dt.with_timezone(&Utc))
-                    })
-                    .ok()
-            } else {
-                None
-            };
-
-            Ok((version_str, parsed_date))
+            Self::parse_clamav_version_response(&raw)
         };
 
         match timeout(self.config.timeout, fut).await {
             Ok(res) => res,
             Err(_) => Err(ScannerError::Timeout(self.config.timeout.as_secs())),
         }
+    }
+
+    /// Parses the raw clamd VERSION response string fail-closed.
+    ///
+    /// Distinguishes:
+    /// - VALID_PARSED_SIGNATURE_TIMESTAMP: produces `Ok(ClamAvVersionInfo)`
+    /// - MISSING_SIGNATURE_TIMESTAMP: fails closed with `ScannerError::Protocol`
+    /// - MALFORMED_SIGNATURE_TIMESTAMP: fails closed with `ScannerError::Protocol`
+    /// - UNRECOGNIZED_VERSION_RESPONSE: fails closed with `ScannerError::Protocol`
+    pub fn parse_clamav_version_response(raw: &str) -> Result<ClamAvVersionInfo, ScannerError> {
+        let trimmed =
+            raw.trim_matches(|c: char| c.is_whitespace() || c == '\0' || c == '\r' || c == '\n');
+        if trimmed.is_empty() {
+            return Err(ScannerError::Protocol(
+                "Empty VERSION response from ClamAV".to_string(),
+            ));
+        }
+
+        // Standard ClamAV response format: "ClamAV 1.3.0/27200/Mon Aug 29 12:00:00 2026"
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        if parts.len() < 3 {
+            if parts.len() == 1 && !trimmed.starts_with("ClamAV") {
+                return Err(ScannerError::Protocol(format!(
+                    "Unrecognized ClamAV VERSION response format: '{trimmed}'"
+                )));
+            }
+            return Err(ScannerError::Protocol(format!(
+                "Missing signature timestamp in ClamAV VERSION response: '{trimmed}'"
+            )));
+        }
+
+        let version_str = parts[0].trim();
+        if version_str.is_empty() {
+            return Err(ScannerError::Protocol(format!(
+                "Missing scanner engine version in ClamAV VERSION response: '{trimmed}'"
+            )));
+        }
+
+        let sig_version_str = parts[1].trim();
+        let sig_version = if sig_version_str.is_empty() {
+            None
+        } else {
+            Some(sig_version_str.to_string())
+        };
+
+        let date_str = parts[2..].join("/").trim().to_string();
+        if date_str.is_empty() {
+            return Err(ScannerError::Protocol(format!(
+                "Missing signature timestamp in ClamAV VERSION response: '{trimmed}'"
+            )));
+        }
+
+        let parsed_date = parse_clamav_date(&date_str)?;
+
+        Ok(ClamAvVersionInfo {
+            version: version_str.to_string(),
+            signature_version: sig_version,
+            signature_timestamp: parsed_date,
+        })
     }
 
     /// Performs the INSTREAM scanning protocol over a connected TCP stream.
@@ -221,6 +268,83 @@ impl ClamAvClient {
     }
 }
 
+/// Parses ClamAV signature date strings across known standard formats.
+///
+/// Supports:
+/// - RFC 2822 (e.g. "Mon, 29 Aug 2026 12:00:00 +0000")
+/// - RFC 3339 / ISO 8601 (e.g. "2026-08-29T12:00:00Z")
+/// - ctime format with timezone offset (e.g. "Mon Aug 29 12:00:00 2026 +0000")
+/// - Standard ClamAV ctime format without timezone (assumed UTC):
+///   e.g. "Mon Aug 29 12:00:00 2026", "Sun Aug  9 12:00:00 2026", "Sun Aug 09 12:00:00 2026"
+pub fn parse_clamav_date(date_str: &str) -> Result<DateTime<Utc>, ScannerError> {
+    let trimmed = date_str.trim();
+    if trimmed.is_empty() {
+        return Err(ScannerError::Protocol(
+            "Empty signature date in ClamAV VERSION response".to_string(),
+        ));
+    }
+
+    // 1. RFC 2822
+    if let Ok(dt) = DateTime::parse_from_rfc2822(trimmed) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+
+    // 2. RFC 3339 / ISO 8601
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+
+    // 3. ctime format with timezone: "%a %b %e %H:%M:%S %Y %z" or "%a %b %d %H:%M:%S %Y %z"
+    if let Ok(dt) = DateTime::parse_from_str(trimmed, "%a %b %e %H:%M:%S %Y %z") {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = DateTime::parse_from_str(trimmed, "%a %b %d %H:%M:%S %Y %z") {
+        return Ok(dt.with_timezone(&Utc));
+    }
+
+    // 4. Standard ClamAV ctime format without timezone (assumed UTC):
+    for fmt in &[
+        "%a %b %e %H:%M:%S %Y",
+        "%a %b %d %H:%M:%S %Y",
+        "%a %b %_d %H:%M:%S %Y",
+        "%a %b %e %T %Y",
+        "%a %b %d %T %Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%b %e %H:%M:%S %Y",
+        "%b %d %H:%M:%S %Y",
+        "%b %_d %H:%M:%S %Y",
+    ] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(trimmed, fmt) {
+            return Ok(naive.and_utc());
+        }
+    }
+
+    // 5. If string starts with a weekday prefix (e.g. "Mon, " or "Mon "), strip and try parsing rest:
+    if let Some((_weekday, rest)) = trimmed.split_once(' ') {
+        let rest = rest.trim_start_matches(',').trim();
+        if let Ok(dt) = DateTime::parse_from_rfc2822(rest) {
+            return Ok(dt.with_timezone(&Utc));
+        }
+        for fmt in &[
+            "%b %e %H:%M:%S %Y",
+            "%b %d %H:%M:%S %Y",
+            "%b %_d %H:%M:%S %Y",
+            "%b %e %T %Y",
+            "%b %d %T %Y",
+            "%d %b %Y %H:%M:%S",
+            "%e %b %Y %H:%M:%S",
+        ] {
+            if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(rest, fmt) {
+                return Ok(naive.and_utc());
+            }
+        }
+    }
+
+    Err(ScannerError::Protocol(format!(
+        "Malformed or unparseable signature timestamp in ClamAV VERSION response: '{trimmed}'"
+    )))
+}
+
 /// Sanitizes and bounds threat names to prevent hostile control codes or over-bound strings.
 #[must_use]
 pub fn sanitize_threat_name(raw: &str) -> String {
@@ -242,17 +366,25 @@ pub fn sanitize_threat_name(raw: &str) -> String {
 impl MalwareScanner for ClamAvClient {
     async fn check_signatures(&self) -> Result<SignatureHealth, ScannerError> {
         let now = Utc::now();
-        let (version, parsed_date) = self.query_version_raw().await?;
 
-        let sig_timestamp = self
-            .signature_timestamp_override
-            .or(parsed_date)
-            .unwrap_or(now); // If no timestamp in string and no override, evaluate against current time
+        if let Some(override_ts) = self.signature_timestamp_override {
+            let version_str = match self.query_version_raw().await {
+                Ok(info) => Some(info.version),
+                Err(_) => None,
+            };
+            return Ok(SignatureHealthPolicy::evaluate(
+                override_ts,
+                now,
+                version_str,
+            ));
+        }
+
+        let version_info = self.query_version_raw().await?;
 
         Ok(SignatureHealthPolicy::evaluate(
-            sig_timestamp,
+            version_info.signature_timestamp,
             now,
-            Some(version),
+            Some(version_info.version),
         ))
     }
 
@@ -350,6 +482,75 @@ mod tests {
         assert!(ClamAvClient::parse_clamav_response("UNKNOWN COMMAND").is_err());
         assert!(ClamAvClient::parse_clamav_response("").is_err());
         assert!(ClamAvClient::parse_clamav_response("stream: ").is_err());
+    }
+
+    #[test]
+    fn test_parse_clamav_version_response_valid() {
+        let res = ClamAvClient::parse_clamav_version_response(
+            "ClamAV 1.3.0/27200/Sat Aug 29 12:00:00 2026\0",
+        )
+        .unwrap();
+        assert_eq!(res.version, "ClamAV 1.3.0");
+        assert_eq!(res.signature_version.as_deref(), Some("27200"));
+        assert_eq!(
+            res.signature_timestamp,
+            DateTime::parse_from_rfc3339("2026-08-29T12:00:00Z").unwrap()
+        );
+
+        // Single digit day with space padding
+        let res2 = ClamAvClient::parse_clamav_version_response(
+            "ClamAV 1.3.0/27200/Sun Aug  9 12:00:00 2026",
+        )
+        .unwrap();
+        assert_eq!(
+            res2.signature_timestamp,
+            DateTime::parse_from_rfc3339("2026-08-09T12:00:00Z").unwrap()
+        );
+
+        // RFC 2822 format
+        let res3 = ClamAvClient::parse_clamav_version_response(
+            "ClamAV 1.3.0/27200/Sat, 29 Aug 2026 12:00:00 +0000",
+        )
+        .unwrap();
+        assert_eq!(
+            res3.signature_timestamp,
+            DateTime::parse_from_rfc3339("2026-08-29T12:00:00Z").unwrap()
+        );
+
+        // RFC 3339 format
+        let res4 =
+            ClamAvClient::parse_clamav_version_response("ClamAV 1.3.0/27200/2026-08-29T12:00:00Z")
+                .unwrap();
+        assert_eq!(
+            res4.signature_timestamp,
+            DateTime::parse_from_rfc3339("2026-08-29T12:00:00Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parse_clamav_version_response_missing_timestamp_fail_closed() {
+        assert!(ClamAvClient::parse_clamav_version_response("ClamAV 1.3.0").is_err());
+        assert!(ClamAvClient::parse_clamav_version_response("ClamAV 1.3.0/27200").is_err());
+        assert!(ClamAvClient::parse_clamav_version_response("ClamAV 1.3.0/27200/").is_err());
+        assert!(ClamAvClient::parse_clamav_version_response("ClamAV 1.3.0/27200/   ").is_err());
+    }
+
+    #[test]
+    fn test_parse_clamav_version_response_malformed_timestamp_fail_closed() {
+        assert!(
+            ClamAvClient::parse_clamav_version_response("ClamAV 1.3.0/27200/NOT_A_DATE").is_err()
+        );
+        assert!(
+            ClamAvClient::parse_clamav_version_response("ClamAV 1.3.0/27200/99-99-9999").is_err()
+        );
+    }
+
+    #[test]
+    fn test_parse_clamav_version_response_unrecognized_fail_closed() {
+        assert!(ClamAvClient::parse_clamav_version_response("").is_err());
+        assert!(ClamAvClient::parse_clamav_version_response("UNKNOWN COMMAND").is_err());
+        assert!(ClamAvClient::parse_clamav_version_response("PONG").is_err());
+        assert!(ClamAvClient::parse_clamav_version_response("ERROR: daemon busy").is_err());
     }
 
     #[test]

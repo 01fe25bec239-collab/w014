@@ -15,7 +15,9 @@ pub mod signature;
 pub mod traits;
 pub mod verdict;
 
-pub use client::{ClamAvClient, SCANNER_NAME_CLAMAV, sanitize_threat_name};
+pub use client::{
+    ClamAvClient, ClamAvVersionInfo, SCANNER_NAME_CLAMAV, parse_clamav_date, sanitize_threat_name,
+};
 pub use config::{
     ClamAvConfig, DEFAULT_CHUNK_SIZE, DEFAULT_CLAMAV_HOST, DEFAULT_CLAMAV_PORT,
     DEFAULT_SCAN_TIMEOUT_SECS, MAX_SCAN_OBJECT_BYTES,

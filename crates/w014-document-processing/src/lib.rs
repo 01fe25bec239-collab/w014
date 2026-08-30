@@ -91,9 +91,9 @@ pub use sandbox::{
     SandboxStatus,
 };
 pub use scanner::{
-    ClamAvClient, ClamAvConfig, EICAR_TEST_SIGNATURE, EICAR_THREAT_NAME, MalwareScanner,
-    MockClamAvScanner, MockScanMode, ScanOutcome, ScanVerdict, ScannerError, SignatureHealth,
-    SignatureHealthPolicy, SignatureStatus,
+    ClamAvClient, ClamAvConfig, ClamAvVersionInfo, EICAR_TEST_SIGNATURE, EICAR_THREAT_NAME,
+    MalwareScanner, MockClamAvScanner, MockScanMode, ScanOutcome, ScanVerdict, ScannerError,
+    SignatureHealth, SignatureHealthPolicy, SignatureStatus,
 };
 pub use source_spans_row::{NewSourceSpanRow, SourceSpanRow, SpanProvenanceJoin};
 pub use upload_intents_row::{NewUploadIntentRow, UploadIntentRow};
