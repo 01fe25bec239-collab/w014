@@ -26,8 +26,12 @@ pub mod conventions;
 pub mod document_version_metadata_row;
 pub mod document_versions_row;
 pub mod documents_row;
+pub mod docx;
+pub mod docx_producer;
 pub mod error;
+pub mod normalization;
 pub mod object_artifacts_row;
+pub mod ocr;
 pub mod parser;
 pub mod parser_artifacts_row;
 pub mod parser_blocks_row;
@@ -37,6 +41,27 @@ pub mod sandbox;
 pub mod scanner;
 pub mod source_spans_row;
 pub mod upload_intents_row;
+
+pub use docx::{
+    DocxError, DocxMediaItem, DocxPackage, DocxParser, MAX_AGGREGATE_COMPRESSION_RATIO,
+    MAX_PART_SIZE, MAX_PER_ENTRY_COMPRESSION_RATIO, MAX_TOTAL_EXPANDED_BYTES, MAX_XML_PART_SIZE,
+    MAX_ZIP_ENTRY_COUNT, ParsedDocxBlock, ParsedDocxDocument, ParsedDocxPage,
+};
+pub use docx_producer::{
+    DOCX_LOCATOR_VERSION, DOCX_PARSER_NAME, DOCX_PARSER_VERSION, DocxOcrProducer, DocxParseOutput,
+};
+pub use normalization::{
+    AnomalyKind, TextAnomaly, inspect_text, is_bidi_control, is_control_character, is_zero_width,
+    normalize_nfc,
+};
+pub use ocr::{
+    ConflictEvaluationResult, CriticalToken, CriticalTokenType, ImageDimensions,
+    LOW_TEXT_CHAR_THRESHOLD, MAX_JOB_WALL_CLOCK_SECS, MAX_NATIVE_OCR_EDIT_DISTANCE_RATIO,
+    MAX_OCR_PAGES, MAX_PAGE_DURATION_SECS, MAX_RASTER_PIXELS, MockOcrBehavior, MockTesseractEngine,
+    OcrEngine, OcrError, OcrPageOutput, OcrPolicyConfig, ProcessTesseractEngine,
+    ReviewIntegritySignal, SpanProvenanceFactory, TARGET_DPI, evaluate_native_vs_ocr,
+    extract_critical_tokens, inspect_and_validate_raster, levenshtein_distance,
+};
 
 pub use document_version_metadata_row::{
     DocumentVersionMetadataRow, NewDocumentVersionMetadataRow,
