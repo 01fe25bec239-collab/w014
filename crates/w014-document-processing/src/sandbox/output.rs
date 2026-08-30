@@ -68,7 +68,7 @@ impl SandboxStatus {
 }
 
 /// Typed, bounded output produced by the parser sandbox.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SandboxOutput {
     /// Protocol contract version (must match `SANDBOX_PROTOCOL_VERSION`).
     pub protocol_version: String,
@@ -100,6 +100,9 @@ pub struct SandboxOutput {
     pub failure_code: Option<String>,
     /// Diagnostic failure detail when status is not Success.
     pub failure_detail: Option<String>,
+    /// Canonical parsed artifact data containing pages, blocks, spans, and metrics.
+    #[serde(default)]
+    pub parsed_artifact: Option<crate::parser::artifact::ParserArtifactData>,
 }
 
 /// Errors occurring during worker-side output validation.

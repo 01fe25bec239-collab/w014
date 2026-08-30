@@ -175,6 +175,7 @@ impl SandboxRunner for MockSandboxRunner {
                     execution_duration_ms: 42,
                     failure_code: None,
                     failure_detail: None,
+                    parsed_artifact: None,
                 };
                 output
                     .validate_against_input(input)

@@ -19,15 +19,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use serde_json::json;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 use w014_document_processing::sandbox::{
     SandboxError, SandboxInput, SandboxRunner, SandboxSecurityProfile, SandboxStatus,
 };
-use w014_domain::Sha256;
-use w014_domain::ids::{DocumentVersionId, WorkspaceId};
+use w014_domain::ids::{DocumentVersionId, ParserArtifactId, WorkspaceId};
 use w014_domain::quarantine::QuarantineStatus;
+use w014_domain::{ParserArtifact, ParserStatus, Sha256};
 use w014_jobs::executor::{JobExecutionContext, JobExecutionFailure, JobExecutor};
 use w014_jobs::kind::JobKind;
 use w014_jobs::models::ClaimedJob;
@@ -35,7 +36,8 @@ use w014_persistence::audit::{AppendAuditParams, AuditAppendContract, PostgresAu
 
 use crate::persistence::{
     DocumentRepository, DocumentVersionRepository, ObjectArtifactRepository,
-    QuarantineRecordRepository,
+    ParserArtifactRepository, ParserBlockRepository, ParserPageRepository,
+    QuarantineRecordRepository, SourceSpanRepository,
 };
 use crate::services::DocumentService;
 
@@ -454,39 +456,7 @@ impl ParserSandboxJobExecutor {
                 )
             })?;
 
-        // 13. Validate output status
-        match sandbox_outcome.status {
-            SandboxStatus::Success => {
-                // Success path: Proceed to fenced completion
-            }
-            SandboxStatus::Unsupported => {
-                return Err(JobExecutionFailure::terminal(
-                    "UNSUPPORTED_DOCUMENT_FORMAT",
-                    sandbox_outcome
-                        .failure_detail
-                        .unwrap_or_else(|| "Document format or feature unsupported".to_string()),
-                ));
-            }
-            SandboxStatus::Corrupted => {
-                return Err(JobExecutionFailure::terminal(
-                    "CORRUPTED_DOCUMENT",
-                    sandbox_outcome
-                        .failure_detail
-                        .unwrap_or_else(|| "Document content is corrupted".to_string()),
-                ));
-            }
-            SandboxStatus::Failed => {
-                let code = sandbox_outcome
-                    .failure_code
-                    .unwrap_or_else(|| "PARSER_FAILED".to_string());
-                let detail = sandbox_outcome
-                    .failure_detail
-                    .unwrap_or_else(|| "Parser execution failed inside sandbox".to_string());
-                return Err(JobExecutionFailure::terminal(code, detail));
-            }
-        }
-
-        // 13. Persist success audit event under lease fence in transaction
+        // 13. Persist parser facts and audit event under lease fence in single atomic transaction
         let mut tx = self.pool.begin().await.map_err(|e| {
             JobExecutionFailure::retryable("DB_ERROR", format!("Failed to begin tx: {e}"))
         })?;
@@ -508,64 +478,402 @@ impl ParserSandboxJobExecutor {
             ));
         }
 
-        let audit_store = PostgresAuditStore::new();
-        let audit_params = AppendAuditParams {
-            workspace_id: workspace_id.into_uuid(),
-            actor_type: "worker".to_string(),
-            actor_id: Some(handle.job_id),
-            authority_snapshot: json!({ "lease_generation": handle.lease_generation }),
-            action_code: "PARSER_SANDBOX_COMPLETED".to_string(),
-            entity_type: "document_version".to_string(),
-            entity_id: document_version_id.to_string(),
-            entity_version: Some(1),
-            request_id: None,
-            correlation_id: None,
-            job_id: Some(handle.job_id),
-            source_state_hash: None,
-            before_ref: Some(json!({ "parse_status": "processing" })),
-            after_ref: Some(json!({
-                "parse_status": "completed",
-                "page_count": sandbox_outcome.page_count,
-                "block_count": sandbox_outcome.block_count,
-                "span_count": sandbox_outcome.span_count,
-            })),
-            metadata: json!({
-                "document_version_id": document_version_id.to_string(),
-                "object_artifact_id": artifact.id.to_string(),
-                "parser_name": sandbox_outcome.parser_name,
-                "parser_version": sandbox_outcome.parser_version,
-                "locator_version": sandbox_outcome.locator_version.as_str(),
-                "page_count": sandbox_outcome.page_count,
-                "block_count": sandbox_outcome.block_count,
-                "span_count": sandbox_outcome.span_count,
-                "execution_duration_ms": sandbox_outcome.execution_duration_ms,
-            }),
-        };
+        let completed_at = Utc::now();
+        let duration_ms = sandbox_outcome.execution_duration_ms as i64;
+        let started_at = completed_at - chrono::Duration::milliseconds(duration_ms);
 
-        audit_store
-            .append_audit_event(&mut tx, audit_params)
-            .await
-            .map_err(|e| {
-                JobExecutionFailure::retryable("AUDIT_ERROR", format!("Audit append failed: {e}"))
-            })?;
+        let parser_artifact_id = ParserArtifactId::new();
 
-        tx.commit().await.map_err(|e| {
-            JobExecutionFailure::retryable("DB_ERROR", format!("Tx commit failed: {e}"))
-        })?;
+        match sandbox_outcome.status {
+            SandboxStatus::Success => {
+                if let Some(ref parsed_data) = sandbox_outcome.parsed_artifact {
+                    let (dom_artifact, dom_pages, dom_blocks, dom_spans) = parsed_data
+                        .into_domain_entities(
+                            workspace_id,
+                            document_version_id,
+                            parser_artifact_id,
+                            sandbox_outcome.locator_version.clone(),
+                            sandbox_outcome.parser_name.clone(),
+                            sandbox_outcome.parser_version.clone(),
+                            started_at,
+                            completed_at,
+                            Some(duration_ms),
+                        )
+                        .map_err(|e| {
+                            JobExecutionFailure::terminal("DOMAIN_ERROR", e.to_string())
+                        })?;
 
-        // 14. Return typed bounded result payload
-        Ok(Some(json!({
-            "status": "succeeded",
-            "document_version_id": document_version_id.to_string(),
-            "object_artifact_id": artifact.id.to_string(),
-            "parser_name": sandbox_outcome.parser_name,
-            "parser_version": sandbox_outcome.parser_version,
-            "locator_version": sandbox_outcome.locator_version.as_str(),
-            "page_count": sandbox_outcome.page_count,
-            "block_count": sandbox_outcome.block_count,
-            "span_count": sandbox_outcome.span_count,
-            "execution_duration_ms": sandbox_outcome.execution_duration_ms,
-        })))
+                    // Persist parser_artifacts
+                    ParserArtifactRepository::insert(&mut tx, &dom_artifact)
+                        .await
+                        .map_err(|e| {
+                            JobExecutionFailure::retryable(
+                                "DB_ERROR",
+                                format!("Failed to insert parser artifact: {e}"),
+                            )
+                        })?;
+
+                    // Persist parser_pages
+                    ParserPageRepository::insert_batch(&mut tx, &dom_pages, workspace_id)
+                        .await
+                        .map_err(|e| {
+                            JobExecutionFailure::retryable(
+                                "DB_ERROR",
+                                format!("Failed to insert parser pages: {e}"),
+                            )
+                        })?;
+
+                    // Persist parser_blocks
+                    ParserBlockRepository::insert_batch(&mut tx, &dom_blocks, workspace_id)
+                        .await
+                        .map_err(|e| {
+                            JobExecutionFailure::retryable(
+                                "DB_ERROR",
+                                format!("Failed to insert parser blocks: {e}"),
+                            )
+                        })?;
+
+                    // Map block identities for span persistence
+                    let mut block_map = std::collections::HashMap::new();
+                    for (parsed_block, dom_block) in
+                        parsed_data.blocks.iter().zip(dom_blocks.iter())
+                    {
+                        block_map.insert(
+                            (parsed_block.page_number, parsed_block.ordinal),
+                            dom_block.id,
+                        );
+                    }
+
+                    // Persist source_spans
+                    for (parsed_span, dom_span) in parsed_data.spans.iter().zip(dom_spans.iter()) {
+                        let block_id = block_map
+                            .get(&(parsed_span.page_number, parsed_span.block_ordinal))
+                            .copied()
+                            .or_else(|| dom_blocks.first().map(|b| b.id))
+                            .ok_or_else(|| {
+                                JobExecutionFailure::terminal(
+                                    "BLOCK_MAPPING_ERROR",
+                                    "No parser block found for source span",
+                                )
+                            })?;
+
+                        SourceSpanRepository::insert(&mut tx, dom_span, block_id)
+                            .await
+                            .map_err(|e| {
+                                JobExecutionFailure::retryable(
+                                    "DB_ERROR",
+                                    format!("Failed to insert source span: {e}"),
+                                )
+                            })?;
+                    }
+                } else {
+                    let dom_artifact = ParserArtifact::reconstruct(
+                        parser_artifact_id,
+                        document_version_id,
+                        workspace_id,
+                        Some(handle.job_id),
+                        sandbox_outcome.parser_name.clone(),
+                        sandbox_outcome.parser_version.clone(),
+                        sandbox_outcome.locator_version.clone(),
+                        ParserStatus::Completed,
+                        None,
+                        sandbox_outcome.text_sha256,
+                        sandbox_outcome.page_count,
+                        sandbox_outcome.block_count,
+                        sandbox_outcome.span_count,
+                        Some(duration_ms),
+                        None,
+                        started_at,
+                        Some(completed_at),
+                    )
+                    .map_err(|e| JobExecutionFailure::terminal("DOMAIN_ERROR", e.to_string()))?;
+
+                    ParserArtifactRepository::insert(&mut tx, &dom_artifact)
+                        .await
+                        .map_err(|e| {
+                            JobExecutionFailure::retryable(
+                                "DB_ERROR",
+                                format!("Failed to insert parser artifact: {e}"),
+                            )
+                        })?;
+                }
+
+                // Append PARSER_COMPLETED audit event
+                let audit_store = PostgresAuditStore::new();
+                let audit_params = AppendAuditParams {
+                    workspace_id: workspace_id.into_uuid(),
+                    actor_type: "worker".to_string(),
+                    actor_id: Some(handle.job_id),
+                    authority_snapshot: json!({ "lease_generation": handle.lease_generation }),
+                    action_code: "PARSER_COMPLETED".to_string(),
+                    entity_type: "document_version".to_string(),
+                    entity_id: document_version_id.to_string(),
+                    entity_version: Some(1),
+                    request_id: None,
+                    correlation_id: None,
+                    job_id: Some(handle.job_id),
+                    source_state_hash: None,
+                    before_ref: Some(json!({ "parse_status": "processing" })),
+                    after_ref: Some(json!({
+                        "parse_status": "completed",
+                        "parser_artifact_id": parser_artifact_id.to_string(),
+                        "page_count": sandbox_outcome.page_count,
+                        "block_count": sandbox_outcome.block_count,
+                        "span_count": sandbox_outcome.span_count,
+                        "text_sha256": sandbox_outcome.text_sha256.map(|h| h.to_hex()),
+                    })),
+                    metadata: json!({
+                        "parser_artifact_id": parser_artifact_id.to_string(),
+                        "document_version_id": document_version_id.to_string(),
+                        "object_artifact_id": artifact.id.to_string(),
+                        "parser_name": sandbox_outcome.parser_name,
+                        "parser_version": sandbox_outcome.parser_version,
+                        "locator_version": sandbox_outcome.locator_version.as_str(),
+                        "page_count": sandbox_outcome.page_count,
+                        "block_count": sandbox_outcome.block_count,
+                        "span_count": sandbox_outcome.span_count,
+                        "execution_duration_ms": sandbox_outcome.execution_duration_ms,
+                    }),
+                };
+
+                audit_store
+                    .append_audit_event(&mut tx, audit_params)
+                    .await
+                    .map_err(|e| {
+                        JobExecutionFailure::retryable(
+                            "AUDIT_ERROR",
+                            format!("Audit append failed: {e}"),
+                        )
+                    })?;
+
+                tx.commit().await.map_err(|e| {
+                    JobExecutionFailure::retryable("DB_ERROR", format!("Tx commit failed: {e}"))
+                })?;
+
+                Ok(Some(json!({
+                    "status": "succeeded",
+                    "parser_artifact_id": parser_artifact_id.to_string(),
+                    "document_version_id": document_version_id.to_string(),
+                    "object_artifact_id": artifact.id.to_string(),
+                    "parser_name": sandbox_outcome.parser_name,
+                    "parser_version": sandbox_outcome.parser_version,
+                    "locator_version": sandbox_outcome.locator_version.as_str(),
+                    "page_count": sandbox_outcome.page_count,
+                    "block_count": sandbox_outcome.block_count,
+                    "span_count": sandbox_outcome.span_count,
+                    "execution_duration_ms": sandbox_outcome.execution_duration_ms,
+                })))
+            }
+            SandboxStatus::Unsupported => {
+                let code = "UNSUPPORTED_DOCUMENT_FORMAT".to_string();
+                let detail = sandbox_outcome
+                    .failure_detail
+                    .unwrap_or_else(|| "Document format or feature unsupported".to_string());
+
+                let dom_artifact = ParserArtifact::reconstruct(
+                    parser_artifact_id,
+                    document_version_id,
+                    workspace_id,
+                    Some(handle.job_id),
+                    sandbox_outcome.parser_name.clone(),
+                    sandbox_outcome.parser_version.clone(),
+                    sandbox_outcome.locator_version.clone(),
+                    ParserStatus::Failed,
+                    None,
+                    None,
+                    0,
+                    0,
+                    0,
+                    Some(duration_ms),
+                    Some(code.clone()),
+                    started_at,
+                    Some(completed_at),
+                )
+                .map_err(|e| JobExecutionFailure::terminal("DOMAIN_ERROR", e.to_string()))?;
+
+                ParserArtifactRepository::insert(&mut tx, &dom_artifact)
+                    .await
+                    .map_err(|e| {
+                        JobExecutionFailure::retryable(
+                            "DB_ERROR",
+                            format!("Failed to insert failed parser artifact: {e}"),
+                        )
+                    })?;
+
+                let audit_store = PostgresAuditStore::new();
+                let audit_params = AppendAuditParams {
+                    workspace_id: workspace_id.into_uuid(),
+                    actor_type: "worker".to_string(),
+                    actor_id: Some(handle.job_id),
+                    authority_snapshot: json!({ "lease_generation": handle.lease_generation }),
+                    action_code: "PARSER_FAILED".to_string(),
+                    entity_type: "document_version".to_string(),
+                    entity_id: document_version_id.to_string(),
+                    entity_version: Some(1),
+                    request_id: None,
+                    correlation_id: None,
+                    job_id: Some(handle.job_id),
+                    source_state_hash: None,
+                    before_ref: Some(json!({ "parse_status": "processing" })),
+                    after_ref: Some(json!({
+                        "parse_status": "failed",
+                        "parser_artifact_id": parser_artifact_id.to_string(),
+                        "failure_code": code,
+                    })),
+                    metadata: json!({
+                        "parser_artifact_id": parser_artifact_id.to_string(),
+                        "document_version_id": document_version_id.to_string(),
+                        "failure_code": code,
+                        "failure_detail": detail,
+                    }),
+                };
+
+                let _ = audit_store.append_audit_event(&mut tx, audit_params).await;
+                let _ = tx.commit().await;
+
+                Err(JobExecutionFailure::terminal(code, detail))
+            }
+            SandboxStatus::Corrupted => {
+                let code = "CORRUPTED_DOCUMENT".to_string();
+                let detail = sandbox_outcome
+                    .failure_detail
+                    .unwrap_or_else(|| "Document content is corrupted".to_string());
+
+                let dom_artifact = ParserArtifact::reconstruct(
+                    parser_artifact_id,
+                    document_version_id,
+                    workspace_id,
+                    Some(handle.job_id),
+                    sandbox_outcome.parser_name.clone(),
+                    sandbox_outcome.parser_version.clone(),
+                    sandbox_outcome.locator_version.clone(),
+                    ParserStatus::Failed,
+                    None,
+                    None,
+                    0,
+                    0,
+                    0,
+                    Some(duration_ms),
+                    Some(code.clone()),
+                    started_at,
+                    Some(completed_at),
+                )
+                .map_err(|e| JobExecutionFailure::terminal("DOMAIN_ERROR", e.to_string()))?;
+
+                ParserArtifactRepository::insert(&mut tx, &dom_artifact)
+                    .await
+                    .map_err(|e| {
+                        JobExecutionFailure::retryable(
+                            "DB_ERROR",
+                            format!("Failed to insert failed parser artifact: {e}"),
+                        )
+                    })?;
+
+                let audit_store = PostgresAuditStore::new();
+                let audit_params = AppendAuditParams {
+                    workspace_id: workspace_id.into_uuid(),
+                    actor_type: "worker".to_string(),
+                    actor_id: Some(handle.job_id),
+                    authority_snapshot: json!({ "lease_generation": handle.lease_generation }),
+                    action_code: "PARSER_FAILED".to_string(),
+                    entity_type: "document_version".to_string(),
+                    entity_id: document_version_id.to_string(),
+                    entity_version: Some(1),
+                    request_id: None,
+                    correlation_id: None,
+                    job_id: Some(handle.job_id),
+                    source_state_hash: None,
+                    before_ref: Some(json!({ "parse_status": "processing" })),
+                    after_ref: Some(json!({
+                        "parse_status": "failed",
+                        "parser_artifact_id": parser_artifact_id.to_string(),
+                        "failure_code": code,
+                    })),
+                    metadata: json!({
+                        "parser_artifact_id": parser_artifact_id.to_string(),
+                        "document_version_id": document_version_id.to_string(),
+                        "failure_code": code,
+                        "failure_detail": detail,
+                    }),
+                };
+
+                let _ = audit_store.append_audit_event(&mut tx, audit_params).await;
+                let _ = tx.commit().await;
+
+                Err(JobExecutionFailure::terminal(code, detail))
+            }
+            SandboxStatus::Failed => {
+                let code = sandbox_outcome
+                    .failure_code
+                    .unwrap_or_else(|| "PARSER_FAILED".to_string());
+                let detail = sandbox_outcome
+                    .failure_detail
+                    .unwrap_or_else(|| "Parser execution failed inside sandbox".to_string());
+
+                let dom_artifact = ParserArtifact::reconstruct(
+                    parser_artifact_id,
+                    document_version_id,
+                    workspace_id,
+                    Some(handle.job_id),
+                    sandbox_outcome.parser_name.clone(),
+                    sandbox_outcome.parser_version.clone(),
+                    sandbox_outcome.locator_version.clone(),
+                    ParserStatus::Failed,
+                    None,
+                    None,
+                    0,
+                    0,
+                    0,
+                    Some(duration_ms),
+                    Some(code.clone()),
+                    started_at,
+                    Some(completed_at),
+                )
+                .map_err(|e| JobExecutionFailure::terminal("DOMAIN_ERROR", e.to_string()))?;
+
+                ParserArtifactRepository::insert(&mut tx, &dom_artifact)
+                    .await
+                    .map_err(|e| {
+                        JobExecutionFailure::retryable(
+                            "DB_ERROR",
+                            format!("Failed to insert failed parser artifact: {e}"),
+                        )
+                    })?;
+
+                let audit_store = PostgresAuditStore::new();
+                let audit_params = AppendAuditParams {
+                    workspace_id: workspace_id.into_uuid(),
+                    actor_type: "worker".to_string(),
+                    actor_id: Some(handle.job_id),
+                    authority_snapshot: json!({ "lease_generation": handle.lease_generation }),
+                    action_code: "PARSER_FAILED".to_string(),
+                    entity_type: "document_version".to_string(),
+                    entity_id: document_version_id.to_string(),
+                    entity_version: Some(1),
+                    request_id: None,
+                    correlation_id: None,
+                    job_id: Some(handle.job_id),
+                    source_state_hash: None,
+                    before_ref: Some(json!({ "parse_status": "processing" })),
+                    after_ref: Some(json!({
+                        "parse_status": "failed",
+                        "parser_artifact_id": parser_artifact_id.to_string(),
+                        "failure_code": code,
+                    })),
+                    metadata: json!({
+                        "parser_artifact_id": parser_artifact_id.to_string(),
+                        "document_version_id": document_version_id.to_string(),
+                        "failure_code": code,
+                        "failure_detail": detail,
+                    }),
+                };
+
+                let _ = audit_store.append_audit_event(&mut tx, audit_params).await;
+                let _ = tx.commit().await;
+
+                Err(JobExecutionFailure::terminal(code, detail))
+            }
+        }
     }
 }
 

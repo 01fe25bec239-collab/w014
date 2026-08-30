@@ -337,7 +337,7 @@ async fn test_wi0205_gate01_clean_scan_allows_sandbox_parse_success_and_audit() 
 
     // 5. Verify audit event was persisted under lease authority
     let audit_row = sqlx::query(
-        "SELECT action_code, entity_type, metadata FROM audit_events WHERE workspace_id = $1 AND action_code = 'PARSER_SANDBOX_COMPLETED'",
+        "SELECT action_code, entity_type, metadata FROM audit_events WHERE workspace_id = $1 AND action_code IN ('PARSER_COMPLETED', 'PARSER_SANDBOX_COMPLETED')",
     )
     .bind(f.ws_a.id.as_uuid())
     .fetch_optional(f.test_db.pool())
@@ -345,7 +345,7 @@ async fn test_wi0205_gate01_clean_scan_allows_sandbox_parse_success_and_audit() 
     .unwrap();
     assert!(
         audit_row.is_some(),
-        "Audit event PARSER_SANDBOX_COMPLETED must be recorded"
+        "Audit event PARSER_COMPLETED or PARSER_SANDBOX_COMPLETED must be recorded"
     );
     let audit_event = audit_row.unwrap();
     let metadata: serde_json::Value = audit_event.get("metadata");
@@ -873,6 +873,7 @@ async fn test_wi0205_gate04_fail_closed_on_sandbox_crash_oom_timeout_and_violati
             execution_duration_ms: 50,
             failure_code: None,
             failure_detail: None,
+            parsed_artifact: None,
         };
 
         let runner = Arc::new(

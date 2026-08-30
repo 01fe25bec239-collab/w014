@@ -13,6 +13,7 @@ pub mod error;
 pub mod input;
 pub mod mock;
 pub mod output;
+pub mod pdf;
 pub mod process;
 pub mod profile;
 pub mod traits;
@@ -25,6 +26,7 @@ pub use output::{
     MAX_EXECUTION_DURATION_MS, OutputValidationError, SANDBOX_PROTOCOL_VERSION, SandboxOutput,
     SandboxStatus,
 };
+pub use pdf::PdfSandboxRunner;
 pub use process::ProcessSandboxRunner;
 pub use profile::{
     FROZEN_MAX_CPU_CORES, FROZEN_MAX_MEMORY_BYTES, FROZEN_MAX_OUTPUT_BYTES, FROZEN_MAX_PIDS,

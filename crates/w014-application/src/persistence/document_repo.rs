@@ -13,19 +13,33 @@ use w014_document_processing::documents_row::{
 use w014_document_processing::object_artifacts_row::{
     INSERT_OBJECT_ARTIFACT, ObjectArtifactRow, artifact_from_row, new_row_from_artifact,
 };
+use w014_document_processing::parser_artifacts_row::{
+    COMPLETE_PARSER_ARTIFACT, FAIL_PARSER_ARTIFACT, INSERT_PARSER_ARTIFACT, ParserArtifactRow,
+    new_row_from_parser_artifact, parser_artifact_from_row,
+};
+use w014_document_processing::parser_blocks_row::{
+    INSERT_PARSER_BLOCK, ParserBlockRow, block_from_row, new_row_from_block,
+};
+use w014_document_processing::parser_pages_row::{
+    INSERT_PARSER_PAGE, ParserPageRow, new_row_from_page, page_from_row,
+};
 use w014_document_processing::quarantine_records_row::{
     INSERT_QUARANTINE_RECORD, QuarantineRecordRow, new_row_from_record, record_from_row,
+};
+use w014_document_processing::source_spans_row::{
+    INSERT_SOURCE_SPAN, SourceSpanRow, SpanProvenanceJoin, new_row_from_span, span_from_row,
 };
 use w014_document_processing::upload_intents_row::{
     INSERT_UPLOAD_INTENT, UPDATE_INTENT_STATUS, UploadIntentRow, intent_from_row,
     new_row_from_intent,
 };
 use w014_domain::ids::{
-    DocumentId, DocumentVersionId, ObjectArtifactId, QuarantineRecordId, UploadIntentId,
-    WorkspaceId,
+    DocumentId, DocumentVersionId, ObjectArtifactId, ParserArtifactId, ParserBlockId, ParserPageId,
+    QuarantineRecordId, SourceSpanId, UploadIntentId, WorkspaceId,
 };
 use w014_domain::{
-    Document, DocumentVersion, IntentStatus, ObjectArtifact, QuarantineRecord, UploadIntent,
+    Document, DocumentVersion, IntentStatus, ObjectArtifact, ParserArtifact, ParserBlock,
+    ParserPage, QuarantineRecord, SourceSpan, UploadIntent,
 };
 use w014_persistence::error::PersistenceError;
 
@@ -702,5 +716,468 @@ impl QuarantineRecordRepository {
             }
             None => Ok(None),
         }
+    }
+}
+
+const SELECT_PARSER_ARTIFACT_BY_ID: &str = "SELECT parser_artifact_id, document_version_id, workspace_id, job_id, parser_name, parser_version, locator_version, status, artifact_object_id, text_sha256, page_count, block_count, span_count, execution_duration_ms, failure_code, started_at, completed_at FROM parser_artifacts WHERE workspace_id = $1 AND parser_artifact_id = $2";
+
+const SELECT_PARSER_ARTIFACT_BY_VERSION: &str = "SELECT parser_artifact_id, document_version_id, workspace_id, job_id, parser_name, parser_version, locator_version, status, artifact_object_id, text_sha256, page_count, block_count, span_count, execution_duration_ms, failure_code, started_at, completed_at FROM parser_artifacts WHERE workspace_id = $1 AND document_version_id = $2 ORDER BY started_at DESC LIMIT 1";
+
+const SELECT_PARSER_PAGE_BY_ID: &str = "SELECT parser_page_id, parser_artifact_id, workspace_id, page_number, width, height, rotation, text_content, metadata, created_at FROM parser_pages WHERE workspace_id = $1 AND parser_page_id = $2";
+
+const SELECT_PARSER_PAGES_BY_ARTIFACT: &str = "SELECT parser_page_id, parser_artifact_id, workspace_id, page_number, width, height, rotation, text_content, metadata, created_at FROM parser_pages WHERE workspace_id = $1 AND parser_artifact_id = $2 ORDER BY page_number ASC";
+
+const SELECT_PARSER_BLOCK_BY_ID: &str = "SELECT parser_block_id, parser_page_id, workspace_id, block_sequence, block_type, bounding_box, text_content, confidence, metadata, created_at FROM parser_blocks WHERE workspace_id = $1 AND parser_block_id = $2";
+
+const SELECT_PARSER_BLOCKS_BY_PAGE: &str = "SELECT parser_block_id, parser_page_id, workspace_id, block_sequence, block_type, bounding_box, text_content, confidence, metadata, created_at FROM parser_blocks WHERE workspace_id = $1 AND parser_page_id = $2 ORDER BY block_sequence ASC";
+
+const SELECT_SOURCE_SPAN_BY_ID: &str = "SELECT source_span_id, parser_block_id, workspace_id, span_sequence, start_char, end_char, text_content, bounding_box, confidence, metadata, created_at FROM source_spans WHERE workspace_id = $1 AND source_span_id = $2";
+
+const SELECT_SOURCE_SPANS_BY_BLOCK: &str = "SELECT source_span_id, parser_block_id, workspace_id, span_sequence, start_char, end_char, text_content, bounding_box, confidence, metadata, created_at FROM source_spans WHERE workspace_id = $1 AND parser_block_id = $2 ORDER BY span_sequence ASC";
+
+const SELECT_SPAN_PROVENANCE_FOR_BLOCK: &str = "SELECT b.workspace_id, a.document_version_id, p.parser_artifact_id, a.locator_version, p.page_number FROM parser_blocks b JOIN parser_pages p ON p.parser_page_id = b.parser_page_id AND p.workspace_id = b.workspace_id JOIN parser_artifacts a ON a.parser_artifact_id = p.parser_artifact_id AND a.workspace_id = p.workspace_id WHERE b.parser_block_id = $1 AND b.workspace_id = $2";
+
+/// Repository operations for Parser Artifacts.
+pub struct ParserArtifactRepository;
+
+impl ParserArtifactRepository {
+    /// Inserts a new parser artifact row.
+    pub async fn insert(
+        tx: &mut PgConnection,
+        artifact: &ParserArtifact,
+    ) -> Result<(), PersistenceError> {
+        let new_row = new_row_from_parser_artifact(artifact)
+            .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+
+        sqlx::query(INSERT_PARSER_ARTIFACT)
+            .bind(new_row.parser_artifact_id)
+            .bind(new_row.document_version_id)
+            .bind(new_row.workspace_id)
+            .bind(new_row.job_id)
+            .bind(&new_row.parser_name)
+            .bind(&new_row.parser_version)
+            .bind(&new_row.locator_version)
+            .bind(&new_row.status)
+            .bind(new_row.artifact_object_id)
+            .bind(new_row.text_sha256.as_deref())
+            .bind(new_row.page_count)
+            .bind(new_row.block_count)
+            .bind(new_row.span_count)
+            .bind(new_row.execution_duration_ms)
+            .bind(new_row.failure_code.as_deref())
+            .bind(new_row.started_at)
+            .bind(new_row.completed_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(())
+    }
+
+    /// Fetches a parser artifact by ID.
+    pub async fn get_by_id(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        artifact_id: ParserArtifactId,
+    ) -> Result<Option<ParserArtifact>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, ParserArtifactRow>(SELECT_PARSER_ARTIFACT_BY_ID)
+            .bind(workspace_id.as_uuid())
+            .bind(artifact_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let art = parser_artifact_from_row(&row)
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(art))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetches the latest parser artifact for a document version.
+    pub async fn get_latest_by_document_version(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        version_id: DocumentVersionId,
+    ) -> Result<Option<ParserArtifact>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, ParserArtifactRow>(SELECT_PARSER_ARTIFACT_BY_VERSION)
+            .bind(workspace_id.as_uuid())
+            .bind(version_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let art = parser_artifact_from_row(&row)
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(art))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Transitions a processing artifact to completed.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        artifact_id: ParserArtifactId,
+        completed_at: DateTime<Utc>,
+        page_count: i32,
+        block_count: i32,
+        span_count: i32,
+        execution_duration_ms: Option<i64>,
+    ) -> Result<(), PersistenceError> {
+        let res = sqlx::query(COMPLETE_PARSER_ARTIFACT)
+            .bind(completed_at)
+            .bind(page_count)
+            .bind(block_count)
+            .bind(span_count)
+            .bind(execution_duration_ms)
+            .bind(artifact_id.as_uuid())
+            .bind(workspace_id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        if res.rows_affected() != 1 {
+            return Err(PersistenceError::Operation(format!(
+                "Failed to complete parser artifact '{artifact_id}'"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Transitions a processing artifact to failed.
+    pub async fn fail(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        artifact_id: ParserArtifactId,
+        completed_at: DateTime<Utc>,
+        failure_code: &str,
+    ) -> Result<(), PersistenceError> {
+        let res = sqlx::query(FAIL_PARSER_ARTIFACT)
+            .bind(completed_at)
+            .bind(failure_code)
+            .bind(artifact_id.as_uuid())
+            .bind(workspace_id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        if res.rows_affected() != 1 {
+            return Err(PersistenceError::Operation(format!(
+                "Failed to fail parser artifact '{artifact_id}'"
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+/// Repository operations for Parser Pages.
+pub struct ParserPageRepository;
+
+impl ParserPageRepository {
+    /// Inserts a new parser page row.
+    pub async fn insert(
+        tx: &mut PgConnection,
+        page: &ParserPage,
+        artifact_workspace_id: WorkspaceId,
+    ) -> Result<(), PersistenceError> {
+        let new_row = new_row_from_page(page, artifact_workspace_id)
+            .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+
+        sqlx::query(INSERT_PARSER_PAGE)
+            .bind(new_row.parser_page_id)
+            .bind(new_row.parser_artifact_id)
+            .bind(new_row.workspace_id)
+            .bind(new_row.page_number)
+            .bind(new_row.width)
+            .bind(new_row.height)
+            .bind(new_row.rotation)
+            .bind(&new_row.text_content)
+            .bind(&new_row.metadata)
+            .bind(new_row.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(())
+    }
+
+    /// Inserts a batch of parser pages.
+    pub async fn insert_batch(
+        tx: &mut PgConnection,
+        pages: &[ParserPage],
+        artifact_workspace_id: WorkspaceId,
+    ) -> Result<(), PersistenceError> {
+        for page in pages {
+            Self::insert(tx, page, artifact_workspace_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Fetches a page by ID.
+    pub async fn get_by_id(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        page_id: ParserPageId,
+    ) -> Result<Option<ParserPage>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, ParserPageRow>(SELECT_PARSER_PAGE_BY_ID)
+            .bind(workspace_id.as_uuid())
+            .bind(page_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let page =
+                    page_from_row(&row).map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(page))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Lists all pages for a parser artifact in page_number order.
+    pub async fn list_by_artifact(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        artifact_id: ParserArtifactId,
+    ) -> Result<Vec<ParserPage>, PersistenceError> {
+        let rows = sqlx::query_as::<_, ParserPageRow>(SELECT_PARSER_PAGES_BY_ARTIFACT)
+            .bind(workspace_id.as_uuid())
+            .bind(artifact_id.as_uuid())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        let mut pages = Vec::with_capacity(rows.len());
+        for row in rows {
+            let page =
+                page_from_row(&row).map_err(|e| PersistenceError::Operation(e.to_string()))?;
+            pages.push(page);
+        }
+        Ok(pages)
+    }
+}
+
+/// Repository operations for Parser Blocks.
+pub struct ParserBlockRepository;
+
+impl ParserBlockRepository {
+    /// Inserts a new parser block row.
+    pub async fn insert(
+        tx: &mut PgConnection,
+        block: &ParserBlock,
+        page_workspace_id: WorkspaceId,
+    ) -> Result<(), PersistenceError> {
+        let new_row = new_row_from_block(block, page_workspace_id)
+            .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+
+        sqlx::query(INSERT_PARSER_BLOCK)
+            .bind(new_row.parser_block_id)
+            .bind(new_row.parser_page_id)
+            .bind(new_row.workspace_id)
+            .bind(new_row.block_sequence)
+            .bind(&new_row.block_type)
+            .bind(&new_row.bounding_box)
+            .bind(&new_row.text_content)
+            .bind(new_row.confidence)
+            .bind(&new_row.metadata)
+            .bind(new_row.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(())
+    }
+
+    /// Inserts a batch of parser blocks.
+    pub async fn insert_batch(
+        tx: &mut PgConnection,
+        blocks: &[ParserBlock],
+        page_workspace_id: WorkspaceId,
+    ) -> Result<(), PersistenceError> {
+        for block in blocks {
+            Self::insert(tx, block, page_workspace_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Fetches a block by ID.
+    pub async fn get_by_id(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        block_id: ParserBlockId,
+    ) -> Result<Option<ParserBlock>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, ParserBlockRow>(SELECT_PARSER_BLOCK_BY_ID)
+            .bind(workspace_id.as_uuid())
+            .bind(block_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        match row_opt {
+            Some(row) => {
+                let block =
+                    block_from_row(&row).map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                Ok(Some(block))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Lists all blocks for a page in sequence order.
+    pub async fn list_by_page(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        page_id: ParserPageId,
+    ) -> Result<Vec<ParserBlock>, PersistenceError> {
+        let rows = sqlx::query_as::<_, ParserBlockRow>(SELECT_PARSER_BLOCKS_BY_PAGE)
+            .bind(workspace_id.as_uuid())
+            .bind(page_id.as_uuid())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        let mut blocks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let block =
+                block_from_row(&row).map_err(|e| PersistenceError::Operation(e.to_string()))?;
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
+}
+
+/// Repository operations for Source Spans.
+pub struct SourceSpanRepository;
+
+impl SourceSpanRepository {
+    /// Inserts a new source span row under its owning parser block.
+    pub async fn insert(
+        tx: &mut PgConnection,
+        span: &SourceSpan,
+        parser_block_id: ParserBlockId,
+    ) -> Result<(), PersistenceError> {
+        let new_row = new_row_from_span(
+            span,
+            parser_block_id.into_uuid(),
+            span.provenance.workspace_id.into_uuid(),
+        )
+        .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+
+        sqlx::query(INSERT_SOURCE_SPAN)
+            .bind(new_row.source_span_id)
+            .bind(new_row.parser_block_id)
+            .bind(new_row.workspace_id)
+            .bind(new_row.span_sequence)
+            .bind(new_row.start_char)
+            .bind(new_row.end_char)
+            .bind(&new_row.text_content)
+            .bind(&new_row.bounding_box)
+            .bind(new_row.confidence)
+            .bind(&new_row.metadata)
+            .bind(new_row.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        Ok(())
+    }
+
+    /// Inserts a batch of source spans.
+    pub async fn insert_batch(
+        tx: &mut PgConnection,
+        spans: &[(SourceSpan, ParserBlockId)],
+    ) -> Result<(), PersistenceError> {
+        for (span, block_id) in spans {
+            Self::insert(tx, span, *block_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Fetches a source span by ID, resolving provenance exclusively through authoritative joins.
+    pub async fn get_by_id(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        span_id: SourceSpanId,
+    ) -> Result<Option<SourceSpan>, PersistenceError> {
+        let row_opt = sqlx::query_as::<_, SourceSpanRow>(SELECT_SOURCE_SPAN_BY_ID)
+            .bind(workspace_id.as_uuid())
+            .bind(span_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        let Some(span_row) = row_opt else {
+            return Ok(None);
+        };
+
+        // Resolve provenance chain through block -> page -> artifact joins
+        let provenance_join =
+            sqlx::query_as::<_, SpanProvenanceJoin>(SELECT_SPAN_PROVENANCE_FOR_BLOCK)
+                .bind(span_row.parser_block_id)
+                .bind(workspace_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(PersistenceError::Connection)?
+                .ok_or_else(|| {
+                    PersistenceError::Operation(
+                        "Failed to resolve provenance chain for source span".to_string(),
+                    )
+                })?;
+
+        let span = span_from_row(&span_row, provenance_join)
+            .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+
+        Ok(Some(span))
+    }
+
+    /// Lists all source spans for a block in sequence order.
+    pub async fn list_by_block(
+        tx: &mut PgConnection,
+        workspace_id: WorkspaceId,
+        block_id: ParserBlockId,
+    ) -> Result<Vec<SourceSpan>, PersistenceError> {
+        let rows = sqlx::query_as::<_, SourceSpanRow>(SELECT_SOURCE_SPANS_BY_BLOCK)
+            .bind(workspace_id.as_uuid())
+            .bind(block_id.as_uuid())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(PersistenceError::Connection)?;
+
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let provenance_join =
+            sqlx::query_as::<_, SpanProvenanceJoin>(SELECT_SPAN_PROVENANCE_FOR_BLOCK)
+                .bind(block_id.as_uuid())
+                .bind(workspace_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(PersistenceError::Connection)?
+                .ok_or_else(|| {
+                    PersistenceError::Operation(
+                        "Failed to resolve provenance chain for source spans".to_string(),
+                    )
+                })?;
+
+        let mut spans = Vec::with_capacity(rows.len());
+        for row in rows {
+            let span = span_from_row(&row, provenance_join.clone())
+                .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+            spans.push(span);
+        }
+        Ok(spans)
     }
 }

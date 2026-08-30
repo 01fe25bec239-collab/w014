@@ -358,9 +358,9 @@ async fn test_production_durable_job_loop_executes_parse_document_pdf() {
     let status: String = job_row.get("status");
     assert_eq!(status, "succeeded");
 
-    // 6. Verify PARSER_SANDBOX_COMPLETED audit event
+    // 6. Verify PARSER_COMPLETED or PARSER_SANDBOX_COMPLETED audit event
     let audit_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1 AND action_code = 'PARSER_SANDBOX_COMPLETED'",
+        "SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1 AND action_code IN ('PARSER_COMPLETED', 'PARSER_SANDBOX_COMPLETED')",
     )
     .bind(f.ws.id.as_uuid())
     .fetch_one(f.test_db.pool())

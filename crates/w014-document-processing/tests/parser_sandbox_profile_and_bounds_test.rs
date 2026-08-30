@@ -316,6 +316,7 @@ fn test_typed_bounded_output_validation() {
         execution_duration_ms: 120,
         failure_code: None,
         failure_detail: None,
+        parsed_artifact: None,
     };
     assert!(valid_output.validate_against_input(&input).is_ok());
 

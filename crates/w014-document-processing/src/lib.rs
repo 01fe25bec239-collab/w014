@@ -28,6 +28,7 @@ pub mod document_versions_row;
 pub mod documents_row;
 pub mod error;
 pub mod object_artifacts_row;
+pub mod parser;
 pub mod parser_artifacts_row;
 pub mod parser_blocks_row;
 pub mod parser_pages_row;
@@ -44,6 +45,12 @@ pub use document_versions_row::{DocumentVersionRow, NewDocumentVersionRow};
 pub use documents_row::{DocumentRow, NewDocumentRow};
 pub use error::{ContractError, ContractResult};
 pub use object_artifacts_row::{NewObjectArtifactRow, ObjectArtifactRow};
+pub use parser::{
+    DEFAULT_LOCATOR_VERSION, DEFAULT_PARSER_PROFILE_VERSION, DEFAULT_TEXT_NORMALIZATION_VERSION,
+    NormalizationResult, PageGeometry, ParsedBlockData, ParsedPageData, ParsedSpanData,
+    ParserArtifactData, ParserFailure, ParserLimits, ParserQualityMetrics, ParserRequest,
+    ParserWarning, PdfSafeParser, TextWarning, map_normalized_range_to_raw, normalize_text_nfc,
+};
 pub use parser_artifacts_row::{NewParserArtifactRow, ParserArtifactRow};
 pub use parser_blocks_row::{NewParserBlockRow, ParserBlockRow};
 pub use parser_pages_row::{NewParserPageRow, ParserPageRow};
@@ -52,10 +59,11 @@ pub use sandbox::{
     FROZEN_MAX_CPU_CORES, FROZEN_MAX_MEMORY_BYTES, FROZEN_MAX_OUTPUT_BYTES, FROZEN_MAX_PIDS,
     FROZEN_MAX_TMPFS_BYTES, FROZEN_MAX_WALL_CLOCK_SECS, MAX_BOUNDED_BLOCK_COUNT,
     MAX_BOUNDED_PAGE_COUNT, MAX_BOUNDED_SPAN_COUNT, MAX_EXECUTION_DURATION_MS, MockSandboxBehavior,
-    MockSandboxRunner, NON_ROOT_GID, NON_ROOT_UID, OutputValidationError, ProcessSandboxRunner,
-    SANDBOX_PROTOCOL_VERSION, SandboxCredentialsPolicy, SandboxError, SandboxFilesystemPolicy,
-    SandboxInput, SandboxNetworkPolicy, SandboxOutput, SandboxProcessPolicy,
-    SandboxResourceCeilings, SandboxRunner, SandboxSecurityProfile, SandboxStatus,
+    MockSandboxRunner, NON_ROOT_GID, NON_ROOT_UID, OutputValidationError, PdfSandboxRunner,
+    ProcessSandboxRunner, SANDBOX_PROTOCOL_VERSION, SandboxCredentialsPolicy, SandboxError,
+    SandboxFilesystemPolicy, SandboxInput, SandboxNetworkPolicy, SandboxOutput,
+    SandboxProcessPolicy, SandboxResourceCeilings, SandboxRunner, SandboxSecurityProfile,
+    SandboxStatus,
 };
 pub use scanner::{
     ClamAvClient, ClamAvConfig, EICAR_TEST_SIGNATURE, EICAR_THREAT_NAME, MalwareScanner,
