@@ -11,6 +11,9 @@ pub const DEFAULT_CLAMAV_PORT: u16 = 3310;
 /// Frozen scan timeout: 120 seconds for one P0 object up to 100 MiB.
 pub const DEFAULT_SCAN_TIMEOUT_SECS: u64 = 120;
 
+/// Maximum allowable scan timeout ceiling: 120 seconds.
+pub const MAX_SCAN_TIMEOUT_SECS: u64 = 120;
+
 /// Default streaming chunk size: 64 KiB.
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 
@@ -56,6 +59,9 @@ impl ClamAvConfig {
     }
 
     /// Loads configuration from environment variables with fallback to defaults.
+    ///
+    /// The effective scan timeout is bounded by `MAX_SCAN_TIMEOUT_SECS` (120s)
+    /// to ensure environment configuration cannot weaken the frozen security ceiling.
     #[must_use]
     pub fn from_env() -> Self {
         let host =
@@ -66,8 +72,9 @@ impl ClamAvConfig {
             .unwrap_or(DEFAULT_CLAMAV_PORT);
         let timeout_secs = std::env::var("W014_CLAMAV_TIMEOUT_SECS")
             .ok()
-            .and_then(|t| t.parse().ok())
-            .unwrap_or(DEFAULT_SCAN_TIMEOUT_SECS);
+            .and_then(|t| t.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SCAN_TIMEOUT_SECS)
+            .min(MAX_SCAN_TIMEOUT_SECS);
 
         Self {
             host,
@@ -75,6 +82,104 @@ impl ClamAvConfig {
             timeout: Duration::from_secs(timeout_secs),
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_object_bytes: MAX_SCAN_OBJECT_BYTES,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mutex to ensure environment variable tests run without interference from parallel tests.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_clamav_config_timeout_ceiling_matrix() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        // Case 1: ENV ABSENT -> default 120 seconds
+        unsafe {
+            std::env::remove_var("W014_CLAMAV_TIMEOUT_SECS");
+        }
+        let cfg = ClamAvConfig::from_env();
+        assert_eq!(cfg.timeout, Duration::from_secs(DEFAULT_SCAN_TIMEOUT_SECS));
+        assert_eq!(cfg.timeout, Duration::from_secs(120));
+
+        // Case 2: ENV = 1 -> 1 second (<= 120 seconds)
+        unsafe {
+            std::env::set_var("W014_CLAMAV_TIMEOUT_SECS", "1");
+        }
+        let cfg = ClamAvConfig::from_env();
+        assert_eq!(cfg.timeout, Duration::from_secs(1));
+
+        // Case 3: ENV = 120 -> 120 seconds
+        unsafe {
+            std::env::set_var("W014_CLAMAV_TIMEOUT_SECS", "120");
+        }
+        let cfg = ClamAvConfig::from_env();
+        assert_eq!(cfg.timeout, Duration::from_secs(120));
+
+        // Case 4: ENV = 121 -> clamped to 120 seconds ceiling
+        unsafe {
+            std::env::set_var("W014_CLAMAV_TIMEOUT_SECS", "121");
+        }
+        let cfg = ClamAvConfig::from_env();
+        assert_eq!(cfg.timeout, Duration::from_secs(120));
+
+        // Case 5: ENV = 600 -> clamped to 120 seconds ceiling
+        unsafe {
+            std::env::set_var("W014_CLAMAV_TIMEOUT_SECS", "600");
+        }
+        let cfg = ClamAvConfig::from_env();
+        assert_eq!(cfg.timeout, Duration::from_secs(120));
+
+        // Case 6: Very large u64 -> clamped to 120 seconds ceiling
+        unsafe {
+            std::env::set_var("W014_CLAMAV_TIMEOUT_SECS", "18446744073709551615");
+        }
+        let cfg = ClamAvConfig::from_env();
+        assert_eq!(cfg.timeout, Duration::from_secs(120));
+
+        // Case 7: Unparseable large integer -> fallback to default 120 seconds
+        unsafe {
+            std::env::set_var(
+                "W014_CLAMAV_TIMEOUT_SECS",
+                "999999999999999999999999999999999999999999",
+            );
+        }
+        let cfg = ClamAvConfig::from_env();
+        assert_eq!(cfg.timeout, Duration::from_secs(120));
+
+        // Case 8: Invalid text -> fallback to default 120 seconds
+        unsafe {
+            std::env::set_var("W014_CLAMAV_TIMEOUT_SECS", "not_a_valid_integer");
+        }
+        let cfg = ClamAvConfig::from_env();
+        assert_eq!(cfg.timeout, Duration::from_secs(120));
+
+        // Case 9: Negative integer -> parse fails -> fallback to default 120 seconds
+        unsafe {
+            std::env::set_var("W014_CLAMAV_TIMEOUT_SECS", "-50");
+        }
+        let cfg = ClamAvConfig::from_env();
+        assert_eq!(cfg.timeout, Duration::from_secs(120));
+
+        // Case 10: Empty string / whitespace -> parse fails -> fallback to default 120 seconds
+        unsafe {
+            std::env::set_var("W014_CLAMAV_TIMEOUT_SECS", "   ");
+        }
+        let cfg = ClamAvConfig::from_env();
+        assert_eq!(cfg.timeout, Duration::from_secs(120));
+
+        unsafe {
+            std::env::set_var("W014_CLAMAV_TIMEOUT_SECS", "");
+        }
+        let cfg = ClamAvConfig::from_env();
+        assert_eq!(cfg.timeout, Duration::from_secs(120));
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var("W014_CLAMAV_TIMEOUT_SECS");
         }
     }
 }

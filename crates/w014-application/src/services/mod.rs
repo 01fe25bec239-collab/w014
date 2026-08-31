@@ -12,9 +12,9 @@ pub mod workspace_init;
 
 pub use capability_service::CapabilityGrantService;
 pub use document_service::{
-    DocumentService, FinalizeUploadError, MAX_DOWNLOAD_TTL_SECS, PresignedGetContract,
-    PresignedPutContract, StoredObjectMetadata, UploadFinalizeResult, can_manage_documents,
-    can_read_documents, can_upload_documents,
+    DocumentService, FinalizeUploadError, MALWARE_SCAN_MAX_ATTEMPTS, MAX_DOWNLOAD_TTL_SECS,
+    PresignedGetContract, PresignedPutContract, StoredObjectMetadata, UploadFinalizeResult,
+    can_manage_documents, can_read_documents, can_upload_documents,
 };
 pub use idempotency_service::IdempotencyCoordinator;
 pub use malware_scan_executor::MalwareScanJobExecutor;

@@ -39,6 +39,9 @@ use crate::services::IdempotencyCoordinator;
 /// Maximum presigned GET download URL lifetime: 5 minutes (300s).
 pub const MAX_DOWNLOAD_TTL_SECS: i64 = 300;
 
+/// Maximum attempt budget for malware scanning: 2 attempts (initial scan + exactly 1 retry).
+pub const MALWARE_SCAN_MAX_ATTEMPTS: i32 = 2;
+
 /// Authoritative object metadata returned by object storage HEAD queries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredObjectMetadata {
@@ -748,7 +751,7 @@ impl DocumentService {
         .bind(job_kind.as_str())
         .bind(&payload_json)
         .bind(&idempotency_key)
-        .bind(FROZEN_MAX_ATTEMPTS)
+        .bind(MALWARE_SCAN_MAX_ATTEMPTS)
         .bind(FROZEN_BACKOFF_MAX_SECS)
         .fetch_optional(&mut *tx)
         .await
