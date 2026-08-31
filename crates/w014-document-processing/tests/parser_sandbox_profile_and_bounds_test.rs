@@ -464,3 +464,393 @@ async fn test_mock_sandbox_runner_deterministic_execution() {
     let err = runner.run(&profile, &input).await.unwrap_err();
     assert!(matches!(err, SandboxError::SandboxViolation { .. }));
 }
+
+#[tokio::test]
+async fn test_process_sandbox_profile_enforcement_fail_closed_matrix() {
+    use w014_document_processing::sandbox::ProcessSandboxRunner;
+
+    let ws_id = WorkspaceId::new();
+    let dv_id = DocumentVersionId::new();
+    let oa_id = ObjectArtifactId::new();
+    let job_id = Uuid::new_v4();
+    let media_type = StoredMediaType::new("application/pdf").unwrap();
+    let sample_bytes = b"%PDF-1.7 scoped test bytes".to_vec();
+    let input = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type,
+        Sha256::digest(&sample_bytes),
+        sample_bytes.len() as i64,
+        sample_bytes,
+    )
+    .unwrap();
+
+    let runner = ProcessSandboxRunner::new("/bin/sh").with_args(["-c", "exit 0"]);
+
+    // Case 1: Permissive network ingress -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.network.allow_public_ingress = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 2: Permissive network egress -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.network.allow_general_egress = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 3: Permissive AI provider access -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.network.allow_ai_provider_access = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 4: Permissive external URL fetching -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.network.allow_external_urls = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 5: Root filesystem not read-only -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.filesystem.root_readonly = false;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 6: Host mounts allowed -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.filesystem.allow_host_mounts = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 7: Secret mounts allowed -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.filesystem.allow_secret_mounts = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 8: Docker socket allowed -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.filesystem.allow_docker_socket = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 9: TMPFS exceeds 1 GiB -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.filesystem.tmpfs_max_bytes = 1024 * 1024 * 1024 + 1;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 10: Root UID (0) -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.process.uid = 0;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 11: Non-root flag disabled -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.process.run_as_non_root = false;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 12: No-new-privileges disabled -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.process.no_new_privileges = false;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 13: Capability dropping disabled -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.process.drop_all_capabilities = false;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 14: Database credentials present in profile -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.credentials.has_database_credentials = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 15: AI credentials present in profile -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.credentials.has_ai_credentials = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 16: S3 credentials present in profile -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.credentials.has_s3_credentials = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 17: KMS credentials present in profile -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.credentials.has_kms_credentials = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 18: Audit signing credentials present in profile -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.credentials.has_audit_signing_credentials = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 19: Audit HMAC keys present in profile -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.credentials.has_audit_hmac_keys = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 20: Session credentials present in profile -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.credentials.has_session_credentials = true;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 21: CPU limit exceeds 2 vCPU -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.ceilings.max_cpu_cores = 2.5;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 22: Memory limit exceeds 2 GiB -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.ceilings.max_memory_bytes = 3 * 1024 * 1024 * 1024;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 23: PID limit exceeds 64 -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.ceilings.max_pids = 128;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 24: Wall clock exceeds 600s -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.ceilings.max_wall_clock_seconds = 601;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 25: Output ceiling exceeds 10 MiB -> Fail closed
+    let mut bad_profile = SandboxSecurityProfile::frozen_default();
+    bad_profile.ceilings.max_output_bytes = 10 * 1024 * 1024 + 1;
+    let err = runner.run(&bad_profile, &input).await.unwrap_err();
+    assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+}
+
+#[tokio::test]
+async fn test_process_sandbox_credential_and_environment_scrubbing() {
+    use w014_document_processing::sandbox::ProcessSandboxRunner;
+
+    // Set sensitive variables in parent environment
+    unsafe {
+        std::env::set_var("DATABASE_URL", "postgres://user:pass@localhost:5432/db");
+        std::env::set_var("OPENAI_API_KEY", "sk-proj-secret123456");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-aws-key");
+        std::env::set_var("KMS_KEY_ARN", "arn:aws:kms:us-east-1:1234:key/test");
+        std::env::set_var("AUDIT_HMAC_SECRET", "super-secret-hmac");
+        std::env::set_var("APP_SESSION_TOKEN", "sess_9999");
+    }
+
+    let ws_id = WorkspaceId::new();
+    let dv_id = DocumentVersionId::new();
+    let oa_id = ObjectArtifactId::new();
+    let job_id = Uuid::new_v4();
+    let media_type = StoredMediaType::new("application/pdf").unwrap();
+    let sample_bytes = b"%PDF-1.7 scoped test bytes".to_vec();
+    let input = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type,
+        Sha256::digest(&sample_bytes),
+        sample_bytes.len() as i64,
+        sample_bytes,
+    )
+    .unwrap();
+
+    let profile = SandboxSecurityProfile::frozen_default();
+
+    // Launch a process that checks for sensitive environment variables
+    let check_script = r#"
+        if env | grep -iE 'DATABASE_URL|OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|KMS_KEY_ARN|AUDIT_HMAC_SECRET|APP_SESSION_TOKEN'; then
+            echo "LEAKED_CREDENTIALS" >&2
+            exit 1
+        fi
+        printf '{"protocol_version":"parser-sandbox-v1","document_version_id":"%s","object_artifact_id":"%s","input_sha256":"%s","status":"success","parser_name":"test-parser","parser_version":"1.0.0","locator_version":"w014-loc-v1","page_count":1,"block_count":1,"span_count":1,"text_sha256":"%s","execution_duration_ms":10,"failure_code":null,"failure_detail":null,"parsed_artifact":null}' "$W014_DOCUMENT_VERSION_ID" "$W014_OBJECT_ARTIFACT_ID" "$W014_INPUT_SHA256" "$W014_INPUT_SHA256"
+    "#;
+
+    let runner = ProcessSandboxRunner::new("/bin/sh").with_args(["-c", check_script]);
+    let output = runner
+        .run(&profile, &input)
+        .await
+        .expect("scrubbed execution must succeed");
+
+    assert_eq!(output.status, SandboxStatus::Success);
+    assert_eq!(output.document_version_id, dv_id);
+    assert_eq!(output.object_artifact_id, oa_id);
+}
+
+#[tokio::test]
+async fn test_process_sandbox_wall_clock_timeout_terminates_and_reaps() {
+    use std::time::Instant;
+    use w014_document_processing::sandbox::ProcessSandboxRunner;
+
+    let ws_id = WorkspaceId::new();
+    let dv_id = DocumentVersionId::new();
+    let oa_id = ObjectArtifactId::new();
+    let job_id = Uuid::new_v4();
+    let media_type = StoredMediaType::new("application/pdf").unwrap();
+    let sample_bytes = b"%PDF-1.7 scoped test bytes".to_vec();
+    let input = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type,
+        Sha256::digest(&sample_bytes),
+        sample_bytes.len() as i64,
+        sample_bytes,
+    )
+    .unwrap();
+
+    let mut profile = SandboxSecurityProfile::frozen_default();
+    profile.ceilings.max_wall_clock_seconds = 1; // Strict 1 second timeout
+
+    // Run a process that attempts to sleep for 10 seconds
+    let runner = ProcessSandboxRunner::new("/bin/sh").with_args(["-c", "sleep 10"]);
+
+    let start = Instant::now();
+    let err = runner.run(&profile, &input).await.unwrap_err();
+    let elapsed = start.elapsed();
+
+    assert!(matches!(err, SandboxError::Timeout { .. }));
+    assert!(
+        elapsed.as_secs() <= 3,
+        "Timeout must enforce termination promptly (elapsed: {elapsed:?})"
+    );
+}
+
+#[tokio::test]
+async fn test_process_sandbox_oversized_stdout_terminates_during_streaming() {
+    use w014_document_processing::sandbox::ProcessSandboxRunner;
+
+    let ws_id = WorkspaceId::new();
+    let dv_id = DocumentVersionId::new();
+    let oa_id = ObjectArtifactId::new();
+    let job_id = Uuid::new_v4();
+    let media_type = StoredMediaType::new("application/pdf").unwrap();
+    let sample_bytes = b"%PDF-1.7 scoped test bytes".to_vec();
+    let input = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type,
+        Sha256::digest(&sample_bytes),
+        sample_bytes.len() as i64,
+        sample_bytes,
+    )
+    .unwrap();
+
+    let mut profile = SandboxSecurityProfile::frozen_default();
+    profile.ceilings.max_output_bytes = 4096; // Tight 4 KB bound for test
+
+    // Script generates 100 KB of stdout (well exceeding the 4 KB bound)
+    let runner = ProcessSandboxRunner::new("/bin/sh")
+        .with_args(["-c", "head -c 102400 /dev/zero | tr '\\000' 'A'"]);
+
+    let err = runner.run(&profile, &input).await.unwrap_err();
+    match err {
+        SandboxError::ResourceViolation {
+            resource, limit, ..
+        } => {
+            assert_eq!(resource, "stdout_output_bytes");
+            assert!(limit.contains("4096"));
+        }
+        other => panic!("Expected ResourceViolation for stdout overflow, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_process_sandbox_oversized_stderr_terminates_during_streaming() {
+    use w014_document_processing::sandbox::ProcessSandboxRunner;
+
+    let ws_id = WorkspaceId::new();
+    let dv_id = DocumentVersionId::new();
+    let oa_id = ObjectArtifactId::new();
+    let job_id = Uuid::new_v4();
+    let media_type = StoredMediaType::new("application/pdf").unwrap();
+    let sample_bytes = b"%PDF-1.7 scoped test bytes".to_vec();
+    let input = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type,
+        Sha256::digest(&sample_bytes),
+        sample_bytes.len() as i64,
+        sample_bytes,
+    )
+    .unwrap();
+
+    let mut profile = SandboxSecurityProfile::frozen_default();
+    profile.ceilings.max_output_bytes = 4096; // Tight 4 KB bound for test
+
+    // Script generates 100 KB of stderr (well exceeding the 4 KB bound)
+    let runner = ProcessSandboxRunner::new("/bin/sh")
+        .with_args(["-c", "head -c 102400 /dev/zero | tr '\\000' 'E' >&2"]);
+
+    let err = runner.run(&profile, &input).await.unwrap_err();
+    match err {
+        SandboxError::ResourceViolation {
+            resource, limit, ..
+        } => {
+            assert_eq!(resource, "stderr_output_bytes");
+            assert!(limit.contains("4096"));
+        }
+        other => panic!("Expected ResourceViolation for stderr overflow, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_process_sandbox_crash_captures_bounded_stderr_and_fails_closed() {
+    use w014_document_processing::sandbox::ProcessSandboxRunner;
+
+    let ws_id = WorkspaceId::new();
+    let dv_id = DocumentVersionId::new();
+    let oa_id = ObjectArtifactId::new();
+    let job_id = Uuid::new_v4();
+    let media_type = StoredMediaType::new("application/pdf").unwrap();
+    let sample_bytes = b"%PDF-1.7 scoped test bytes".to_vec();
+    let input = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type,
+        Sha256::digest(&sample_bytes),
+        sample_bytes.len() as i64,
+        sample_bytes,
+    )
+    .unwrap();
+
+    let profile = SandboxSecurityProfile::frozen_default();
+
+    let runner = ProcessSandboxRunner::new("/bin/sh")
+        .with_args(["-c", "echo 'Fatal memory fault inside parser' >&2; exit 2"]);
+
+    let err = runner.run(&profile, &input).await.unwrap_err();
+    match err {
+        SandboxError::ProcessCrash {
+            exit_code, stderr, ..
+        } => {
+            assert_eq!(exit_code, Some(2));
+            assert!(stderr.contains("Fatal memory fault inside parser"));
+        }
+        other => panic!("Expected ProcessCrash, got: {other:?}"),
+    }
+}

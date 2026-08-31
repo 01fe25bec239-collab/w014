@@ -31,7 +31,8 @@ use w014_application::services::{
 };
 use w014_authz::AuthorizedWorkspaceContext;
 use w014_document_processing::sandbox::{
-    MockSandboxBehavior, MockSandboxRunner, SANDBOX_PROTOCOL_VERSION, SandboxOutput, SandboxStatus,
+    MockSandboxBehavior, MockSandboxRunner, ProcessSandboxRunner, SANDBOX_PROTOCOL_VERSION,
+    SandboxOutput, SandboxSecurityProfile, SandboxStatus,
 };
 use w014_document_processing::scanner::{EICAR_TEST_SIGNATURE, MockClamAvScanner};
 use w014_domain::ids::{DocumentVersionId, ObjectArtifactId};
@@ -1070,4 +1071,181 @@ async fn test_wi0205_gate07_negative_scope_zero_canonical_page_block_span_writes
         spans_count, 0,
         "WI-0205 must NOT persist canonical source_spans rows"
     );
+}
+
+#[tokio::test]
+async fn test_wi0205_gate08_process_sandbox_runner_real_queue_enforcement() {
+    let f = setup_fixture().await;
+    let pdf_bytes = b"%PDF-1.7 sample document for process sandbox real queue test";
+
+    // -------------------------------------------------------------
+    // CASE A: Real ProcessSandboxRunner Successful Execution
+    // -------------------------------------------------------------
+    {
+        let (_intent, version_id, artifact_id) =
+            finalize_and_clean_scan(&f, "proc_success.pdf", MediaType::ApplicationPdf, pdf_bytes)
+                .await;
+
+        let job_id =
+            enqueue_parse_job(&f, JobKind::ParseDocumentPdf, version_id, artifact_id).await;
+
+        let claimed = f
+            .queue
+            .claim(
+                ClaimCriteria {
+                    queues: vec![QUEUE_DOCUMENT_PARSE.to_string()],
+                    kinds: vec![JobKind::ParseDocumentPdf],
+                    workspace: WorkspaceScope::Single(f.ws_a.id.into_uuid()),
+                    lease_duration: Duration::from_secs(30),
+                },
+                WorkerId::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let success_script = r#"
+            printf '{"protocol_version":"parser-sandbox-v1","document_version_id":"%s","object_artifact_id":"%s","input_sha256":"%s","status":"success","parser_name":"real-process-parser","parser_version":"1.0.0","locator_version":"w014-loc-v1","page_count":1,"block_count":1,"span_count":1,"text_sha256":"%s","execution_duration_ms":15,"failure_code":null,"failure_detail":null,"parsed_artifact":null}' "$W014_DOCUMENT_VERSION_ID" "$W014_OBJECT_ARTIFACT_ID" "$W014_INPUT_SHA256" "$W014_INPUT_SHA256"
+        "#;
+
+        let runner =
+            Arc::new(ProcessSandboxRunner::new("/bin/sh").with_args(["-c", success_script]));
+        let executor = ParserSandboxJobExecutor::new(f.test_db.pool().clone(), runner);
+
+        let outcome = executor
+            .execute_claimed(&claimed)
+            .await
+            .expect("process sandbox execution must succeed");
+
+        f.queue.complete_success(&claimed, outcome).await.unwrap();
+
+        let job_row = sqlx::query("SELECT status FROM jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(f.test_db.pool())
+            .await
+            .unwrap();
+        let status: String = job_row.get("status");
+        assert_eq!(status, "succeeded");
+
+        let artifact_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM parser_artifacts WHERE document_version_id = $1",
+        )
+        .bind(version_id.as_uuid())
+        .fetch_one(f.test_db.pool())
+        .await
+        .unwrap();
+        assert_eq!(artifact_count, 1, "Parser artifact must be persisted");
+    }
+
+    // -------------------------------------------------------------
+    // CASE B: Real ProcessSandboxRunner Oversized Stdout -> Fails Closed & Commits Zero Truth
+    // -------------------------------------------------------------
+    {
+        let (_intent, version_id, artifact_id) = finalize_and_clean_scan(
+            &f,
+            "proc_overflow.pdf",
+            MediaType::ApplicationPdf,
+            pdf_bytes,
+        )
+        .await;
+
+        let _ = enqueue_parse_job(&f, JobKind::ParseDocumentPdf, version_id, artifact_id).await;
+
+        let claimed = f
+            .queue
+            .claim(
+                ClaimCriteria {
+                    queues: vec![QUEUE_DOCUMENT_PARSE.to_string()],
+                    kinds: vec![JobKind::ParseDocumentPdf],
+                    workspace: WorkspaceScope::Single(f.ws_a.id.into_uuid()),
+                    lease_duration: Duration::from_secs(30),
+                },
+                WorkerId::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Runner generates massive output stream (exceeding bound during streaming)
+        let overflow_script = "head -c 20000000 /dev/zero | tr '\\000' 'A'";
+        let runner =
+            Arc::new(ProcessSandboxRunner::new("/bin/sh").with_args(["-c", overflow_script]));
+        let mut custom_profile = SandboxSecurityProfile::frozen_default();
+        custom_profile.ceilings.max_output_bytes = 10_000; // Tight bound for test
+
+        let executor = ParserSandboxJobExecutor::new(f.test_db.pool().clone(), runner)
+            .with_profile(custom_profile);
+
+        let failure = executor
+            .execute_claimed(&claimed)
+            .await
+            .expect_err("oversized stdout must fail closed");
+
+        assert_eq!(failure.error_code, "SANDBOX_RESOURCE_VIOLATION");
+
+        // Verify zero parser facts written to DB on failure
+        let artifact_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM parser_artifacts WHERE document_version_id = $1",
+        )
+        .bind(version_id.as_uuid())
+        .fetch_one(f.test_db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            artifact_count, 0,
+            "Zero parser artifacts must be persisted on overflow"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // CASE C: Real ProcessSandboxRunner Timeout -> Fails Closed & Commits Zero Truth
+    // -------------------------------------------------------------
+    {
+        let (_intent, version_id, artifact_id) =
+            finalize_and_clean_scan(&f, "proc_timeout.pdf", MediaType::ApplicationPdf, pdf_bytes)
+                .await;
+
+        let _ = enqueue_parse_job(&f, JobKind::ParseDocumentPdf, version_id, artifact_id).await;
+
+        let claimed = f
+            .queue
+            .claim(
+                ClaimCriteria {
+                    queues: vec![QUEUE_DOCUMENT_PARSE.to_string()],
+                    kinds: vec![JobKind::ParseDocumentPdf],
+                    workspace: WorkspaceScope::Single(f.ws_a.id.into_uuid()),
+                    lease_duration: Duration::from_secs(30),
+                },
+                WorkerId::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let runner = Arc::new(ProcessSandboxRunner::new("/bin/sh").with_args(["-c", "sleep 10"]));
+        let mut custom_profile = SandboxSecurityProfile::frozen_default();
+        custom_profile.ceilings.max_wall_clock_seconds = 1; // Strict 1s timeout
+
+        let executor = ParserSandboxJobExecutor::new(f.test_db.pool().clone(), runner)
+            .with_profile(custom_profile);
+
+        let failure = executor
+            .execute_claimed(&claimed)
+            .await
+            .expect_err("timeout must fail closed");
+
+        assert_eq!(failure.error_code, "SANDBOX_TIMEOUT");
+
+        let artifact_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM parser_artifacts WHERE document_version_id = $1",
+        )
+        .bind(version_id.as_uuid())
+        .fetch_one(f.test_db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            artifact_count, 0,
+            "Zero parser artifacts must be persisted on timeout"
+        );
+    }
 }
