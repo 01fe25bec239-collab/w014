@@ -706,11 +706,130 @@ fn test_threat_name_sanitization() {
     );
     assert_eq!(sanitize_threat_name("Trojan\0\r\nName"), "TrojanName");
     assert_eq!(sanitize_threat_name(""), "UnknownThreat");
+    assert_eq!(sanitize_threat_name("   "), "UnknownThreat");
+    assert_eq!(sanitize_threat_name("\0\r\n\t"), "UnknownThreat");
+}
+
+#[test]
+fn test_threat_name_utf8_truncation_no_panic_matrix() {
+    use w014_domain::limits::MAX_REASON_CODE_BYTES;
+
+    // 127 ASCII bytes + 2-byte character ('é' = 2 bytes) -> byte 128 is inside 'é'
+    let input_127_2b = format!("{}é", "A".repeat(127));
+    let sanitized_127_2b = sanitize_threat_name(&input_127_2b);
+    assert_eq!(sanitized_127_2b.len(), 127);
+    assert_eq!(sanitized_127_2b, "A".repeat(127));
+    assert!(sanitized_127_2b.len() <= MAX_REASON_CODE_BYTES);
+
+    // 127 ASCII bytes + 3-byte character ('€' = 3 bytes) -> byte 128 is inside '€'
+    let input_127_3b = format!("{}€", "A".repeat(127));
+    let sanitized_127_3b = sanitize_threat_name(&input_127_3b);
+    assert_eq!(sanitized_127_3b.len(), 127);
+    assert_eq!(sanitized_127_3b, "A".repeat(127));
+    assert!(sanitized_127_3b.len() <= MAX_REASON_CODE_BYTES);
+
+    // 127 ASCII bytes + 4-byte emoji ('🦀' = 4 bytes) -> byte 128 is inside '🦀'
+    let input_127_4b = format!("{}🦀", "A".repeat(127));
+    let sanitized_127_4b = sanitize_threat_name(&input_127_4b);
+    assert_eq!(sanitized_127_4b.len(), 127);
+    assert_eq!(sanitized_127_4b, "A".repeat(127));
+    assert!(sanitized_127_4b.len() <= MAX_REASON_CODE_BYTES);
+
+    // Long two-byte code points: 'é' (2 bytes each) x 100 = 200 bytes
+    let input_2b = "é".repeat(100);
+    let sanitized_2b = sanitize_threat_name(&input_2b);
+    assert_eq!(sanitized_2b.len(), 128); // 64 x 2 = 128
+    assert_eq!(sanitized_2b, "é".repeat(64));
+    assert!(sanitized_2b.len() <= MAX_REASON_CODE_BYTES);
+
+    // 1 ASCII + Long two-byte code points: 1 byte + 'é'*100 (200 bytes) -> boundary lands inside 64th 'é'
+    let input_1_2b = format!("X{}", "é".repeat(100));
+    let sanitized_1_2b = sanitize_threat_name(&input_1_2b);
+    assert_eq!(sanitized_1_2b.len(), 127); // 1 + 63*2 = 127
+    assert_eq!(sanitized_1_2b, format!("X{}", "é".repeat(63)));
+    assert!(sanitized_1_2b.len() <= MAX_REASON_CODE_BYTES);
+
+    // Long three-byte code points: '€' (3 bytes each) x 60 = 180 bytes
+    let input_3b = "€".repeat(60);
+    let sanitized_3b = sanitize_threat_name(&input_3b);
+    assert_eq!(sanitized_3b.len(), 126); // 42 x 3 = 126
+    assert_eq!(sanitized_3b, "€".repeat(42));
+    assert!(sanitized_3b.len() <= MAX_REASON_CODE_BYTES);
+
+    // Long four-byte emoji: '🦀' (4 bytes each) x 50 = 200 bytes
+    let input_4b = "🦀".repeat(50);
+    let sanitized_4b = sanitize_threat_name(&input_4b);
+    assert_eq!(sanitized_4b.len(), 128); // 32 x 4 = 128
+    assert_eq!(sanitized_4b, "🦀".repeat(32));
+    assert!(sanitized_4b.len() <= MAX_REASON_CODE_BYTES);
+
+    // 1 ASCII + Long four-byte emoji: 1 byte + '🦀'*50 (200 bytes) -> boundary lands inside 32nd '🦀'
+    let input_1_4b = format!("X{}", "🦀".repeat(50));
+    let sanitized_1_4b = sanitize_threat_name(&input_1_4b);
+    assert_eq!(sanitized_1_4b.len(), 125); // 1 + 31*4 = 125
+    assert_eq!(sanitized_1_4b, format!("X{}", "🦀".repeat(31)));
+    assert!(sanitized_1_4b.len() <= MAX_REASON_CODE_BYTES);
+
+    // Control characters + multibyte content
+    let input_ctrl_mb = "Trojan\0\r\n\x07\x1b🦀.Variant.€é\0";
+    let sanitized_ctrl_mb = sanitize_threat_name(input_ctrl_mb);
+    assert_eq!(sanitized_ctrl_mb, "Trojan🦀.Variant.€é");
+}
+
+#[tokio::test]
+async fn test_clamav_instream_exact_clean_framing_pass() {
+    let clean_cases: [&[u8]; 3] = [b"stream: OK\0", b"stream: OK\n", b"stream: OK\r\n"];
+
+    for clean_wire in clean_cases {
+        let resp_bytes = clean_wire.to_vec();
+        let (host, port, _server) =
+            spawn_mock_clamd_server(move |_| (None, resp_bytes.clone())).await;
+
+        let config = ClamAvConfig::new(host, port);
+        let client = ClamAvClient::new(config);
+
+        let outcome = client
+            .scan(b"%PDF-1.7 clean bytes")
+            .await
+            .expect("exact clean framing must pass");
+        assert_eq!(outcome.verdict, ScanVerdict::Clean);
+    }
 }
 
 #[tokio::test]
 async fn test_clamav_instream_malformed_clean_responses_fail_closed() {
     let malformed_responses = [
+        "  stream: OK  \0",
+        " stream: OK\0",
+        "stream: OK \0",
+        "  stream: OK\0",
+        "stream: OK  \0",
+        "\tstream: OK\0",
+        "stream: OK\t\0",
+        "\tstream: OK\t\0",
+        "\u{00A0}stream: OK\0",
+        "stream: OK\u{00A0}\0",
+        "\u{2003}stream: OK\0",
+        "stream: OK\u{2003}\0",
+        "\x0bstream: OK\0",
+        "stream: OK\x0b\0",
+        "\x0cstream: OK\0",
+        "stream: OK\x0c\0",
+        " stream: OK\n",
+        "stream: OK \n",
+        "\tstream: OK\n",
+        "stream: OK\t\n",
+        " stream: OK\r\n",
+        "stream: OK \r\n",
+        "\tstream: OK\r\n",
+        "stream: OK\t\r\n",
+        "stream: OK\0\0",
+        "stream: OK\n\n",
+        "stream: OK\r\n\r\n",
+        "\0stream: OK\0",
+        "\nstream: OK\0",
+        "\r\nstream: OK\0",
+        "stream: OK\nstream: OK\0",
         "UNKNOWN SERVER OK\0",
         "foo: OK\0",
         "stream: MAYBE OK\0",
@@ -736,11 +855,11 @@ async fn test_clamav_instream_malformed_clean_responses_fail_closed() {
         let res = client.scan(b"%PDF-1.7 sample bytes").await;
         assert!(
             res.is_err(),
-            "Malformed response '{raw}' must fail closed, but got {res:?}"
+            "Malformed response '{raw:?}' must fail closed, but got {res:?}"
         );
         assert!(
             matches!(res.unwrap_err(), ScannerError::Protocol(_)),
-            "Malformed response '{raw}' must fail with ScannerError::Protocol"
+            "Malformed response '{raw:?}' must fail with ScannerError::Protocol"
         );
     }
 }
@@ -769,5 +888,50 @@ async fn test_clamav_instream_malformed_found_responses_fail_closed() {
             "Malformed FOUND response '{raw}' must fail closed, but got {res:?}"
         );
         assert!(matches!(res.unwrap_err(), ScannerError::Protocol(_)));
+    }
+}
+
+#[tokio::test]
+async fn test_clamav_instream_multibyte_and_emoji_found_responses_never_panic() {
+    let threat_cases = [
+        // Long 4-byte emoji
+        ("🦀".repeat(50), "🦀".repeat(32)),
+        // 127 ASCII + 4-byte emoji
+        (format!("{}🦀", "A".repeat(127)), "A".repeat(127)),
+        // 127 ASCII + 2-byte char
+        (format!("{}é", "B".repeat(127)), "B".repeat(127)),
+        // 127 ASCII + 3-byte char
+        (format!("{}€", "C".repeat(127)), "C".repeat(127)),
+        // Long 2-byte chars
+        ("é".repeat(100), "é".repeat(64)),
+        // Long 3-byte chars
+        ("€".repeat(60), "€".repeat(42)),
+        // Hostile control codes with emoji
+        (
+            "Hostile\0\r\n\x1b\x07Threat.🦀.Variant".to_string(),
+            "HostileThreat.🦀.Variant".to_string(),
+        ),
+    ];
+
+    for (raw_threat, expected_threat) in threat_cases {
+        let response_wire = format!("stream: {raw_threat} FOUND\0").into_bytes();
+        let (host, port, _server) =
+            spawn_mock_clamd_server(move |_| (None, response_wire.clone())).await;
+
+        let config = ClamAvConfig::new(host, port);
+        let client = ClamAvClient::new(config);
+
+        let outcome = client
+            .scan(b"%PDF-1.7 sample document")
+            .await
+            .expect("Multibyte threat scan must not panic and must return ScanOutcome");
+
+        assert_eq!(
+            outcome.verdict,
+            ScanVerdict::Malware {
+                threat_name: expected_threat.clone(),
+            }
+        );
+        assert!(outcome.verdict.threat_name().unwrap().len() <= 128);
     }
 }
