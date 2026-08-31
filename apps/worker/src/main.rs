@@ -74,8 +74,8 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Construct the parser sandbox runner and register the authoritative WI-0205
-    // parser executor for ParseDocumentPdf and ParseDocumentDocxOcr.
+    // Construct the parser sandbox runner and register the authoritative W2
+    // document-processing executors for malware scan and document parse.
     let sandbox_runner = create_default_sandbox_runner();
     let registry = build_production_executor_registry(pool.clone(), sandbox_runner);
     let loop_runner = DurableJobLoop::new(

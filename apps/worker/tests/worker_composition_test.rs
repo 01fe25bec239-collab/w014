@@ -1,9 +1,11 @@
 //! Production worker executor composition test suite.
 //!
 //! Validates:
-//! - Real production `ExecutorRegistry` registers `JobKind::ParseDocumentPdf` and `JobKind::ParseDocumentDocxOcr`
-//! - Registered executor is the authoritative WI-0205 `ParserSandboxJobExecutor`
-//! - Real `DurableJobLoop` claims and dispatches parse jobs to the real executor
+//! - Real production `ExecutorRegistry` registers all 4 W2 document-processing kinds:
+//!   `JobKind::MalwareScanDocumentPdf`, `JobKind::MalwareScanDocumentDocxOcr`,
+//!   `JobKind::ParseDocumentPdf`, `JobKind::ParseDocumentDocxOcr`
+//! - Registered executors are the authoritative `MalwareScanJobExecutor` and `ParserSandboxJobExecutor`
+//! - Real `DurableJobLoop` claims and dispatches malware scan and parse jobs
 //! - Fenced execution, progress reporting, and audit persistence work through the production loop
 //! - Malware-gate admission precondition enforcement through the production loop
 //! - No placeholder, fake worker, or second queue exists
@@ -259,8 +261,69 @@ async fn enqueue_parse_job(
     job_id
 }
 
+async fn enqueue_malware_scan_job(
+    f: &TestFixture,
+    filename: &str,
+    media_type: MediaType,
+    bytes: &[u8],
+) -> (UploadIntent, Uuid, JobKind) {
+    let mut tx = f.test_db.pool().begin().await.unwrap();
+    let intent = UploadIntent::new(
+        f.ws.id,
+        f.principal.id,
+        None,
+        filename,
+        media_type,
+        bytes.len() as i64,
+        Some(Sha256::digest(bytes)),
+        Utc::now() + ChronoDuration::minutes(5),
+    )
+    .unwrap();
+    UploadIntentRepository::insert(&mut tx, &intent)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let bucket = "w014-documents";
+    let key = intent.opaque_object_key.as_str();
+    DocumentService::stage_mock_upload_bytes(bucket, key, bytes, media_type.as_str());
+
+    let idemp_store = PostgresIdempotencyStore::new();
+    let mut tx = f.test_db.pool().begin().await.unwrap();
+    let _finalize_res = DocumentService::execute_finalize_upload_tx(
+        &mut tx,
+        &f.awc,
+        f.principal.id,
+        intent.id,
+        Utc::now(),
+        None,
+        &idemp_store,
+    )
+    .await
+    .expect("finalize must succeed");
+    tx.commit().await.unwrap();
+
+    let expected_kind = match media_type {
+        MediaType::ApplicationPdf => JobKind::MalwareScanDocumentPdf,
+        MediaType::Docx => JobKind::MalwareScanDocumentDocxOcr,
+    };
+
+    let job_row = sqlx::query(
+        "SELECT job_id FROM jobs WHERE workspace_id = $1 AND queue_name = $2 AND job_type = $3 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(f.ws.id.as_uuid())
+    .bind(QUEUE_MALWARE_SCAN)
+    .bind(expected_kind.as_str())
+    .fetch_one(f.test_db.pool())
+    .await
+    .unwrap();
+    let job_id: Uuid = job_row.get("job_id");
+
+    (intent, job_id, expected_kind)
+}
+
 #[tokio::test]
-async fn test_production_registry_registers_parse_pdf_and_docx_ocr() {
+async fn test_production_registry_registers_all_four_w2_document_processing_kinds() {
     let f = setup_fixture().await;
     let runner = Arc::new(MockSandboxRunner::new());
     let registry = build_production_executor_registry(f.test_db.pool().clone(), runner);
@@ -271,33 +334,156 @@ async fn test_production_registry_registers_parse_pdf_and_docx_ocr() {
         "Production registry must not be empty"
     );
 
-    // 2. Verify ParseDocumentPdf is registered
+    // 2. Verify MalwareScanDocumentPdf is registered
+    assert!(
+        registry.get(JobKind::MalwareScanDocumentPdf).is_some(),
+        "JobKind::MalwareScanDocumentPdf must have a registered executor"
+    );
+
+    // 3. Verify MalwareScanDocumentDocxOcr is registered
+    assert!(
+        registry.get(JobKind::MalwareScanDocumentDocxOcr).is_some(),
+        "JobKind::MalwareScanDocumentDocxOcr must have a registered executor"
+    );
+
+    // 4. Verify ParseDocumentPdf is registered
     assert!(
         registry.get(JobKind::ParseDocumentPdf).is_some(),
         "JobKind::ParseDocumentPdf must have a registered executor"
     );
 
-    // 3. Verify ParseDocumentDocxOcr is registered
+    // 5. Verify ParseDocumentDocxOcr is registered
     assert!(
         registry.get(JobKind::ParseDocumentDocxOcr).is_some(),
         "JobKind::ParseDocumentDocxOcr must have a registered executor"
     );
 
-    // 4. Verify registered kinds contains both parse kinds
+    // 6. Verify registered kinds contains exactly all 4 W2 document-processing kinds
     let kinds = registry.registered_kinds();
-    assert_eq!(kinds.len(), 2);
+    assert_eq!(
+        kinds.len(),
+        4,
+        "Production registry must register exactly 4 W2 kinds"
+    );
+    assert!(kinds.contains(&JobKind::MalwareScanDocumentPdf));
+    assert!(kinds.contains(&JobKind::MalwareScanDocumentDocxOcr));
     assert!(kinds.contains(&JobKind::ParseDocumentPdf));
     assert!(kinds.contains(&JobKind::ParseDocumentDocxOcr));
+}
 
-    // 5. Verify non-parser kinds are NOT registered
-    assert!(
-        registry.get(JobKind::MalwareScanDocumentPdf).is_none(),
-        "Malware scan must not be in parser executor registry"
-    );
-    assert!(
-        registry.get(JobKind::MalwareScanDocumentDocxOcr).is_none(),
-        "Malware scan must not be in parser executor registry"
-    );
+#[tokio::test]
+async fn test_production_durable_job_loop_claims_malware_scan_document_pdf() {
+    let f = setup_fixture().await;
+    let pdf_bytes = b"%PDF-1.7 Test document for malware scan claim reachability";
+    let (_intent, job_id, kind) =
+        enqueue_malware_scan_job(&f, "scan_test.pdf", MediaType::ApplicationPdf, pdf_bytes).await;
+    assert_eq!(kind, JobKind::MalwareScanDocumentPdf);
+
+    let runner = Arc::new(MockSandboxRunner::new());
+    let registry = build_production_executor_registry(f.test_db.pool().clone(), runner);
+    let loop_config = DurableJobLoopConfig {
+        queues: vec![QUEUE_MALWARE_SCAN.to_string()],
+        lease_duration: Duration::from_secs(30),
+        poll_interval: Duration::from_millis(50),
+    };
+
+    let worker_id = WorkerId::new();
+    let loop_runner = DurableJobLoop::new(f.queue.clone(), registry, worker_id, loop_config);
+
+    let claimed = loop_runner
+        .poll_once()
+        .await
+        .expect("poll_once must succeed")
+        .expect("must claim the queued malware scan pdf job");
+
+    assert_eq!(claimed.job_id, job_id);
+    assert_eq!(claimed.kind, JobKind::MalwareScanDocumentPdf);
+}
+
+#[tokio::test]
+async fn test_production_durable_job_loop_claims_malware_scan_document_docx_ocr() {
+    let f = setup_fixture().await;
+    let docx_bytes = b"PK\x03\x04 Test document for malware scan claim reachability";
+    let (_intent, job_id, kind) =
+        enqueue_malware_scan_job(&f, "scan_test.docx", MediaType::Docx, docx_bytes).await;
+    assert_eq!(kind, JobKind::MalwareScanDocumentDocxOcr);
+
+    let runner = Arc::new(MockSandboxRunner::new());
+    let registry = build_production_executor_registry(f.test_db.pool().clone(), runner);
+    let loop_config = DurableJobLoopConfig {
+        queues: vec![QUEUE_MALWARE_SCAN.to_string()],
+        lease_duration: Duration::from_secs(30),
+        poll_interval: Duration::from_millis(50),
+    };
+
+    let worker_id = WorkerId::new();
+    let loop_runner = DurableJobLoop::new(f.queue.clone(), registry, worker_id, loop_config);
+
+    let claimed = loop_runner
+        .poll_once()
+        .await
+        .expect("poll_once must succeed")
+        .expect("must claim the queued malware scan docx ocr job");
+
+    assert_eq!(claimed.job_id, job_id);
+    assert_eq!(claimed.kind, JobKind::MalwareScanDocumentDocxOcr);
+}
+
+#[tokio::test]
+async fn test_production_durable_job_loop_claims_all_four_kinds_on_combined_queues() {
+    let f = setup_fixture().await;
+    let runner = Arc::new(MockSandboxRunner::new());
+    let registry = build_production_executor_registry(f.test_db.pool().clone(), runner);
+    let loop_config = DurableJobLoopConfig {
+        queues: vec![
+            QUEUE_MALWARE_SCAN.to_string(),
+            QUEUE_DOCUMENT_PARSE.to_string(),
+        ],
+        lease_duration: Duration::from_secs(30),
+        poll_interval: Duration::from_millis(50),
+    };
+
+    let worker_id = WorkerId::new();
+    let loop_runner = DurableJobLoop::new(f.queue.clone(), registry, worker_id, loop_config);
+
+    // 1. Enqueue parse PDF and DOCX jobs (with prior clean scans completed)
+    let pdf_bytes = b"%PDF-1.7 Test document";
+    let (_intent_p_pdf, v_pdf, a_pdf) =
+        create_document_with_clean_scan(&f, "p1.pdf", MediaType::ApplicationPdf, pdf_bytes).await;
+    let job_id_p_pdf = enqueue_parse_job(&f, JobKind::ParseDocumentPdf, v_pdf, a_pdf).await;
+
+    let docx_bytes = b"PK\x03\x04 Test docx";
+    let (_intent_p_docx, v_docx, a_docx) =
+        create_document_with_clean_scan(&f, "p2.docx", MediaType::Docx, docx_bytes).await;
+    let job_id_p_docx = enqueue_parse_job(&f, JobKind::ParseDocumentDocxOcr, v_docx, a_docx).await;
+
+    // 2. Enqueue standalone malware PDF and DOCX jobs
+    let (_intent_m_pdf, job_id_m_pdf, _) =
+        enqueue_malware_scan_job(&f, "m1.pdf", MediaType::ApplicationPdf, pdf_bytes).await;
+
+    let (_intent_m_docx, job_id_m_docx, _) =
+        enqueue_malware_scan_job(&f, "m2.docx", MediaType::Docx, docx_bytes).await;
+
+    // 3. Claim jobs through the real DurableJobLoop with combined queues
+    let mut claimed_kinds = Vec::new();
+    let mut claimed_ids = Vec::new();
+    for _ in 0..4 {
+        if let Some(claimed) = loop_runner.poll_once().await.unwrap() {
+            claimed_kinds.push(claimed.kind);
+            claimed_ids.push(claimed.job_id);
+        }
+    }
+
+    assert_eq!(claimed_kinds.len(), 4);
+    assert!(claimed_kinds.contains(&JobKind::MalwareScanDocumentPdf));
+    assert!(claimed_kinds.contains(&JobKind::MalwareScanDocumentDocxOcr));
+    assert!(claimed_kinds.contains(&JobKind::ParseDocumentPdf));
+    assert!(claimed_kinds.contains(&JobKind::ParseDocumentDocxOcr));
+
+    assert!(claimed_ids.contains(&job_id_m_pdf));
+    assert!(claimed_ids.contains(&job_id_m_docx));
+    assert!(claimed_ids.contains(&job_id_p_pdf));
+    assert!(claimed_ids.contains(&job_id_p_docx));
 }
 
 #[tokio::test]
@@ -661,4 +847,13 @@ fn test_default_sandbox_runner_factory() {
     assert_eq!(DEFAULT_PARSER_SANDBOX_BIN, "w014-parser-sandbox");
     assert_eq!(ENV_PARSER_SANDBOX_BIN, "W014_PARSER_SANDBOX_BIN");
     drop(runner);
+}
+
+#[test]
+fn test_production_wiring_uses_real_clamav_client_configuration() {
+    let clamav_config = w014_document_processing::scanner::ClamAvConfig::from_env();
+    assert_eq!(clamav_config.host, "127.0.0.1");
+    assert_eq!(clamav_config.port, 3310);
+    assert_eq!(clamav_config.timeout, Duration::from_secs(120));
+    assert_eq!(clamav_config.max_object_bytes, 100 * 1024 * 1024);
 }

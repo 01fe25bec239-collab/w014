@@ -7,8 +7,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use w014_application::services::ParserSandboxJobExecutor;
+use w014_application::services::{MalwareScanJobExecutor, ParserSandboxJobExecutor};
 use w014_document_processing::sandbox::{ProcessSandboxRunner, SandboxRunner};
+use w014_document_processing::scanner::{ClamAvClient, ClamAvConfig};
 use w014_jobs::executor::ExecutorRegistry;
 use w014_jobs::kind::JobKind;
 
@@ -29,6 +30,8 @@ pub fn create_default_sandbox_runner() -> Arc<dyn SandboxRunner> {
 /// Builds the production `ExecutorRegistry` registering all authoritative job executors.
 ///
 /// Registers:
+/// - `JobKind::MalwareScanDocumentPdf` -> `MalwareScanJobExecutor`
+/// - `JobKind::MalwareScanDocumentDocxOcr` -> `MalwareScanJobExecutor`
 /// - `JobKind::ParseDocumentPdf` -> `ParserSandboxJobExecutor`
 /// - `JobKind::ParseDocumentDocxOcr` -> `ParserSandboxJobExecutor`
 #[must_use]
@@ -36,8 +39,13 @@ pub fn build_production_executor_registry(
     pool: PgPool,
     runner: Arc<dyn SandboxRunner>,
 ) -> ExecutorRegistry {
+    let clamav_config = ClamAvConfig::from_env();
+    let scanner = Arc::new(ClamAvClient::new(clamav_config));
+    let malware_executor = Arc::new(MalwareScanJobExecutor::new(pool.clone(), scanner));
     let parser_executor = Arc::new(ParserSandboxJobExecutor::new(pool, runner));
     ExecutorRegistry::new()
+        .with_executor(JobKind::MalwareScanDocumentPdf, malware_executor.clone())
+        .with_executor(JobKind::MalwareScanDocumentDocxOcr, malware_executor)
         .with_executor(JobKind::ParseDocumentPdf, parser_executor.clone())
         .with_executor(JobKind::ParseDocumentDocxOcr, parser_executor)
 }
