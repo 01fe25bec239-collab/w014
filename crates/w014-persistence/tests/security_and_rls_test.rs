@@ -917,9 +917,9 @@ async fn test_m002r_rls_isolation_and_composite_fk_enforcement() {
     let artifact_b = Uuid::new_v4();
     let dummy_hash = vec![0u8; 32];
     sqlx::query(
-        "INSERT INTO object_artifacts (object_artifact_id, workspace_id, artifact_kind, storage_bucket, object_key, byte_length, content_sha256, content_type, sse_mode) \
-         VALUES ($1, $2, 'original', 'w014-test', $3, 100, $4, 'application/pdf', 'none'), \
-                ($5, $6, 'original', 'w014-test', $7, 200, $4, 'application/pdf', 'none')",
+        "INSERT INTO object_artifacts (object_artifact_id, workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+         VALUES ($1, $2, 'raw_upload', $3, 100, $4, 'application/pdf', 'aws:kms'), \
+                ($5, $6, 'raw_upload', $7, 200, $4, 'application/pdf', 'aws:kms')",
     )
     .bind(artifact_a)
     .bind(ws_a)

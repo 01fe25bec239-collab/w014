@@ -373,8 +373,7 @@ async fn test_database_catalog_state_and_security_mechanics() {
         ("object_artifacts", "uq_object_artifacts_object_key"),
         ("object_artifacts", "uq_object_artifacts_id_workspace"),
         ("quarantine_records", "fk_quarantine_records_intent_ws"),
-        ("quarantine_records", "fk_quarantine_records_doc_ver_ws"),
-        ("quarantine_records", "fk_quarantine_records_artifact_ws"),
+        ("quarantine_records", "uq_quarantine_records_upload_intent"),
         ("quarantine_records", "uq_quarantine_records_id_workspace"),
         ("document_versions", "fk_document_versions_artifact_ws"),
         ("jobs", "uq_jobs_id_workspace"),
@@ -1251,7 +1250,6 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
         obj_cols.contains_key("artifact_kind"),
         "object_artifacts.artifact_kind must be an explicit closed-domain fact"
     );
-    assert!(obj_cols.contains_key("storage_bucket"));
     assert!(
         obj_cols.contains_key("object_key"),
         "object_artifacts.object_key must be the server-owned authority column"
@@ -1262,16 +1260,35 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
     );
     assert!(obj_cols.contains_key("content_sha256"));
     assert_eq!(obj_cols["content_sha256"].0, "bytea");
-    assert!(obj_cols.contains_key("content_type"));
-    assert!(obj_cols.contains_key("storage_tier"));
+    assert!(
+        obj_cols.contains_key("media_type"),
+        "object_artifacts.media_type must be the explicit frozen column"
+    );
     assert!(
         obj_cols.contains_key("sse_mode"),
         "object_artifacts.sse_mode must be an explicit encryption-posture fact"
     );
     assert!(obj_cols.contains_key("kms_key_ref"));
     assert_eq!(obj_cols["kms_key_ref"].1, "YES");
+    assert!(
+        obj_cols.contains_key("retention_until"),
+        "object_artifacts.retention_until must be an explicit nullable timestamptz column"
+    );
+    assert_eq!(obj_cols["retention_until"].1, "YES");
     assert!(obj_cols.contains_key("created_at"));
     // Defective substitutes must NOT remain.
+    assert!(
+        !obj_cols.contains_key("storage_bucket"),
+        "defective 'storage_bucket' must not remain in object_artifacts"
+    );
+    assert!(
+        !obj_cols.contains_key("storage_tier"),
+        "defective 'storage_tier' must not remain in object_artifacts"
+    );
+    assert!(
+        !obj_cols.contains_key("content_type"),
+        "defective 'content_type' must not remain in object_artifacts (frozen name: media_type)"
+    );
     assert!(
         !obj_cols.contains_key("storage_key"),
         "defective 'storage_key' must not remain in object_artifacts (frozen name: object_key)"
@@ -1297,22 +1314,38 @@ async fn test_exact_17_table_m002r_physical_prompt12_conformance() {
         qr_cols["upload_intent_id"].1, "NO",
         "quarantine_records.upload_intent_id must be NOT NULL"
     );
-    assert!(qr_cols.contains_key("document_version_id"));
-    assert_eq!(qr_cols["document_version_id"].1, "YES");
-    assert!(qr_cols.contains_key("object_artifact_id"));
-    assert_eq!(qr_cols["object_artifact_id"].1, "YES");
-    assert!(qr_cols.contains_key("scanner_name"));
-    assert!(qr_cols.contains_key("scanner_version"));
-    assert_eq!(qr_cols["scanner_version"].1, "YES");
+    assert!(
+        qr_cols.contains_key("scanner_version"),
+        "quarantine_records.scanner_version must be an explicit frozen column"
+    );
+    assert_eq!(
+        qr_cols["scanner_version"].1, "NO",
+        "quarantine_records.scanner_version must be NOT NULL"
+    );
     assert!(
         qr_cols.contains_key("reason_code"),
         "quarantine_records.reason_code must be the explicit frozen reason column"
     );
-    assert!(qr_cols.contains_key("threat_details"));
-    assert_eq!(qr_cols["threat_details"].0, "jsonb");
+    assert_eq!(qr_cols["reason_code"].1, "YES");
     assert!(qr_cols.contains_key("status"));
     assert!(qr_cols.contains_key("checked_at"));
-    // Defective substitutes must NOT remain.
+    // Defective / non-frozen substitutes must NOT remain.
+    assert!(
+        !qr_cols.contains_key("document_version_id"),
+        "non-frozen 'document_version_id' must not remain in quarantine_records"
+    );
+    assert!(
+        !qr_cols.contains_key("object_artifact_id"),
+        "non-frozen 'object_artifact_id' must not remain in quarantine_records"
+    );
+    assert!(
+        !qr_cols.contains_key("scanner_name"),
+        "non-frozen 'scanner_name' must not remain in quarantine_records"
+    );
+    assert!(
+        !qr_cols.contains_key("threat_details"),
+        "non-frozen 'threat_details' must not remain in quarantine_records"
+    );
     assert!(
         !qr_cols.contains_key("quarantine_reason"),
         "defective 'quarantine_reason' must not remain in quarantine_records (frozen name: reason_code)"

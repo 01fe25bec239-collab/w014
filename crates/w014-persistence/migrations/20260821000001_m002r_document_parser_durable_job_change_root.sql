@@ -8,14 +8,14 @@
 -- caller-supplied context):
 --   documents            : current_version_id (nullable deferred pointer, staged FK)
 --   object_artifacts     : artifact_kind, object_key, content_sha256, byte_length,
---                          sse_mode, kms_key_ref + immutable object-fact semantics
+--                          media_type, sse_mode, kms_key_ref, retention_until + immutable object-fact semantics
 --   upload_intents       : opaque_object_key, expected_media_type, expected_length,
 --                          expected_sha256_b64, created_by, finalized_at, abandoned_at,
 --                          object_artifact_id binding + one-way terminal semantics
 --   document_versions    : object_artifact_id, original_filename + immutable row with
 --                          guarded one-way trust_state transitions
---   quarantine_records   : upload_intent_id, reason_code, checked_at + frozen scan
---                          outcome domain + insert-only rescan-append semantics
+--   quarantine_records   : upload_intent_id, status, scanner_version, reason_code, checked_at +
+--                          frozen scan outcome domain + insert-only semantics + UNIQUE(upload_intent_id)
 --   parser_artifacts     : locator_version, artifact_object_id, text_sha256,
 --                          started_at, failure_code + guarded terminal transitions
 
@@ -48,23 +48,21 @@ CREATE INDEX IF NOT EXISTS idx_documents_current_version ON documents(current_ve
 
 -- 1.2 Object Artifacts Table
 -- Server-owned immutable object facts: the object key is minted server-side,
--- never client-selected; digest/length/kind/encryption posture are explicit
--- frozen physical columns, not JSONB substitutes. Rows are insert-only.
+-- never client-selected; digest/length/kind/media_type/encryption posture/retention
+-- are explicit frozen physical columns, not JSONB substitutes. Rows are insert-only.
 CREATE TABLE IF NOT EXISTS object_artifacts (
     object_artifact_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     artifact_kind TEXT NOT NULL,
-    storage_bucket TEXT NOT NULL,
     object_key TEXT NOT NULL,
-    byte_length BIGINT NOT NULL,
     content_sha256 BYTEA NOT NULL,
-    content_type TEXT NOT NULL,
-    storage_tier TEXT NOT NULL DEFAULT 'hot',
-    sse_mode TEXT NOT NULL,
+    byte_length BIGINT NOT NULL,
+    media_type TEXT NOT NULL,
+    sse_mode TEXT NOT NULL DEFAULT 'aws:kms',
     kms_key_ref TEXT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT chk_object_artifacts_kind CHECK (artifact_kind IN ('original', 'derived')),
-    CONSTRAINT chk_object_artifacts_bucket_non_empty CHECK (length(trim(storage_bucket)) > 0),
+    retention_until TIMESTAMPTZ NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT chk_object_artifacts_kind CHECK (artifact_kind IN ('raw_upload', 'ocr', 'parser', 'page_preview', 'report_json', 'report_pdf', 'temp')),
     CONSTRAINT chk_object_artifacts_key_shape CHECK (
         length(object_key) <= 1024
         AND object_key ~ '^[!-~]+$'
@@ -74,15 +72,16 @@ CREATE TABLE IF NOT EXISTS object_artifacts (
     ),
     CONSTRAINT chk_object_artifacts_byte_length_non_negative CHECK (byte_length >= 0),
     CONSTRAINT chk_object_artifacts_content_sha256_len CHECK (octet_length(content_sha256) = 32),
-    CONSTRAINT chk_object_artifacts_content_type_non_empty CHECK (length(trim(content_type)) > 0),
-    CONSTRAINT chk_object_artifacts_tier CHECK (storage_tier IN ('hot', 'warm', 'cold', 'archive')),
-    CONSTRAINT chk_object_artifacts_sse_mode CHECK (sse_mode IN ('none', 'sse_aes256')),
+    CONSTRAINT chk_object_artifacts_media_type_non_empty CHECK (length(trim(media_type)) > 0),
+    CONSTRAINT chk_object_artifacts_sse_mode CHECK (sse_mode IN ('aws:kms', 'local')),
     CONSTRAINT chk_object_artifacts_kms_ref_non_empty CHECK (kms_key_ref IS NULL OR length(trim(kms_key_ref)) > 0),
     CONSTRAINT uq_object_artifacts_object_key UNIQUE (object_key),
-    CONSTRAINT uq_object_artifacts_id_workspace UNIQUE (object_artifact_id, workspace_id)
+    CONSTRAINT uq_object_artifacts_id_workspace UNIQUE (object_artifact_id, workspace_id),
+    CONSTRAINT uq_object_artifacts_workspace_id UNIQUE (workspace_id, object_artifact_id)
 );
 CREATE INDEX IF NOT EXISTS idx_object_artifacts_workspace_id ON object_artifacts(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_object_artifacts_content_sha256 ON object_artifacts(content_sha256);
+CREATE INDEX IF NOT EXISTS idx_object_artifacts_workspace_kind_created ON object_artifacts(workspace_id, artifact_kind, created_at);
 
 CREATE OR REPLACE FUNCTION fn_enforce_object_artifacts_append_only()
 RETURNS TRIGGER AS $$
@@ -298,33 +297,25 @@ CREATE INDEX IF NOT EXISTS idx_doc_ver_metadata_workspace_id ON document_version
 -- 1.6 Quarantine Records Table
 -- Immutable scan-outcome facts tied physically to the scanned upload intent.
 -- The outcome rides in the frozen closed status domain (never hidden in JSONB).
--- A rescan is expressed by appending a brand-new record; recorded results are
--- never rewritten.
+-- Single quarantine fact per upload_intent (rescan uses a new upload/version);
+-- recorded results are immutable and insert-only.
 CREATE TABLE IF NOT EXISTS quarantine_records (
     quarantine_record_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     upload_intent_id UUID NOT NULL,
-    document_version_id UUID NULL,
-    object_artifact_id UUID NULL,
-    scanner_name TEXT NOT NULL,
-    scanner_version TEXT NULL,
-    reason_code TEXT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
-    checked_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    threat_details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    scanner_version TEXT NOT NULL,
+    reason_code TEXT NULL,
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT fk_quarantine_records_intent_ws FOREIGN KEY (upload_intent_id, workspace_id) REFERENCES upload_intents(upload_intent_id, workspace_id) ON DELETE CASCADE,
-    CONSTRAINT fk_quarantine_records_doc_ver_ws FOREIGN KEY (document_version_id, workspace_id) REFERENCES document_versions(document_version_id, workspace_id) ON DELETE CASCADE,
-    CONSTRAINT fk_quarantine_records_artifact_ws FOREIGN KEY (object_artifact_id, workspace_id) REFERENCES object_artifacts(object_artifact_id, workspace_id) ON DELETE SET NULL (object_artifact_id),
-    CONSTRAINT chk_quarantine_records_scanner_non_empty CHECK (length(trim(scanner_name)) > 0),
-    CONSTRAINT chk_quarantine_records_scanner_version_non_empty CHECK (scanner_version IS NULL OR length(trim(scanner_version)) > 0),
+    CONSTRAINT uq_quarantine_records_upload_intent UNIQUE (upload_intent_id),
+    CONSTRAINT uq_quarantine_records_id_workspace UNIQUE (quarantine_record_id, workspace_id),
+    CONSTRAINT chk_quarantine_records_scanner_version_non_empty CHECK (length(trim(scanner_version)) > 0),
     CONSTRAINT chk_quarantine_records_reason_code_non_empty CHECK (reason_code IS NULL OR length(trim(reason_code)) > 0),
-    CONSTRAINT chk_quarantine_records_status CHECK (status IN ('pending', 'clean', 'malware', 'integrity_failed', 'unsupported')),
-    CONSTRAINT uq_quarantine_records_id_workspace UNIQUE (quarantine_record_id, workspace_id)
+    CONSTRAINT chk_quarantine_records_status CHECK (status IN ('pending', 'clean', 'malware', 'integrity_failed', 'unsupported'))
 );
 CREATE INDEX IF NOT EXISTS idx_quarantine_records_workspace_id ON quarantine_records(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_quarantine_records_intent ON quarantine_records(upload_intent_id);
-CREATE INDEX IF NOT EXISTS idx_quarantine_records_doc_ver ON quarantine_records(document_version_id);
-CREATE INDEX IF NOT EXISTS idx_quarantine_records_object ON quarantine_records(object_artifact_id);
 CREATE INDEX IF NOT EXISTS idx_quarantine_records_status ON quarantine_records(status);
 
 CREATE OR REPLACE FUNCTION fn_enforce_quarantine_records_insert_only()

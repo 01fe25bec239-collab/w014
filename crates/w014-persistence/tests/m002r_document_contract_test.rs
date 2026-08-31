@@ -116,8 +116,8 @@ async fn insert_document(pool: &PgPool, workspace_id: Uuid, title: &str) -> Uuid
 async fn insert_artifact(pool: &PgPool, workspace_id: Uuid, kind: &str, sse_mode: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO object_artifacts (object_artifact_id, workspace_id, artifact_kind, storage_bucket, object_key, byte_length, content_sha256, content_type, sse_mode) \
-         VALUES ($1, $2, $3, 'w014-test-bucket', $4, 128, $5, 'application/pdf', $6)",
+        "INSERT INTO object_artifacts (object_artifact_id, workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+         VALUES ($1, $2, $3, $4, 128, $5, 'application/pdf', $6)",
     )
     .bind(id)
     .bind(workspace_id)
@@ -218,7 +218,7 @@ async fn test_documents_current_version_pointer_is_staged_same_document_fk() {
     );
 
     let doc = insert_document(pool, ctx.ws_a, "Pointer Doc").await;
-    let artifact = insert_artifact(pool, ctx.ws_a, "original", "none").await;
+    let artifact = insert_artifact(pool, ctx.ws_a, "raw_upload", "aws:kms").await;
     let version = insert_version(pool, doc, ctx.ws_a, artifact, 1).await;
 
     // NULL default is representable; setting the pointer to its own document's version works.
@@ -260,7 +260,7 @@ async fn test_documents_current_version_pointer_is_staged_same_document_fk() {
 
     // Cross-workspace pointer must be rejected as well.
     let foreign_doc = insert_document(pool, ctx.ws_b, "Foreign Doc").await;
-    let foreign_artifact = insert_artifact(pool, ctx.ws_b, "original", "none").await;
+    let foreign_artifact = insert_artifact(pool, ctx.ws_b, "raw_upload", "aws:kms").await;
     let foreign_version = insert_version(pool, foreign_doc, ctx.ws_b, foreign_artifact, 1).await;
     let cross_ws_pointer =
         sqlx::query("UPDATE documents SET current_version_id = $1 WHERE document_id = $2")
@@ -293,7 +293,7 @@ async fn test_document_versions_explicit_facts_immutability_and_trust_chain() {
     let pool = ctx.pool();
 
     let doc = insert_document(pool, ctx.ws_a, "Immutable Doc").await;
-    let artifact = insert_artifact(pool, ctx.ws_a, "original", "none").await;
+    let artifact = insert_artifact(pool, ctx.ws_a, "raw_upload", "aws:kms").await;
 
     // original_filename and object_artifact_id are mandatory physical facts.
     let missing_filename = sqlx::query(
@@ -334,7 +334,7 @@ async fn test_document_versions_explicit_facts_immutability_and_trust_chain() {
     );
 
     // Cross-workspace artifact binding is rejected by the composite FK.
-    let foreign_artifact = insert_artifact(pool, ctx.ws_b, "original", "none").await;
+    let foreign_artifact = insert_artifact(pool, ctx.ws_b, "raw_upload", "aws:kms").await;
     let spoofed_binding = sqlx::query(
         "INSERT INTO document_versions (document_version_id, document_id, workspace_id, version_number, object_artifact_id, byte_size, sha256_hash, content_type, original_filename) \
          VALUES ($1, $2, $3, 1, $4, 10, $5, 'application/pdf', 'spoofed.pdf')",
@@ -642,14 +642,14 @@ async fn test_upload_intents_finalize_abandon_one_way_and_no_contradiction() {
 
     // Object-artifact binding is immutable once registered.
     let binder = insert_flow_intent(pool, ctx.ws_a, creator, "bind").await;
-    let artifact = insert_artifact(pool, ctx.ws_a, "original", "none").await;
+    let artifact = insert_artifact(pool, ctx.ws_a, "raw_upload", "aws:kms").await;
     sqlx::query("UPDATE upload_intents SET object_artifact_id = $1 WHERE upload_intent_id = $2")
         .bind(artifact)
         .bind(binder)
         .execute(pool)
         .await
         .expect("first registration of the binding must succeed");
-    let other_artifact = insert_artifact(pool, ctx.ws_a, "derived", "sse_aes256").await;
+    let other_artifact = insert_artifact(pool, ctx.ws_a, "parser", "local").await;
     let res = sqlx::query(
         "UPDATE upload_intents SET object_artifact_id = $1 WHERE upload_intent_id = $2",
     )
@@ -675,60 +675,149 @@ async fn test_object_artifacts_immutable_closed_domain_facts() {
     let ctx = provision().await;
     let pool = ctx.pool();
 
-    // Closed domains enforced by CHECK constraints.
-    let kind_res = sqlx::query(
-        "INSERT INTO object_artifacts (workspace_id, artifact_kind, storage_bucket, object_key, byte_length, content_sha256, content_type, sse_mode) \
-         VALUES ($1, 'replica', 'b', $2, 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream', 'none')",
+    // 1. artifact_kind closed domain: obsolete/invalid values rejected.
+    for invalid_kind in ["original", "derived", "replica", "", "unknown"] {
+        let kind_res = sqlx::query(
+            "INSERT INTO object_artifacts (workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+             VALUES ($1, $2, $3, 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream', 'aws:kms')",
+        )
+        .bind(ctx.ws_a)
+        .bind(invalid_kind)
+        .bind(format!("documents/{}", Uuid::new_v4().simple()))
+        .execute(pool)
+        .await;
+        let err_msg = kind_res
+            .expect_err(&format!("artifact_kind '{invalid_kind}' must be rejected"))
+            .to_string();
+        assert!(
+            err_msg.contains("chk_object_artifacts_kind"),
+            "got: {err_msg}"
+        );
+    }
+
+    // 2. artifact_kind accepts all frozen Prompt-12 values.
+    for valid_kind in [
+        "raw_upload",
+        "ocr",
+        "parser",
+        "page_preview",
+        "report_json",
+        "report_pdf",
+        "temp",
+    ] {
+        let valid_key = format!("documents/{valid_kind}-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO object_artifacts (workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+             VALUES ($1, $2, $3, 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream', 'aws:kms')",
+        )
+        .bind(ctx.ws_a)
+        .bind(valid_kind)
+        .bind(&valid_key)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("valid artifact_kind '{valid_kind}' must succeed: {e}"));
+    }
+
+    // 3. sse_mode closed domain: obsolete/invalid values rejected.
+    for invalid_sse in ["none", "sse_aes256", "envelope", "", "custom"] {
+        let sse_res = sqlx::query(
+            "INSERT INTO object_artifacts (workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+             VALUES ($1, 'raw_upload', $2, 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream', $3)",
+        )
+        .bind(ctx.ws_a)
+        .bind(format!("documents/{}", Uuid::new_v4().simple()))
+        .bind(invalid_sse)
+        .execute(pool)
+        .await;
+        let err_msg = sse_res
+            .expect_err(&format!("sse_mode '{invalid_sse}' must be rejected"))
+            .to_string();
+        assert!(
+            err_msg.contains("chk_object_artifacts_sse_mode"),
+            "got: {err_msg}"
+        );
+    }
+
+    // 4. sse_mode accepts 'aws:kms' and 'local', and defaults to 'aws:kms'.
+    for valid_sse in ["aws:kms", "local"] {
+        let valid_key = format!("documents/sse-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO object_artifacts (workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+             VALUES ($1, 'raw_upload', $2, 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream', $3)",
+        )
+        .bind(ctx.ws_a)
+        .bind(&valid_key)
+        .bind(valid_sse)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("valid sse_mode '{valid_sse}' must succeed: {e}"));
+    }
+
+    // Default sse_mode verification.
+    let def_art_id = Uuid::new_v4();
+    let def_key = format!("documents/def-{}", def_art_id.simple());
+    sqlx::query(
+        "INSERT INTO object_artifacts (object_artifact_id, workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type) \
+         VALUES ($1, $2, 'raw_upload', $3, 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream')",
+    )
+    .bind(def_art_id)
+    .bind(ctx.ws_a)
+    .bind(&def_key)
+    .execute(pool)
+    .await
+    .expect("insert with default sse_mode must succeed");
+    let stored_sse: String =
+        sqlx::query_scalar("SELECT sse_mode FROM object_artifacts WHERE object_artifact_id = $1")
+            .bind(def_art_id)
+            .fetch_one(pool)
+            .await
+            .expect("read sse_mode");
+    assert_eq!(stored_sse, "aws:kms", "default sse_mode must be 'aws:kms'");
+
+    // 5. Digest length is strictly 32 bytes.
+    for bad_digest in [vec![], vec![0u8; 16], vec![0u8; 31], vec![0u8; 33]] {
+        let short_digest = sqlx::query(
+            "INSERT INTO object_artifacts (workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+             VALUES ($1, 'raw_upload', $2, 1, $3, 'application/octet-stream', 'aws:kms')",
+        )
+        .bind(ctx.ws_a)
+        .bind(format!("documents/{}", Uuid::new_v4().simple()))
+        .bind(&bad_digest)
+        .execute(pool)
+        .await;
+        let err_msg = short_digest
+            .expect_err(&format!(
+                "content digest length {} must be rejected",
+                bad_digest.len()
+            ))
+            .to_string();
+        assert!(
+            err_msg.contains("chk_object_artifacts_content_sha256_len"),
+            "got: {err_msg}"
+        );
+    }
+
+    // 6. byte_length must be non-negative.
+    let neg_length = sqlx::query(
+        "INSERT INTO object_artifacts (workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+         VALUES ($1, 'raw_upload', $2, -1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream', 'aws:kms')",
     )
     .bind(ctx.ws_a)
     .bind(format!("documents/{}", Uuid::new_v4().simple()))
     .execute(pool)
     .await;
-    let err_msg = kind_res
-        .expect_err("artifact_kind outside frozen domain must be rejected")
+    let err_msg = neg_length
+        .expect_err("negative byte_length must be rejected")
         .to_string();
     assert!(
-        err_msg.contains("chk_object_artifacts_kind"),
+        err_msg.contains("chk_object_artifacts_byte_length_non_negative"),
         "got: {err_msg}"
     );
 
-    let sse_res = sqlx::query(
-        "INSERT INTO object_artifacts (workspace_id, artifact_kind, storage_bucket, object_key, byte_length, content_sha256, content_type, sse_mode) \
-         VALUES ($1, 'original', 'b', $2, 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream', 'envelope')",
-    )
-    .bind(ctx.ws_a)
-    .bind(format!("documents/{}", Uuid::new_v4().simple()))
-    .execute(pool)
-    .await;
-    let err_msg = sse_res
-        .expect_err("sse_mode outside frozen domain must be rejected")
-        .to_string();
-    assert!(
-        err_msg.contains("chk_object_artifacts_sse_mode"),
-        "got: {err_msg}"
-    );
-
-    // Digest length is enforced.
-    let short_digest = sqlx::query(
-        "INSERT INTO object_artifacts (workspace_id, artifact_kind, storage_bucket, object_key, byte_length, content_sha256, content_type, sse_mode) \
-         VALUES ($1, 'original', 'b', $2, 1, decode('000000','hex'), 'application/octet-stream', 'none')",
-    )
-    .bind(ctx.ws_a)
-    .bind(format!("documents/{}", Uuid::new_v4().simple()))
-    .execute(pool)
-    .await;
-    let err_msg = short_digest
-        .expect_err("short content digest must be rejected")
-        .to_string();
-    assert!(
-        err_msg.contains("chk_object_artifacts_content_sha256_len"),
-        "got: {err_msg}"
-    );
-
-    // Client-chosen traversal keys are rejected: object authority stays server-owned.
+    // 7. Client-chosen traversal keys are rejected: object authority stays server-owned.
     let traversal = sqlx::query(
-        "INSERT INTO object_artifacts (workspace_id, artifact_kind, storage_bucket, object_key, byte_length, content_sha256, content_type, sse_mode) \
-         VALUES ($1, 'original', 'b', '../../etc/passwd', 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream', 'none')",
+        "INSERT INTO object_artifacts (workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+         VALUES ($1, 'raw_upload', '../../etc/passwd', 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream', 'aws:kms')",
     )
     .bind(ctx.ws_a)
     .execute(pool)
@@ -741,8 +830,66 @@ async fn test_object_artifacts_immutable_closed_domain_facts() {
         "got: {err_msg}"
     );
 
-    // Rows are immutable object facts.
-    let artifact = insert_artifact(pool, ctx.ws_a, "original", "none").await;
+    // 8. UNIQUE(object_key) is enforced.
+    let shared_key = format!("documents/uniq-{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO object_artifacts (workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+         VALUES ($1, 'raw_upload', $2, 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream', 'aws:kms')",
+    )
+    .bind(ctx.ws_a)
+    .bind(&shared_key)
+    .execute(pool)
+    .await
+    .expect("first insert with key must succeed");
+
+    let dup_key = sqlx::query(
+        "INSERT INTO object_artifacts (workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+         VALUES ($1, 'raw_upload', $2, 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/octet-stream', 'aws:kms')",
+    )
+    .bind(ctx.ws_a)
+    .bind(&shared_key)
+    .execute(pool)
+    .await;
+    let err_msg = dup_key
+        .expect_err("duplicate object_key must be rejected")
+        .to_string();
+    assert!(
+        err_msg.contains("uq_object_artifacts_object_key"),
+        "got: {err_msg}"
+    );
+
+    // 9. media_type NOT NULL and non-empty.
+    let empty_media = sqlx::query(
+        "INSERT INTO object_artifacts (workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+         VALUES ($1, 'raw_upload', $2, 1, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), '   ', 'aws:kms')",
+    )
+    .bind(ctx.ws_a)
+    .bind(format!("documents/{}", Uuid::new_v4().simple()))
+    .execute(pool)
+    .await;
+    let err_msg = empty_media
+        .expect_err("empty media_type must be rejected")
+        .to_string();
+    assert!(
+        err_msg.contains("chk_object_artifacts_media_type_non_empty"),
+        "got: {err_msg}"
+    );
+
+    // 10. retention_until and kms_key_ref nullable fields work properly.
+    let retention_art_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO object_artifacts (object_artifact_id, workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode, kms_key_ref, retention_until) \
+         VALUES ($1, $2, 'raw_upload', $3, 100, decode('0000000000000000000000000000000000000000000000000000000000000001','hex'), 'application/pdf', 'aws:kms', 'arn:aws:kms:us-east-1:123456789012:key/test', clock_timestamp() + INTERVAL '30 days')",
+    )
+    .bind(retention_art_id)
+    .bind(ctx.ws_a)
+    .bind(format!("documents/{}", retention_art_id.simple()))
+    .execute(pool)
+    .await
+    .expect("insert with retention_until and kms_key_ref must succeed");
+
+    // 11. Rows are immutable object facts: UPDATE and DELETE prohibited.
+    let artifact = insert_artifact(pool, ctx.ws_a, "raw_upload", "aws:kms").await;
     let update_res = sqlx::query(
         "UPDATE object_artifacts SET byte_length = 999999 WHERE object_artifact_id = $1",
     )
@@ -776,20 +923,24 @@ async fn test_quarantine_records_intent_tie_outcome_domain_and_insert_only() {
     let pool = ctx.pool();
     let creator = insert_principal(pool).await;
 
-    let intent_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO upload_intents (upload_intent_id, workspace_id, created_by, filename, expected_media_type, expected_length, opaque_object_key, expires_at) \
-         VALUES ($1, $2, $3, 'scan-me.pdf', 'application/pdf', 4096, $4, clock_timestamp() + INTERVAL '30 minutes')",
-    )
-    .bind(intent_id)
-    .bind(ctx.ws_a)
-    .bind(creator)
-    .bind(format!("upload-intents/{}", intent_id.simple()))
-    .execute(pool)
-    .await
-    .expect("intent insert failed");
+    async fn create_intent(pool: &PgPool, ws_id: Uuid, creator: Uuid) -> Uuid {
+        let intent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO upload_intents (upload_intent_id, workspace_id, created_by, filename, expected_media_type, expected_length, opaque_object_key, expires_at) \
+             VALUES ($1, $2, $3, 'scan-me.pdf', 'application/pdf', 4096, $4, clock_timestamp() + INTERVAL '30 minutes')",
+        )
+        .bind(intent_id)
+        .bind(ws_id)
+        .bind(creator)
+        .bind(format!("upload-intents/{}", intent_id.simple()))
+        .execute(pool)
+        .await
+        .expect("intent insert failed");
+        intent_id
+    }
 
-    // The scan outcome lives in the frozen closed domain, not hidden JSONB.
+    // 1. The scan outcome lives in the frozen closed domain, not hidden JSONB.
+    // Each record requires its own upload_intent_id due to UNIQUE(upload_intent_id).
     for status in [
         "pending",
         "clean",
@@ -797,9 +948,10 @@ async fn test_quarantine_records_intent_tie_outcome_domain_and_insert_only() {
         "integrity_failed",
         "unsupported",
     ] {
+        let intent_id = create_intent(pool, ctx.ws_a, creator).await;
         sqlx::query(
-            "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_name, reason_code, checked_at) \
-             VALUES ($1, $2, $3, 'clamav-scanner', $4, clock_timestamp())",
+            "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_version, reason_code, checked_at) \
+             VALUES ($1, $2, $3, 'clamav-1.3.0', $4, clock_timestamp())",
         )
         .bind(ctx.ws_a)
         .bind(intent_id)
@@ -810,11 +962,12 @@ async fn test_quarantine_records_intent_tie_outcome_domain_and_insert_only() {
         .unwrap_or_else(|e| panic!("frozen outcome '{status}' must be representable: {e}"));
     }
 
-    // Obsolete lifecycle substitutes are rejected.
-    for obsolete in ["quarantined", "released", "purged"] {
+    // 2. Obsolete / invalid lifecycle substitutes are rejected.
+    for obsolete in ["quarantined", "released", "purged", "infected", ""] {
+        let intent_id = create_intent(pool, ctx.ws_a, creator).await;
         let res = sqlx::query(
-            "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_name, checked_at) \
-             VALUES ($1, $2, $3, 'clamav-scanner', clock_timestamp())",
+            "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_version, checked_at) \
+             VALUES ($1, $2, $3, 'clamav-1.3.0', clock_timestamp())",
         )
         .bind(ctx.ws_a)
         .bind(intent_id)
@@ -830,10 +983,69 @@ async fn test_quarantine_records_intent_tie_outcome_domain_and_insert_only() {
         );
     }
 
-    // The intent tie is mandatory and workspace-bound through the composite FK.
+    // 3. scanner_version NOT NULL is enforced.
+    let intent_for_null_scan = create_intent(pool, ctx.ws_a, creator).await;
+    let null_scanner_res = sqlx::query(
+        "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_version, checked_at) \
+         VALUES ($1, $2, 'clean', NULL, clock_timestamp())",
+    )
+    .bind(ctx.ws_a)
+    .bind(intent_for_null_scan)
+    .execute(pool)
+    .await;
+    assert!(
+        null_scanner_res.is_err(),
+        "NULL scanner_version must be rejected"
+    );
+
+    let empty_scanner_res = sqlx::query(
+        "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_version, checked_at) \
+         VALUES ($1, $2, 'clean', '   ', clock_timestamp())",
+    )
+    .bind(ctx.ws_a)
+    .bind(intent_for_null_scan)
+    .execute(pool)
+    .await;
+    let err_msg = empty_scanner_res
+        .expect_err("empty scanner_version must be rejected")
+        .to_string();
+    assert!(
+        err_msg.contains("chk_quarantine_records_scanner_version_non_empty"),
+        "got: {err_msg}"
+    );
+
+    // 4. UNIQUE(upload_intent_id): duplicate quarantine facts for the same intent are rejected.
+    let unique_intent = create_intent(pool, ctx.ws_a, creator).await;
+    sqlx::query(
+        "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_version, checked_at) \
+         VALUES ($1, $2, 'pending', 'clamav-1.3.0', clock_timestamp())",
+    )
+    .bind(ctx.ws_a)
+    .bind(unique_intent)
+    .execute(pool)
+    .await
+    .expect("initial quarantine insert must succeed");
+
+    let dup_intent_res = sqlx::query(
+        "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_version, checked_at) \
+         VALUES ($1, $2, 'clean', 'clamav-1.3.0', clock_timestamp())",
+    )
+    .bind(ctx.ws_a)
+    .bind(unique_intent)
+    .execute(pool)
+    .await;
+    let err_msg = dup_intent_res
+        .expect_err("duplicate quarantine record for the same upload_intent must be rejected")
+        .to_string();
+    assert!(
+        err_msg.contains("uq_quarantine_records_upload_intent"),
+        "got: {err_msg}"
+    );
+
+    // 5. The intent tie is mandatory and workspace-bound through the composite FK.
     let no_tie = sqlx::query(
-        "INSERT INTO quarantine_records (workspace_id, status, scanner_name, checked_at) \
-         VALUES ($1, 'malware', 'clamav-scanner', clock_timestamp())",
+        "INSERT INTO quarantine_records (workspace_id, status, scanner_version, checked_at) \
+         VALUES ($1, 'malware', 'clamav-1.3.0', clock_timestamp())",
     )
     .bind(ctx.ws_a)
     .execute(pool)
@@ -843,12 +1055,13 @@ async fn test_quarantine_records_intent_tie_outcome_domain_and_insert_only() {
         .to_string();
     assert!(err_msg.contains("upload_intent_id"), "got: {err_msg}");
 
+    let test_intent = create_intent(pool, ctx.ws_a, creator).await;
     let foreign_tie = sqlx::query(
-        "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_name, checked_at) \
-         VALUES ($1, $2, 'malware', 'clamav-scanner', clock_timestamp())",
+        "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_version, checked_at) \
+         VALUES ($1, $2, 'malware', 'clamav-1.3.0', clock_timestamp())",
     )
     .bind(ctx.ws_b)
-    .bind(intent_id)
+    .bind(test_intent)
     .execute(pool)
     .await;
     assert!(
@@ -856,18 +1069,20 @@ async fn test_quarantine_records_intent_tie_outcome_domain_and_insert_only() {
         "cross-workspace intent tie must be rejected by fk_quarantine_records_intent_ws"
     );
 
-    // Rescan appends a NEW immutable record; recorded results are never rewritten.
+    // 6. Immutability: recorded results are never rewritten (UPDATE/DELETE prohibited).
+    let immut_intent = create_intent(pool, ctx.ws_a, creator).await;
     let first = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO quarantine_records (quarantine_record_id, workspace_id, upload_intent_id, status, scanner_name, checked_at) \
-         VALUES ($1, $2, $3, 'malware', 'clamav-scanner', clock_timestamp())",
+        "INSERT INTO quarantine_records (quarantine_record_id, workspace_id, upload_intent_id, status, scanner_version, checked_at) \
+         VALUES ($1, $2, $3, 'malware', 'clamav-1.3.0', clock_timestamp())",
     )
     .bind(first)
     .bind(ctx.ws_a)
-    .bind(intent_id)
+    .bind(immut_intent)
     .execute(pool)
     .await
     .expect("initial record insert failed");
+
     let update_res = sqlx::query(
         "UPDATE quarantine_records SET status = 'clean' WHERE quarantine_record_id = $1",
     )
@@ -881,6 +1096,7 @@ async fn test_quarantine_records_intent_tie_outcome_domain_and_insert_only() {
         err_msg.contains("immutable once recorded"),
         "got: {err_msg}"
     );
+
     let delete_res = sqlx::query("DELETE FROM quarantine_records WHERE quarantine_record_id = $1")
         .bind(first)
         .execute(pool)
@@ -893,16 +1109,17 @@ async fn test_quarantine_records_intent_tie_outcome_domain_and_insert_only() {
         "got: {err_msg}"
     );
 
-    // Rescan: brand-new independent fact for the same intent.
+    // 7. Rescan semantics: a rescan uses a NEW upload/version with its own intent.
+    let rescan_intent = create_intent(pool, ctx.ws_a, creator).await;
     sqlx::query(
-        "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_name, scanner_version, reason_code, checked_at) \
-         VALUES ($1, $2, 'clean', 'clamav-scanner', '1.3.0', NULL, clock_timestamp())",
+        "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_version, reason_code, checked_at) \
+         VALUES ($1, $2, 'clean', 'clamav-1.3.0', NULL, clock_timestamp())",
     )
     .bind(ctx.ws_a)
-    .bind(intent_id)
+    .bind(rescan_intent)
     .execute(pool)
     .await
-    .expect("rescan must append a new record");
+    .expect("rescan with new upload_intent must succeed");
 
     ctx.close().await;
 }
@@ -917,7 +1134,7 @@ async fn test_parser_artifacts_locator_identity_and_state_machine() {
     let pool = ctx.pool();
 
     let doc = insert_document(pool, ctx.ws_a, "Parsed Doc").await;
-    let artifact = insert_artifact(pool, ctx.ws_a, "original", "none").await;
+    let artifact = insert_artifact(pool, ctx.ws_a, "raw_upload", "aws:kms").await;
     let version = insert_version(pool, doc, ctx.ws_a, artifact, 1).await;
 
     // locator_version is REQUIRED identity.
@@ -1053,7 +1270,7 @@ async fn test_parser_artifacts_locator_identity_and_state_machine() {
 
     // Optional derived-text references are open-time identity facts: they bind
     // within workspace boundaries at INSERT and never change afterwards.
-    let derived = insert_artifact(pool, ctx.ws_a, "derived", "sse_aes256").await;
+    let derived = insert_artifact(pool, ctx.ws_a, "parser", "local").await;
     let referencing = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO parser_artifacts (parser_artifact_id, document_version_id, workspace_id, parser_name, parser_version, locator_version, artifact_object_id, text_sha256) \
@@ -1076,7 +1293,7 @@ async fn test_parser_artifacts_locator_identity_and_state_machine() {
     .await
     .expect("completion without touching identity references must succeed");
 
-    let foreign_derived = insert_artifact(pool, ctx.ws_b, "derived", "none").await;
+    let foreign_derived = insert_artifact(pool, ctx.ws_b, "parser", "local").await;
     let spoofing = sqlx::query(
         "INSERT INTO parser_artifacts (parser_artifact_id, document_version_id, workspace_id, parser_name, parser_version, locator_version, artifact_object_id) \
          VALUES ($1, $2, $3, 'w014-parser', 'v1', 'locator-v1', $4)",
@@ -1110,8 +1327,8 @@ async fn test_document_tables_rls_force_and_cross_workspace_isolation() {
     let doc_a = insert_document(pool, ctx.ws_a, "Doc A").await;
     let doc_b = insert_document(pool, ctx.ws_b, "Doc B").await;
 
-    let art_a = insert_artifact(pool, ctx.ws_a, "original", "none").await;
-    let art_b = insert_artifact(pool, ctx.ws_b, "original", "none").await;
+    let art_a = insert_artifact(pool, ctx.ws_a, "raw_upload", "aws:kms").await;
+    let art_b = insert_artifact(pool, ctx.ws_b, "raw_upload", "aws:kms").await;
 
     let ver_a = insert_version(pool, doc_a, ctx.ws_a, art_a, 1).await;
     let ver_b = insert_version(pool, doc_b, ctx.ws_b, art_b, 1).await;
@@ -1143,8 +1360,8 @@ async fn test_document_tables_rls_force_and_cross_workspace_isolation() {
 
     for (qr_ws, intent) in [(ctx.ws_a, intent_a), (ctx.ws_b, intent_b)] {
         sqlx::query(
-            "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_name, checked_at) \
-             VALUES ($1, $2, 'malware', 'clamav-scanner', clock_timestamp())",
+            "INSERT INTO quarantine_records (workspace_id, upload_intent_id, status, scanner_version, checked_at) \
+             VALUES ($1, $2, 'malware', '1.3.0', clock_timestamp())",
         )
         .bind(qr_ws)
         .bind(intent)
@@ -1296,8 +1513,8 @@ async fn test_document_tables_rls_force_and_cross_workspace_isolation() {
         );
 
         let spoof_artifact = sqlx::query(
-            "INSERT INTO object_artifacts (workspace_id, artifact_kind, storage_bucket, object_key, byte_length, content_sha256, content_type, sse_mode) \
-             VALUES ($1, 'original', 'bucket', $2, 1, $3, 'application/pdf', 'none')",
+            "INSERT INTO object_artifacts (workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode) \
+             VALUES ($1, 'raw_upload', $2, 1, $3, 'application/pdf', 'aws:kms')",
         )
         .bind(ctx.ws_b)
         .bind(format!("documents/{}", Uuid::new_v4().simple()))
