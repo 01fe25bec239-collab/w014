@@ -218,28 +218,31 @@ impl ClamAvClient {
             }
         }
 
-        let raw_response = String::from_utf8_lossy(&response_buf)
-            .trim_matches(|c| c == '\0' || c == '\r' || c == '\n')
-            .to_string();
+        let raw_response = String::from_utf8_lossy(&response_buf);
 
         Self::parse_clamav_response(&raw_response)
     }
 
     /// Parses the raw clamd scan response string fail-closed.
+    ///
+    /// The only canonical semantic clean token is exactly `stream: OK`.
+    /// Permitted transport terminators are limited to exact clamd transport
+    /// framing (terminal `\0`, `\r\n`, or `\n`).
+    ///
+    /// Leading/trailing ASCII or Unicode whitespace is NOT framing and fails closed.
     pub fn parse_clamav_response(raw: &str) -> Result<ScanVerdict, ScannerError> {
-        let trimmed =
-            raw.trim_matches(|c: char| c.is_whitespace() || c == '\0' || c == '\r' || c == '\n');
-        if trimmed.is_empty() {
+        let unframed = strip_transport_framing(raw);
+        if unframed.is_empty() {
             return Err(ScannerError::Protocol(
                 "Empty response from scanner".to_string(),
             ));
         }
 
-        if trimmed == "stream: OK" {
+        if unframed == "stream: OK" {
             return Ok(ScanVerdict::Clean);
         }
 
-        if let Some(threat) = trimmed
+        if let Some(threat) = unframed
             .strip_prefix("stream: ")
             .and_then(|s| s.strip_suffix(" FOUND"))
         {
@@ -255,7 +258,7 @@ impl ClamAvClient {
             });
         }
 
-        if let Some(err) = trimmed
+        if let Some(err) = unframed
             .strip_prefix("stream: ")
             .and_then(|s| s.strip_suffix(" ERROR"))
         {
@@ -271,8 +274,24 @@ impl ClamAvClient {
         }
 
         Err(ScannerError::Protocol(format!(
-            "Unrecognized scanner response format: '{trimmed}'"
+            "Unrecognized scanner response format: '{unframed}'"
         )))
+    }
+}
+
+/// Strips authorized clamd transport framing (terminal `\0`, `\r\n`, or `\n`).
+///
+/// Whitespace (ASCII space, tab, vertical tab, form feed, non-breaking space,
+/// and other Unicode whitespace) is NOT framing and is never stripped.
+fn strip_transport_framing(raw: &str) -> &str {
+    if let Some(s) = raw.strip_suffix('\0') {
+        s
+    } else if let Some(s) = raw.strip_suffix("\r\n") {
+        s
+    } else if let Some(s) = raw.strip_suffix('\n') {
+        s
+    } else {
+        raw
     }
 }
 
@@ -369,6 +388,9 @@ pub fn parse_clamav_date(date_str: &str) -> Result<DateTime<Utc>, ScannerError> 
 }
 
 /// Sanitizes and bounds threat names to prevent hostile control codes or over-bound strings.
+///
+/// Truncation is performed strictly at a valid UTF-8 character boundary so that
+/// the result is valid UTF-8 and the byte length does not exceed `MAX_REASON_CODE_BYTES` (128).
 #[must_use]
 pub fn sanitize_threat_name(raw: &str) -> String {
     let filtered: String = raw
@@ -376,10 +398,20 @@ pub fn sanitize_threat_name(raw: &str) -> String {
         .filter(|c| !c.is_control() && *c != '\0')
         .collect();
     let trimmed = filtered.trim();
+    if trimmed.is_empty() {
+        return "UnknownThreat".to_string();
+    }
     if trimmed.len() > MAX_REASON_CODE_BYTES {
-        trimmed[..MAX_REASON_CODE_BYTES].to_string()
-    } else if trimmed.is_empty() {
-        "UnknownThreat".to_string()
+        let mut boundary = MAX_REASON_CODE_BYTES;
+        while !trimmed.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        let bounded = &trimmed[..boundary];
+        if bounded.is_empty() {
+            "UnknownThreat".to_string()
+        } else {
+            bounded.to_string()
+        }
     } else {
         trimmed.to_string()
     }
@@ -478,15 +510,46 @@ mod tests {
             ClamAvClient::parse_clamav_response("stream: OK").unwrap(),
             ScanVerdict::Clean
         );
-        assert_eq!(
-            ClamAvClient::parse_clamav_response("  stream: OK  ").unwrap(),
-            ScanVerdict::Clean
-        );
     }
 
     #[test]
     fn test_parse_clamav_response_clean_negative_matrix_fails_closed() {
         let malformed_clean_cases = [
+            "  stream: OK  ",
+            " stream: OK",
+            "stream: OK ",
+            "  stream: OK",
+            "stream: OK  ",
+            "\tstream: OK",
+            "stream: OK\t",
+            "\tstream: OK\t",
+            "\u{00A0}stream: OK",
+            "stream: OK\u{00A0}",
+            "\u{2003}stream: OK",
+            "stream: OK\u{2003}",
+            "\x0bstream: OK",
+            "stream: OK\x0b",
+            "\x0cstream: OK",
+            "stream: OK\x0c",
+            " stream: OK\0",
+            "stream: OK \0",
+            "\tstream: OK\0",
+            "stream: OK\t\0",
+            " stream: OK\n",
+            "stream: OK \n",
+            "\tstream: OK\n",
+            "stream: OK\t\n",
+            " stream: OK\r\n",
+            "stream: OK \r\n",
+            "\tstream: OK\r\n",
+            "stream: OK\t\r\n",
+            "stream: OK\0\0",
+            "stream: OK\n\n",
+            "stream: OK\r\n\r\n",
+            "\0stream: OK",
+            "\nstream: OK",
+            "\r\nstream: OK",
+            "stream: OK\nstream: OK\n",
             "UNKNOWN SERVER OK",
             "foo: OK",
             "stream: MAYBE OK",
@@ -505,6 +568,7 @@ mod tests {
             "stream: OK\nsomething",
             "",
             "   ",
+            "\t",
             "\0",
             "\r\n",
             "\n",
@@ -514,7 +578,7 @@ mod tests {
             let res = ClamAvClient::parse_clamav_response(case);
             assert!(
                 res.is_err(),
-                "Case '{case}' must fail closed with error, but got {res:?}"
+                "Case '{case:?}' must fail closed with error, but got {res:?}"
             );
         }
     }
@@ -712,8 +776,96 @@ mod tests {
             sanitize_threat_name("Threat\0With\nControls"),
             "ThreatWithControls"
         );
+        assert_eq!(sanitize_threat_name(""), "UnknownThreat");
+        assert_eq!(sanitize_threat_name("   "), "UnknownThreat");
+        assert_eq!(sanitize_threat_name("\0\r\n\t"), "UnknownThreat");
+
         let long_name = "A".repeat(200);
         let sanitized = sanitize_threat_name(&long_name);
         assert_eq!(sanitized.len(), MAX_REASON_CODE_BYTES);
+    }
+
+    #[test]
+    fn test_sanitize_threat_name_utf8_truncation_no_panic() {
+        // 127 ASCII bytes + 2-byte character ('é' = 2 bytes) -> byte 128 is inside 'é'
+        let input_127_2b = format!("{}é", "A".repeat(127));
+        let sanitized_127_2b = sanitize_threat_name(&input_127_2b);
+        assert_eq!(sanitized_127_2b.len(), 127);
+        assert_eq!(sanitized_127_2b, "A".repeat(127));
+        assert!(sanitized_127_2b.len() <= MAX_REASON_CODE_BYTES);
+
+        // 127 ASCII bytes + 3-byte character ('€' = 3 bytes) -> byte 128 is inside '€'
+        let input_127_3b = format!("{}€", "A".repeat(127));
+        let sanitized_127_3b = sanitize_threat_name(&input_127_3b);
+        assert_eq!(sanitized_127_3b.len(), 127);
+        assert_eq!(sanitized_127_3b, "A".repeat(127));
+        assert!(sanitized_127_3b.len() <= MAX_REASON_CODE_BYTES);
+
+        // 127 ASCII bytes + 4-byte emoji ('🦀' = 4 bytes) -> byte 128 is inside '🦀'
+        let input_127_4b = format!("{}🦀", "A".repeat(127));
+        let sanitized_127_4b = sanitize_threat_name(&input_127_4b);
+        assert_eq!(sanitized_127_4b.len(), 127);
+        assert_eq!(sanitized_127_4b, "A".repeat(127));
+        assert!(sanitized_127_4b.len() <= MAX_REASON_CODE_BYTES);
+
+        // Long two-byte code points: 'é' (2 bytes each) x 100 = 200 bytes
+        let input_2b = "é".repeat(100);
+        let sanitized_2b = sanitize_threat_name(&input_2b);
+        assert_eq!(sanitized_2b.len(), 128); // 64 x 2 = 128
+        assert_eq!(sanitized_2b, "é".repeat(64));
+        assert!(sanitized_2b.len() <= MAX_REASON_CODE_BYTES);
+
+        // 1 ASCII + Long two-byte code points: 1 byte + 'é'*100 (200 bytes) -> boundary lands inside 64th 'é'
+        let input_1_2b = format!("X{}", "é".repeat(100));
+        let sanitized_1_2b = sanitize_threat_name(&input_1_2b);
+        assert_eq!(sanitized_1_2b.len(), 127); // 1 + 63*2 = 127
+        assert_eq!(sanitized_1_2b, format!("X{}", "é".repeat(63)));
+        assert!(sanitized_1_2b.len() <= MAX_REASON_CODE_BYTES);
+
+        // Long three-byte code points: '€' (3 bytes each) x 60 = 180 bytes
+        let input_3b = "€".repeat(60);
+        let sanitized_3b = sanitize_threat_name(&input_3b);
+        assert_eq!(sanitized_3b.len(), 126); // 42 x 3 = 126
+        assert_eq!(sanitized_3b, "€".repeat(42));
+        assert!(sanitized_3b.len() <= MAX_REASON_CODE_BYTES);
+
+        // Long four-byte emoji: '🦀' (4 bytes each) x 50 = 200 bytes
+        let input_4b = "🦀".repeat(50);
+        let sanitized_4b = sanitize_threat_name(&input_4b);
+        assert_eq!(sanitized_4b.len(), 128); // 32 x 4 = 128
+        assert_eq!(sanitized_4b, "🦀".repeat(32));
+        assert!(sanitized_4b.len() <= MAX_REASON_CODE_BYTES);
+
+        // 1 ASCII + Long four-byte emoji: 1 byte + '🦀'*50 (200 bytes) -> boundary lands inside 32nd '🦀'
+        let input_1_4b = format!("X{}", "🦀".repeat(50));
+        let sanitized_1_4b = sanitize_threat_name(&input_1_4b);
+        assert_eq!(sanitized_1_4b.len(), 125); // 1 + 31*4 = 125
+        assert_eq!(sanitized_1_4b, format!("X{}", "🦀".repeat(31)));
+        assert!(sanitized_1_4b.len() <= MAX_REASON_CODE_BYTES);
+
+        // Control characters + multibyte content
+        let input_ctrl_mb = "Trojan\0\r\n\x07\x1b🦀.Variant.€é\0";
+        let sanitized_ctrl_mb = sanitize_threat_name(input_ctrl_mb);
+        assert_eq!(sanitized_ctrl_mb, "Trojan🦀.Variant.€é");
+
+        // Long multibyte response through parse_clamav_response
+        let long_found_resp = format!("stream: {} FOUND\0", "🦀".repeat(50));
+        let verdict = ClamAvClient::parse_clamav_response(&long_found_resp).unwrap();
+        assert_eq!(
+            verdict,
+            ScanVerdict::Malware {
+                threat_name: "🦀".repeat(32)
+            }
+        );
+
+        // Long multibyte 127-boundary through parse_clamav_response
+        let boundary_found_resp = format!("stream: {}{} FOUND\n", "A".repeat(127), "🦀");
+        let verdict_boundary = ClamAvClient::parse_clamav_response(&boundary_found_resp).unwrap();
+        assert_eq!(
+            verdict_boundary,
+            ScanVerdict::Malware {
+                threat_name: "A".repeat(127)
+            }
+        );
     }
 }
