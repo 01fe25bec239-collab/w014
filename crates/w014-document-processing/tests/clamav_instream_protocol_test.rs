@@ -707,3 +707,67 @@ fn test_threat_name_sanitization() {
     assert_eq!(sanitize_threat_name("Trojan\0\r\nName"), "TrojanName");
     assert_eq!(sanitize_threat_name(""), "UnknownThreat");
 }
+
+#[tokio::test]
+async fn test_clamav_instream_malformed_clean_responses_fail_closed() {
+    let malformed_responses = [
+        "UNKNOWN SERVER OK\0",
+        "foo: OK\0",
+        "stream: MAYBE OK\0",
+        "stream: UNKNOWN OK\0",
+        "OK\0",
+        "prefix stream: OK\0",
+        "stream: OK suffix\0",
+        "stream: OK OK\0",
+        "stream: FOUND OK\0",
+        "stream: ERROR OK\0",
+        "UNKNOWN_ENGINE OK\0",
+        "arbitrary/text/ending OK\0",
+    ];
+
+    for raw in malformed_responses {
+        let resp_bytes = raw.as_bytes().to_vec();
+        let (host, port, _server) =
+            spawn_mock_clamd_server(move |_| (None, resp_bytes.clone())).await;
+
+        let config = ClamAvConfig::new(host, port);
+        let client = ClamAvClient::new(config);
+
+        let res = client.scan(b"%PDF-1.7 sample bytes").await;
+        assert!(
+            res.is_err(),
+            "Malformed response '{raw}' must fail closed, but got {res:?}"
+        );
+        assert!(
+            matches!(res.unwrap_err(), ScannerError::Protocol(_)),
+            "Malformed response '{raw}' must fail with ScannerError::Protocol"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_clamav_instream_malformed_found_responses_fail_closed() {
+    let malformed_found = [
+        "stream:  FOUND\0",
+        "stream: FOUND\0",
+        "UNKNOWN FOUND\0",
+        "foo: threat FOUND\0",
+        "stream: threat FOUND OK\0",
+    ];
+
+    for raw in malformed_found {
+        let resp_bytes = raw.as_bytes().to_vec();
+        let (host, port, _server) =
+            spawn_mock_clamd_server(move |_| (None, resp_bytes.clone())).await;
+
+        let config = ClamAvConfig::new(host, port);
+        let client = ClamAvClient::new(config);
+
+        let res = client.scan(b"%PDF-1.7 sample bytes").await;
+        assert!(
+            res.is_err(),
+            "Malformed FOUND response '{raw}' must fail closed, but got {res:?}"
+        );
+        assert!(matches!(res.unwrap_err(), ScannerError::Protocol(_)));
+    }
+}

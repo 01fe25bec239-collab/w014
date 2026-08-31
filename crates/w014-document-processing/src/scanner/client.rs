@@ -235,7 +235,7 @@ impl ClamAvClient {
             ));
         }
 
-        if trimmed == "stream: OK" || trimmed.ends_with(" OK") {
+        if trimmed == "stream: OK" {
             return Ok(ScanVerdict::Clean);
         }
 
@@ -243,7 +243,13 @@ impl ClamAvClient {
             .strip_prefix("stream: ")
             .and_then(|s| s.strip_suffix(" FOUND"))
         {
-            let sanitized = sanitize_threat_name(threat.trim());
+            let threat_trimmed = threat.trim();
+            if threat_trimmed.is_empty() {
+                return Err(ScannerError::Protocol(
+                    "Empty threat name in ClamAV FOUND response".to_string(),
+                ));
+            }
+            let sanitized = sanitize_threat_name(threat_trimmed);
             return Ok(ScanVerdict::Malware {
                 threat_name: sanitized,
             });
@@ -253,9 +259,14 @@ impl ClamAvClient {
             .strip_prefix("stream: ")
             .and_then(|s| s.strip_suffix(" ERROR"))
         {
+            let reason = err.trim();
+            if reason.is_empty() {
+                return Err(ScannerError::Protocol(
+                    "ClamAV scan error with empty reason".to_string(),
+                ));
+            }
             return Err(ScannerError::Protocol(format!(
-                "ClamAV scan error: {}",
-                err.trim()
+                "ClamAV scan error: {reason}"
             )));
         }
 
@@ -460,9 +471,52 @@ mod tests {
             ScanVerdict::Clean
         );
         assert_eq!(
+            ClamAvClient::parse_clamav_response("stream: OK\r\n").unwrap(),
+            ScanVerdict::Clean
+        );
+        assert_eq!(
             ClamAvClient::parse_clamav_response("stream: OK").unwrap(),
             ScanVerdict::Clean
         );
+        assert_eq!(
+            ClamAvClient::parse_clamav_response("  stream: OK  ").unwrap(),
+            ScanVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn test_parse_clamav_response_clean_negative_matrix_fails_closed() {
+        let malformed_clean_cases = [
+            "UNKNOWN SERVER OK",
+            "foo: OK",
+            "stream: MAYBE OK",
+            "stream: UNKNOWN OK",
+            "OK",
+            "prefix stream: OK",
+            "stream: OK suffix",
+            "stream: OK OK",
+            "stream: FOUND OK",
+            "stream: ERROR OK",
+            "UNKNOWN_ENGINE OK",
+            "arbitrary/slash/delimited/text OK",
+            "foo/bar/baz OK",
+            "something\nstream: OK",
+            "stream:\nOK",
+            "stream: OK\nsomething",
+            "",
+            "   ",
+            "\0",
+            "\r\n",
+            "\n",
+        ];
+
+        for case in malformed_clean_cases {
+            let res = ClamAvClient::parse_clamav_response(case);
+            assert!(
+                res.is_err(),
+                "Case '{case}' must fail closed with error, but got {res:?}"
+            );
+        }
     }
 
     #[test]
@@ -484,6 +538,21 @@ mod tests {
                 threat_name: "Eicar-Test-Signature".to_string()
             }
         );
+
+        let v3 = ClamAvClient::parse_clamav_response("stream: Trojan.Generic FOUND").unwrap();
+        assert_eq!(
+            v3,
+            ScanVerdict::Malware {
+                threat_name: "Trojan.Generic".to_string()
+            }
+        );
+
+        // Malformed FOUND responses must fail closed
+        assert!(ClamAvClient::parse_clamav_response("stream:  FOUND").is_err());
+        assert!(ClamAvClient::parse_clamav_response("stream: FOUND").is_err());
+        assert!(ClamAvClient::parse_clamav_response("UNKNOWN FOUND").is_err());
+        assert!(ClamAvClient::parse_clamav_response("foo: threat FOUND").is_err());
+        assert!(ClamAvClient::parse_clamav_response("stream: threat FOUND OK").is_err());
     }
 
     #[test]
@@ -491,6 +560,12 @@ mod tests {
         assert!(
             ClamAvClient::parse_clamav_response("stream: size limit exceeded ERROR\0").is_err()
         );
+        assert!(ClamAvClient::parse_clamav_response("stream: temporary failure ERROR").is_err());
+        assert!(ClamAvClient::parse_clamav_response("UNKNOWN ERROR").is_err());
+        assert!(ClamAvClient::parse_clamav_response("foo: error ERROR").is_err());
+        assert!(ClamAvClient::parse_clamav_response("stream: ERROR OK").is_err());
+        assert!(ClamAvClient::parse_clamav_response("stream: ERROR").is_err());
+        assert!(ClamAvClient::parse_clamav_response("stream:  ERROR").is_err());
         assert!(ClamAvClient::parse_clamav_response("UNKNOWN COMMAND").is_err());
         assert!(ClamAvClient::parse_clamav_response("").is_err());
         assert!(ClamAvClient::parse_clamav_response("stream: ").is_err());
