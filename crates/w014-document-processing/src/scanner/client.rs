@@ -112,6 +112,7 @@ impl ClamAvClient {
     ///
     /// Distinguishes:
     /// - VALID_PARSED_SIGNATURE_TIMESTAMP: produces `Ok(ClamAvVersionInfo)`
+    /// - UNRECOGNIZED_ENGINE_IDENTITY: fails closed with `ScannerError::Protocol`
     /// - MISSING_SIGNATURE_TIMESTAMP: fails closed with `ScannerError::Protocol`
     /// - MALFORMED_SIGNATURE_TIMESTAMP: fails closed with `ScannerError::Protocol`
     /// - UNRECOGNIZED_VERSION_RESPONSE: fails closed with `ScannerError::Protocol`
@@ -126,21 +127,17 @@ impl ClamAvClient {
 
         // Standard ClamAV response format: "ClamAV 1.3.0/27200/Mon Aug 29 12:00:00 2026"
         let parts: Vec<&str> = trimmed.split('/').collect();
-        if parts.len() < 3 {
-            if parts.len() == 1 && !trimmed.starts_with("ClamAV") {
-                return Err(ScannerError::Protocol(format!(
-                    "Unrecognized ClamAV VERSION response format: '{trimmed}'"
-                )));
-            }
+
+        let engine_str = parts[0].trim();
+        if !is_valid_clamav_engine(engine_str) {
             return Err(ScannerError::Protocol(format!(
-                "Missing signature timestamp in ClamAV VERSION response: '{trimmed}'"
+                "Unrecognized or invalid ClamAV engine identity in VERSION response: '{trimmed}'"
             )));
         }
 
-        let version_str = parts[0].trim();
-        if version_str.is_empty() {
+        if parts.len() < 3 {
             return Err(ScannerError::Protocol(format!(
-                "Missing scanner engine version in ClamAV VERSION response: '{trimmed}'"
+                "Missing signature timestamp in ClamAV VERSION response: '{trimmed}'"
             )));
         }
 
@@ -161,7 +158,7 @@ impl ClamAvClient {
         let parsed_date = parse_clamav_date(&date_str)?;
 
         Ok(ClamAvVersionInfo {
-            version: version_str.to_string(),
+            version: engine_str.to_string(),
             signature_version: sig_version,
             signature_timestamp: parsed_date,
         })
@@ -265,6 +262,21 @@ impl ClamAvClient {
         Err(ScannerError::Protocol(format!(
             "Unrecognized scanner response format: '{trimmed}'"
         )))
+    }
+}
+
+/// Positively validates that the engine component identifies a valid ClamAV engine
+/// conforming strictly to the canonical `ClamAV <version>` format.
+fn is_valid_clamav_engine(engine_str: &str) -> bool {
+    let trimmed = engine_str.trim();
+    if let Some(version_suffix) = trimmed.strip_prefix("ClamAV ") {
+        let version_part = version_suffix.trim();
+        !version_part.is_empty()
+            && version_part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || c == '+')
+    } else {
+        false
     }
 }
 
@@ -551,6 +563,71 @@ mod tests {
         assert!(ClamAvClient::parse_clamav_version_response("UNKNOWN COMMAND").is_err());
         assert!(ClamAvClient::parse_clamav_version_response("PONG").is_err());
         assert!(ClamAvClient::parse_clamav_version_response("ERROR: daemon busy").is_err());
+    }
+
+    #[test]
+    fn test_parse_clamav_version_response_unknown_or_foreign_engine_fail_closed() {
+        // UNKNOWN_ENGINE with valid fresh timestamp
+        assert!(
+            ClamAvClient::parse_clamav_version_response(
+                "UNKNOWN_ENGINE/27200/Sat Aug 29 12:00:00 2026"
+            )
+            .is_err()
+        );
+        // FOREIGN_ENGINE with valid ISO timestamp
+        assert!(
+            ClamAvClient::parse_clamav_version_response(
+                "FOREIGN_ENGINE/27200/2026-08-29T12:00:00Z"
+            )
+            .is_err()
+        );
+        // NOTCLAMAV with valid fresh timestamp
+        assert!(
+            ClamAvClient::parse_clamav_version_response("NOTCLAMAV/27200/Sat Aug 29 12:00:00 2026")
+                .is_err()
+        );
+        // Lookalike ClamAVish with valid fresh timestamp
+        assert!(
+            ClamAvClient::parse_clamav_version_response(
+                "ClamAVish 1.0/27200/Sat Aug 29 12:00:00 2026"
+            )
+            .is_err()
+        );
+        // CLAMAVISH
+        assert!(
+            ClamAvClient::parse_clamav_version_response("CLAMAVISH/27200/Sat Aug 29 12:00:00 2026")
+                .is_err()
+        );
+        // Uppercase CLAMAV
+        assert!(
+            ClamAvClient::parse_clamav_version_response(
+                "CLAMAV 1.3.0/27200/Sat Aug 29 12:00:00 2026"
+            )
+            .is_err()
+        );
+        // Lowercase clamav
+        assert!(
+            ClamAvClient::parse_clamav_version_response(
+                "clamav 1.3.0/27200/Sat Aug 29 12:00:00 2026"
+            )
+            .is_err()
+        );
+        // Empty engine field
+        assert!(
+            ClamAvClient::parse_clamav_version_response("/27200/Sat Aug 29 12:00:00 2026").is_err()
+        );
+        // Just "ClamAV" without version
+        assert!(
+            ClamAvClient::parse_clamav_version_response("ClamAV/27200/Sat Aug 29 12:00:00 2026")
+                .is_err()
+        );
+        assert!(
+            ClamAvClient::parse_clamav_version_response("ClamAV /27200/Sat Aug 29 12:00:00 2026")
+                .is_err()
+        );
+        // Non-slash single component foreign engine
+        assert!(ClamAvClient::parse_clamav_version_response("UNKNOWN_ENGINE").is_err());
+        assert!(ClamAvClient::parse_clamav_version_response("FOREIGN_ENGINE").is_err());
     }
 
     #[test]
