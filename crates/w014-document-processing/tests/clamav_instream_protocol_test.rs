@@ -10,15 +10,15 @@
 //! - SEC-010 EICAR detection on test fixture
 //! - Threat name sanitization and bounding (<=128 bytes)
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use w014_document_processing::scanner::{
-    ClamAvClient, ClamAvConfig, EICAR_TEST_SIGNATURE, EICAR_THREAT_NAME, MalwareScanner,
-    MockClamAvScanner, MockScanMode, ScanVerdict, ScannerError, SignatureHealthPolicy,
-    SignatureStatus, sanitize_threat_name,
+    ClamAvClient, ClamAvConfig, EICAR_TEST_SIGNATURE, EICAR_THREAT_NAME, MAX_SCAN_TIMEOUT_SECS,
+    MalwareScanner, MockClamAvScanner, MockScanMode, ScanVerdict, ScannerError,
+    SignatureHealthPolicy, SignatureStatus, sanitize_threat_name,
 };
 
 /// Helper to spin up a mock TCP clamd server responding with custom payloads and default fresh version.
@@ -1026,4 +1026,348 @@ fn test_clamav_config_from_env_timeout_ceiling_matrix() {
     unsafe {
         std::env::remove_var("W014_CLAMAV_TIMEOUT_SECS");
     }
+}
+
+/// Helper to spin up a mock TCP clamd server with granular phase delay controls.
+async fn spawn_delayed_clamd_server(
+    version_delay: Duration,
+    version_response: Vec<u8>,
+    chunk_read_delay: Duration,
+    instream_response_delay: Duration,
+    instream_response: Vec<u8>,
+) -> (String, u16, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let v_bytes = std::sync::Arc::new(version_response);
+    let i_bytes = std::sync::Arc::new(instream_response);
+
+    let handle = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let v_b = v_bytes.clone();
+            let i_b = i_bytes.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut temp = [0u8; 1024];
+
+                loop {
+                    let n = match socket.read(&mut temp).await {
+                        Ok(n) if n > 0 => n,
+                        _ => break,
+                    };
+                    buf.extend_from_slice(&temp[..n]);
+
+                    if chunk_read_delay > Duration::ZERO {
+                        tokio::time::sleep(chunk_read_delay).await;
+                    }
+
+                    // Check if command is VERSION
+                    if buf.starts_with(b"zVERSION") || buf.starts_with(b"nVERSION") {
+                        if version_delay > Duration::ZERO {
+                            tokio::time::sleep(version_delay).await;
+                        }
+                        let _ = socket.write_all(&v_b).await;
+                        let _ = socket.flush().await;
+                        break;
+                    }
+
+                    // Check if INSTREAM has terminated with [0,0,0,0]
+                    if buf.windows(4).any(|w| w == [0, 0, 0, 0]) {
+                        if instream_response_delay > Duration::ZERO {
+                            tokio::time::sleep(instream_response_delay).await;
+                        }
+                        let _ = socket.write_all(&i_b).await;
+                        let _ = socket.flush().await;
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    ("127.0.0.1".to_string(), port, handle)
+}
+
+#[tokio::test]
+async fn test_global_deadline_slow_version_plus_slow_instream_cannot_exceed_total() {
+    let fresh_date = (Utc::now() - ChronoDuration::hours(1))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{fresh_date}\0").into_bytes();
+
+    // VERSION takes 120ms, INSTREAM takes 150ms -> Total would be 270ms if separate timeouts existed.
+    // With global deadline of 200ms, the entire scan must abort at ~200ms.
+    let (host, port, _server) = spawn_delayed_clamd_server(
+        Duration::from_millis(120),
+        version_bytes,
+        Duration::ZERO,
+        Duration::from_millis(150),
+        b"stream: OK\0".to_vec(),
+    )
+    .await;
+
+    let mut config = ClamAvConfig::new(host, port);
+    config.timeout = Duration::from_millis(200);
+    let client = ClamAvClient::new(config);
+
+    let start = Instant::now();
+    let res = client.scan(b"%PDF-1.7 sample test bytes").await;
+    let elapsed = start.elapsed();
+
+    assert!(res.is_err(), "Scan must fail closed on timeout");
+    assert!(
+        matches!(res.unwrap_err(), ScannerError::Timeout(_)),
+        "Must fail with ScannerError::Timeout"
+    );
+    assert!(
+        elapsed < Duration::from_millis(260),
+        "Total elapsed time ({elapsed:?}) must not allow VERSION (120ms) + INSTREAM (150ms) = 270ms"
+    );
+}
+
+#[tokio::test]
+async fn test_global_deadline_version_work_consumes_deadline() {
+    let fresh_date = (Utc::now() - ChronoDuration::hours(1))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{fresh_date}\0").into_bytes();
+
+    // VERSION takes 250ms with 100ms global timeout
+    let (host, port, _server) = spawn_delayed_clamd_server(
+        Duration::from_millis(250),
+        version_bytes,
+        Duration::ZERO,
+        Duration::ZERO,
+        b"stream: OK\0".to_vec(),
+    )
+    .await;
+
+    let mut config = ClamAvConfig::new(host, port);
+    config.timeout = Duration::from_millis(100);
+    let client = ClamAvClient::new(config);
+
+    let start = Instant::now();
+    let res = client.scan(b"%PDF-1.7 sample bytes").await;
+    let elapsed = start.elapsed();
+
+    assert!(res.is_err());
+    assert!(matches!(res.unwrap_err(), ScannerError::Timeout(_)));
+    assert!(
+        elapsed < Duration::from_millis(160),
+        "VERSION timeout must abort promptly at ~100ms (took {elapsed:?})"
+    );
+}
+
+#[tokio::test]
+async fn test_global_deadline_streaming_consumes_remaining_deadline() {
+    let fresh_date = (Utc::now() - ChronoDuration::hours(1))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{fresh_date}\0").into_bytes();
+
+    // VERSION is fast (0ms), but streaming is throttled (10ms per chunk x 50 chunks = 500ms)
+    let (host, port, _server) = spawn_delayed_clamd_server(
+        Duration::ZERO,
+        version_bytes,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        b"stream: OK\0".to_vec(),
+    )
+    .await;
+
+    let mut config = ClamAvConfig::new(host, port);
+    config.timeout = Duration::from_millis(150);
+    config.chunk_size = 512; // 50 chunks for 25 KB
+    let client = ClamAvClient::new(config);
+
+    let payload = vec![0x41u8; 25_000];
+    let start = Instant::now();
+    let res = client.scan(&payload).await;
+    let elapsed = start.elapsed();
+
+    assert!(res.is_err());
+    assert!(matches!(res.unwrap_err(), ScannerError::Timeout(_)));
+    assert!(
+        elapsed < Duration::from_millis(220),
+        "Streaming timeout must abort promptly at ~150ms (took {elapsed:?})"
+    );
+}
+
+#[tokio::test]
+async fn test_global_deadline_response_read_consumes_remaining_deadline() {
+    let fresh_date = (Utc::now() - ChronoDuration::hours(1))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{fresh_date}\0").into_bytes();
+
+    // VERSION is fast (0ms), streaming is fast (0ms), but clamd response takes 300ms with 100ms deadline
+    let (host, port, _server) = spawn_delayed_clamd_server(
+        Duration::ZERO,
+        version_bytes,
+        Duration::ZERO,
+        Duration::from_millis(300),
+        b"stream: OK\0".to_vec(),
+    )
+    .await;
+
+    let mut config = ClamAvConfig::new(host, port);
+    config.timeout = Duration::from_millis(100);
+    let client = ClamAvClient::new(config);
+
+    let start = Instant::now();
+    let res = client.scan(b"%PDF-1.7 quick bytes").await;
+    let elapsed = start.elapsed();
+
+    assert!(res.is_err());
+    assert!(matches!(res.unwrap_err(), ScannerError::Timeout(_)));
+    assert!(
+        elapsed < Duration::from_millis(160),
+        "Response read timeout must abort promptly at ~100ms (took {elapsed:?})"
+    );
+}
+
+#[tokio::test]
+async fn test_global_deadline_exhaustion_before_instream_fails_closed() {
+    let fresh_date = (Utc::now() - ChronoDuration::hours(1))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{fresh_date}\0").into_bytes();
+
+    // VERSION exhausts deadline entirely (150ms on 100ms deadline)
+    let (host, port, _server) = spawn_delayed_clamd_server(
+        Duration::from_millis(150),
+        version_bytes,
+        Duration::ZERO,
+        Duration::ZERO,
+        b"stream: OK\0".to_vec(),
+    )
+    .await;
+
+    let mut config = ClamAvConfig::new(host, port);
+    config.timeout = Duration::from_millis(100);
+    let client = ClamAvClient::new(config);
+
+    let res = client.scan(b"%PDF-1.7 test").await;
+    assert!(res.is_err());
+    assert!(matches!(res.unwrap_err(), ScannerError::Timeout(_)));
+}
+
+#[tokio::test]
+async fn test_global_deadline_exhaustion_during_instream_fails_closed() {
+    let fresh_date = (Utc::now() - ChronoDuration::hours(1))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{fresh_date}\0").into_bytes();
+
+    // VERSION takes 50ms of 100ms budget, remaining 50ms is exhausted during chunk streaming (100ms chunk delay)
+    let (host, port, _server) = spawn_delayed_clamd_server(
+        Duration::from_millis(50),
+        version_bytes,
+        Duration::from_millis(100),
+        Duration::ZERO,
+        b"stream: OK\0".to_vec(),
+    )
+    .await;
+
+    let mut config = ClamAvConfig::new(host, port);
+    config.timeout = Duration::from_millis(100);
+    config.chunk_size = 512;
+    let client = ClamAvClient::new(config);
+
+    let payload = vec![0x41u8; 10_000];
+    let res = client.scan(&payload).await;
+    assert!(res.is_err());
+    assert!(matches!(res.unwrap_err(), ScannerError::Timeout(_)));
+}
+
+#[tokio::test]
+async fn test_global_deadline_exhaustion_during_response_fails_closed() {
+    let fresh_date = (Utc::now() - ChronoDuration::hours(1))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{fresh_date}\0").into_bytes();
+
+    // VERSION takes 50ms of 100ms budget, remaining 50ms is exhausted waiting for response (100ms delay)
+    let (host, port, _server) = spawn_delayed_clamd_server(
+        Duration::from_millis(50),
+        version_bytes,
+        Duration::ZERO,
+        Duration::from_millis(100),
+        b"stream: OK\0".to_vec(),
+    )
+    .await;
+
+    let mut config = ClamAvConfig::new(host, port);
+    config.timeout = Duration::from_millis(100);
+    let client = ClamAvClient::new(config);
+
+    let res = client.scan(b"%PDF-1.7 sample").await;
+    assert!(res.is_err());
+    assert!(matches!(res.unwrap_err(), ScannerError::Timeout(_)));
+}
+
+#[test]
+fn test_global_deadline_configured_large_values_cannot_exceed_120() {
+    assert_eq!(MAX_SCAN_TIMEOUT_SECS, 120);
+
+    let cfg_default = ClamAvConfig::new("127.0.0.1", 3310);
+    assert_eq!(cfg_default.effective_timeout(), Duration::from_secs(120));
+
+    let cfg_121 = ClamAvConfig {
+        timeout: Duration::from_secs(121),
+        ..ClamAvConfig::new("127.0.0.1", 3310)
+    };
+    assert_eq!(cfg_121.effective_timeout(), Duration::from_secs(120));
+    assert_eq!(
+        ClamAvClient::new(cfg_121).effective_timeout(),
+        Duration::from_secs(120)
+    );
+
+    let cfg_600 = ClamAvConfig {
+        timeout: Duration::from_secs(600),
+        ..ClamAvConfig::new("127.0.0.1", 3310)
+    };
+    assert_eq!(cfg_600.effective_timeout(), Duration::from_secs(120));
+    assert_eq!(
+        ClamAvClient::new(cfg_600).effective_timeout(),
+        Duration::from_secs(120)
+    );
+
+    let cfg_max = ClamAvConfig {
+        timeout: Duration::from_secs(u64::MAX),
+        ..ClamAvConfig::new("127.0.0.1", 3310)
+    };
+    assert_eq!(cfg_max.effective_timeout(), Duration::from_secs(120));
+    assert_eq!(
+        ClamAvClient::new(cfg_max).effective_timeout(),
+        Duration::from_secs(120)
+    );
+}
+
+#[tokio::test]
+async fn test_global_deadline_expiry_never_yields_clean() {
+    let fresh_date = (Utc::now() - ChronoDuration::hours(1))
+        .format("%a %b %d %H:%M:%S %Y")
+        .to_string();
+    let version_bytes = format!("ClamAV 1.3.0/27200/{fresh_date}\0").into_bytes();
+
+    // Server sends valid Clean "stream: OK\0", but response is delayed beyond deadline
+    let (host, port, _server) = spawn_delayed_clamd_server(
+        Duration::ZERO,
+        version_bytes,
+        Duration::ZERO,
+        Duration::from_millis(200),
+        b"stream: OK\0".to_vec(),
+    )
+    .await;
+
+    let mut config = ClamAvConfig::new(host, port);
+    config.timeout = Duration::from_millis(50);
+    let client = ClamAvClient::new(config);
+
+    let res = client.scan(b"%PDF-1.7 clean bytes").await;
+    assert!(res.is_err(), "Deadline expiry MUST NOT succeed");
+    assert!(
+        matches!(res.unwrap_err(), ScannerError::Timeout(_)),
+        "Deadline expiry MUST return ScannerError::Timeout"
+    );
 }

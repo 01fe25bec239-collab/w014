@@ -152,12 +152,8 @@ impl DocxParser {
                 total_blocks += 1;
             }
 
-            let has_images = !package.media_items.is_empty() && page_num == 1; // associate package media with first page or per-page
-            let page_media = if page_num == 1 {
-                package.media_items.clone()
-            } else {
-                Vec::new()
-            };
+            let has_images = !package.media_items.is_empty();
+            let page_media = package.media_items.clone();
 
             if !full_text_acc.is_empty() && !page_text.is_empty() {
                 full_text_acc.push_str("\n\n");

@@ -40,11 +40,31 @@ pub struct OcrPageOutput {
 /// Abstract interface for OCR engines.
 #[async_trait]
 pub trait OcrEngine: Send + Sync {
-    /// Performs OCR extraction on the provided image bytes.
+    /// Performs OCR extraction on the provided image bytes with default page timeout.
     ///
     /// # Errors
     /// Fails closed if raster limits are exceeded, timeout occurs, or the engine crashes.
-    async fn ocr_image(&self, image_bytes: &[u8], format: &str) -> Result<OcrPageOutput, OcrError>;
+    async fn ocr_image(&self, image_bytes: &[u8], format: &str) -> Result<OcrPageOutput, OcrError> {
+        self.ocr_image_with_timeout(
+            image_bytes,
+            format,
+            Duration::from_secs(MAX_PAGE_DURATION_SECS),
+        )
+        .await
+    }
+
+    /// Performs OCR extraction on the provided image bytes with an explicit maximum duration ceiling.
+    ///
+    /// The effective timeout is bounded by `min(configured_page_timeout, max_duration, MAX_PAGE_DURATION_SECS)`.
+    ///
+    /// # Errors
+    /// Fails closed if raster limits are exceeded, timeout occurs, or the engine crashes.
+    async fn ocr_image_with_timeout(
+        &self,
+        image_bytes: &[u8],
+        format: &str,
+        max_duration: Duration,
+    ) -> Result<OcrPageOutput, OcrError>;
 }
 
 /// Production Rust process runner executing the `tesseract` command-line tool.
@@ -85,10 +105,17 @@ impl ProcessTesseractEngine {
 
 #[async_trait]
 impl OcrEngine for ProcessTesseractEngine {
-    async fn ocr_image(
+    async fn ocr_image(&self, image_bytes: &[u8], format: &str) -> Result<OcrPageOutput, OcrError> {
+        let default_limit = Duration::from_secs(self.config.effective_page_timeout_secs());
+        self.ocr_image_with_timeout(image_bytes, format, default_limit)
+            .await
+    }
+
+    async fn ocr_image_with_timeout(
         &self,
         image_bytes: &[u8],
         _format: &str,
+        max_duration: Duration,
     ) -> Result<OcrPageOutput, OcrError> {
         let start = Instant::now();
 
@@ -134,10 +161,19 @@ impl OcrEngine for ProcessTesseractEngine {
 
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
 
-        // 4. Execute with strict per-page wall-clock timeout (<= 15 seconds)
-        let page_timeout =
-            Duration::from_secs(self.config.page_timeout_secs.min(MAX_PAGE_DURATION_SECS));
+        // 4. Calculate effective timeout: bounded by configured page timeout (<= 15s) and max_duration
+        let configured_page_limit = Duration::from_secs(self.config.effective_page_timeout_secs());
+        let effective_timeout = configured_page_limit.min(max_duration);
+
+        if effective_timeout.is_zero() {
+            drop(temp_file);
+            return Err(OcrError::Timeout {
+                elapsed_secs: 0,
+                limit_secs: 0,
+            });
+        }
 
         let mut child = cmd.spawn().map_err(|e| OcrError::EngineCrash {
             detail: format!(
@@ -146,21 +182,25 @@ impl OcrEngine for ProcessTesseractEngine {
             ),
         })?;
 
-        let wait_result = tokio::time::timeout(page_timeout, async {
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+
+        let read_and_wait = async {
             let mut stdout_buf = Vec::new();
             let mut stderr_buf = Vec::new();
 
-            if let Some(mut stdout) = child.stdout.take() {
-                let _ = stdout.read_to_end(&mut stdout_buf).await;
+            if let Some(ref mut out) = stdout {
+                let _ = out.read_to_end(&mut stdout_buf).await;
             }
-            if let Some(mut stderr) = child.stderr.take() {
-                let _ = stderr.read_to_end(&mut stderr_buf).await;
+            if let Some(ref mut err) = stderr {
+                let _ = err.read_to_end(&mut stderr_buf).await;
             }
 
             let status = child.wait().await;
             (status, stdout_buf, stderr_buf)
-        })
-        .await;
+        };
+
+        let wait_result = tokio::time::timeout(effective_timeout, read_and_wait).await;
 
         // Clean up tempfile
         drop(temp_file);
@@ -168,10 +208,14 @@ impl OcrEngine for ProcessTesseractEngine {
         let (status_res, stdout_bytes, stderr_bytes) = match wait_result {
             Ok(tuple) => tuple,
             Err(_) => {
+                // Timeout fired: explicitly terminate the child process and reap it
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+
                 let elapsed = start.elapsed().as_secs();
                 return Err(OcrError::Timeout {
                     elapsed_secs: elapsed,
-                    limit_secs: self.config.page_timeout_secs,
+                    limit_secs: effective_timeout.as_secs(),
                 });
             }
         };
@@ -222,6 +266,8 @@ pub enum MockOcrBehavior {
     Crash(String),
     /// Echoes embedded image length and hex snippet as text.
     Echo,
+    /// Simulate processing with artificial sleep delay.
+    Delay(Duration, String),
 }
 
 impl Default for MockTesseractEngine {
@@ -256,17 +302,42 @@ impl MockTesseractEngine {
             behavior: MockOcrBehavior::Crash(msg.into()),
         })
     }
+
+    /// Creates a mock that simulates processing delay.
+    #[must_use]
+    pub fn delayed(duration: Duration, text: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            behavior: MockOcrBehavior::Delay(duration, text.into()),
+        })
+    }
 }
 
 #[async_trait]
 impl OcrEngine for MockTesseractEngine {
-    async fn ocr_image(
+    async fn ocr_image(&self, image_bytes: &[u8], format: &str) -> Result<OcrPageOutput, OcrError> {
+        self.ocr_image_with_timeout(
+            image_bytes,
+            format,
+            Duration::from_secs(MAX_PAGE_DURATION_SECS),
+        )
+        .await
+    }
+
+    async fn ocr_image_with_timeout(
         &self,
         image_bytes: &[u8],
         _format: &str,
+        max_duration: Duration,
     ) -> Result<OcrPageOutput, OcrError> {
         // Enforce raster validation even in mock engine
         let _ = inspect_and_validate_raster(image_bytes)?;
+
+        if max_duration.is_zero() {
+            return Err(OcrError::Timeout {
+                elapsed_secs: 0,
+                limit_secs: 0,
+            });
+        }
 
         match &self.behavior {
             MockOcrBehavior::Success(text) => {
@@ -297,6 +368,24 @@ impl OcrEngine for MockTesseractEngine {
                     confidence: Some(0.90),
                     duration_ms: 5,
                 })
+            }
+            MockOcrBehavior::Delay(duration, text) => {
+                if *duration > max_duration {
+                    tokio::time::sleep(max_duration).await;
+                    Err(OcrError::Timeout {
+                        elapsed_secs: max_duration.as_secs(),
+                        limit_secs: max_duration.as_secs(),
+                    })
+                } else {
+                    tokio::time::sleep(*duration).await;
+                    let norm = normalize_nfc(text);
+                    Ok(OcrPageOutput {
+                        raw_text: text.clone(),
+                        normalized_text: norm,
+                        confidence: Some(0.95),
+                        duration_ms: duration.as_millis() as u64,
+                    })
+                }
             }
         }
     }

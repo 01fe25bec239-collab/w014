@@ -24,7 +24,7 @@ use w014_document_processing::parser::{
     DEFAULT_LOCATOR_VERSION, DEFAULT_PARSER_PROFILE_VERSION, ParserFailure, ParserLimits,
     ParserRequest, PdfSafeParser, map_normalized_range_to_raw, normalize_text_nfc,
 };
-use w014_domain::ids::{DocumentVersionId, ParserArtifactId, WorkspaceId};
+use w014_domain::ids::{DocumentVersionId, ObjectArtifactId, ParserArtifactId, WorkspaceId};
 use w014_domain::source_spans::derive_span_hash;
 use w014_domain::{
     BoundingBox, ExtractionMethod, LocatorVersion, OffsetRange, SectionPath, Sha256, SourceSpan,
@@ -406,4 +406,186 @@ fn test_canonical_span_hash_computation_and_invariants() {
         hash_1, hash_diff,
         "Span hash MUST bind exact document_version_id"
     );
+}
+
+#[test]
+fn test_safe_subset_corrupted_magic_header_fails_closed() {
+    let bad_header = b"%NOTPDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\nxref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n100\n%%EOF";
+    let digest = Sha256::digest(bad_header);
+
+    let request = ParserRequest::pdf_default("bad-header", digest, pdf_media_type()).unwrap();
+    let parser = PdfSafeParser::default();
+
+    let err = parser.parse(&request, bad_header).unwrap_err();
+    assert!(matches!(err, ParserFailure::CorruptedFile(_)));
+}
+
+#[test]
+fn test_safe_subset_corrupt_unclosed_stream_fails_closed() {
+    let unclosed_stream = b"%PDF-1.4\n\
+        1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+        2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+        3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n\
+        4 0 obj\n<< /Length 50 >>\nstream\nBT /F1 12 Tf (Unclosed stream data...) Tj ET\n\
+        xref\n0 5\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000180 00000 n \n\
+        trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n350\n%%EOF";
+    let digest = Sha256::digest(unclosed_stream);
+
+    let request = ParserRequest::pdf_default("unclosed-stream", digest, pdf_media_type()).unwrap();
+    let parser = PdfSafeParser::default();
+
+    let err = parser.parse(&request, unclosed_stream).unwrap_err();
+    assert!(matches!(
+        err,
+        ParserFailure::CorruptedFile(_) | ParserFailure::MalformedXref(_)
+    ));
+}
+
+#[test]
+fn test_safe_subset_attachments_not_recursively_opened() {
+    let attach_pdf = b"%PDF-1.4\n\
+        1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles 5 0 R >> >>\nendobj\n\
+        2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+        3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n\
+        4 0 obj\n<< /Length 30 >>\nstream\nBT /F1 12 Tf (Safe Body) Tj ET\nendstream\nendobj\n\
+        5 0 obj\n<< /Names [(malware.exe) 6 0 R] >>\nendobj\n\
+        6 0 obj\n<< /Type /Filespec /F (malware.exe) /EF << /F 7 0 R >> >>\nendobj\n\
+        7 0 obj\n<< /Length 10 /Type /EmbeddedFile >>\nstream\nBADPAYLOAD\nendstream\nendobj\n\
+        xref\n0 8\n0000000000 65535 f \n0000000009 00000 n \n0000000085 00000 n \n0000000142 00000 n \n0000000227 00000 n \n0000000318 00000 n \n0000000370 00000 n \n0000000445 00000 n \n\
+        trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n520\n%%EOF";
+
+    let digest = Sha256::digest(attach_pdf);
+    let request = ParserRequest::pdf_default("attach-test", digest, pdf_media_type()).unwrap();
+    let parser = PdfSafeParser::default();
+
+    let artifact = parser
+        .parse(&request, attach_pdf)
+        .expect("parse must succeed and ignore attachments");
+
+    assert!(
+        artifact
+            .parser_warnings
+            .iter()
+            .any(|w| w.code == "ATTACHMENTS_NOT_OPENED")
+    );
+}
+
+#[test]
+fn test_safe_subset_decompression_bomb_fails_closed() {
+    let mut limits = ParserLimits::pdf_frozen_default();
+    limits.max_total_decompressed_bytes = 50; // Artificially low limit for testing
+
+    let sample_text = "This text stream is definitely longer than 50 bytes total.";
+    let pdf_bytes = create_simple_pdf_bytes(sample_text);
+    let digest = Sha256::digest(&pdf_bytes);
+
+    let request = ParserRequest::new(
+        "decomp-bomb",
+        digest,
+        pdf_media_type(),
+        None,
+        limits.clone(),
+        DEFAULT_PARSER_PROFILE_VERSION,
+    )
+    .unwrap();
+
+    let parser = PdfSafeParser::new(limits);
+    let err = parser.parse(&request, &pdf_bytes).unwrap_err();
+    assert!(matches!(err, ParserFailure::DecompressionBomb(_)));
+}
+
+#[tokio::test]
+async fn test_pdfium_parse_failure_fail_closed_prevents_heuristic_fallback_matrix() {
+    use uuid::Uuid;
+    use w014_document_processing::PdfSandboxRunner;
+    use w014_document_processing::sandbox::{
+        SandboxInput, SandboxRunner, SandboxSecurityProfile, SandboxStatus,
+    };
+
+    let test_cases: Vec<(&str, &[u8], &str)> = vec![
+        (
+            "malformed-xref",
+            b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF",
+            "MALFORMED_XREF",
+        ),
+        (
+            "unclosed-stream",
+            b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\nstream\ncorrupted\nxref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n100\n%%EOF",
+            "CORRUPTED_PDF",
+        ),
+        (
+            "encrypted-unsupported",
+            b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\nxref\n0 3\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R /Encrypt << /V 2 /R 3 >> >>\nstartxref\n120\n%%EOF",
+            "UNSUPPORTED_ENCRYPTED_PDF",
+        ),
+        (
+            "bad-magic-header",
+            b"%NOTPDF-1.4\n1 0 obj\n<< >>\nendobj\nxref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n100\n%%EOF",
+            "CORRUPTED_PDF",
+        ),
+    ];
+
+    let runner = PdfSandboxRunner::default();
+    let profile = SandboxSecurityProfile::frozen_default();
+
+    for (label, bytes, expected_code_prefix) in test_cases {
+        let ws_id = WorkspaceId::new();
+        let dv_id = DocumentVersionId::new();
+        let oa_id = ObjectArtifactId::new();
+        let digest = Sha256::digest(bytes);
+
+        let input = SandboxInput::new(
+            ws_id,
+            dv_id,
+            oa_id,
+            Uuid::new_v4(),
+            pdf_media_type(),
+            digest,
+            bytes.len() as i64,
+            bytes.to_vec(),
+        )
+        .expect("valid sandbox input");
+
+        let output = runner
+            .run(&profile, &input)
+            .await
+            .expect("runner must return typed output");
+
+        // Assert fail closed: status is NEVER Success
+        assert_ne!(
+            output.status,
+            SandboxStatus::Success,
+            "Failed PDF '{label}' must NEVER be converted to heuristic success"
+        );
+        assert!(
+            output.status == SandboxStatus::Corrupted
+                || output.status == SandboxStatus::Unsupported
+                || output.status == SandboxStatus::Failed,
+            "Output status must be a failure status"
+        );
+
+        // Assert ZERO canonical facts are produced
+        assert!(
+            output.parsed_artifact.is_none(),
+            "Zero parsed_artifact data on rejection for '{label}'"
+        );
+        assert_eq!(output.page_count, 0, "page_count must be 0 for '{label}'");
+        assert_eq!(output.block_count, 0, "block_count must be 0 for '{label}'");
+        assert_eq!(output.span_count, 0, "span_count must be 0 for '{label}'");
+        assert!(
+            output.text_sha256.is_none(),
+            "text_sha256 must be None for '{label}'"
+        );
+        assert!(
+            output.failure_code.is_some(),
+            "failure_code must be present for '{label}'"
+        );
+        let code = output.failure_code.unwrap();
+        assert!(
+            code.contains(expected_code_prefix)
+                || code == "CORRUPTED_PDF"
+                || code == "MALFORMED_XREF",
+            "Expected failure code related to '{expected_code_prefix}', got '{code}' for '{label}'"
+        );
+    }
 }

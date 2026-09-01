@@ -9,7 +9,7 @@
 //! 6. Typed, bounded `SandboxOutput` generation
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use w014_domain::ids::ParserArtifactId;
 use w014_domain::{
@@ -19,8 +19,8 @@ use w014_domain::{
 
 use crate::docx::{DocxError, DocxPackage, DocxParser};
 use crate::ocr::{
-    ConflictEvaluationResult, MAX_OCR_PAGES, OcrEngine, OcrError, OcrPolicyConfig,
-    SpanProvenanceFactory, evaluate_native_vs_ocr,
+    ConflictEvaluationResult, OcrEngine, OcrError, OcrPolicyConfig, SpanProvenanceFactory,
+    evaluate_native_vs_ocr,
 };
 use crate::sandbox::{SANDBOX_PROTOCOL_VERSION, SandboxInput, SandboxOutput, SandboxStatus};
 
@@ -93,14 +93,12 @@ impl DocxOcrProducer {
         // 2. Safe subset hierarchy extraction
         let parsed_doc = DocxParser::parse_package(&package)?;
 
-        // 3. Page count limit check
-        if parsed_doc.pages.len() > MAX_OCR_PAGES as usize {
-            return Err(DocxError::PackageLimitsExceeded {
-                limit_name: "OCR_PAGE_LIMIT",
-                actual: parsed_doc.pages.len() as u64,
-                limit: MAX_OCR_PAGES as u64,
-            });
-        }
+        // Note: General parser page limit (MAX_PAGE_NUMBER = 10,000) is enforced inside DocxParser.
+        // The OCR page budget (MAX_OCR_PAGES = 250) applies strictly to pages submitted to OCR.
+
+        // 3. Setup single bounded OCR job wall-clock deadline (<= 1800s total)
+        let job_timeout = Duration::from_secs(self.ocr_config.effective_job_timeout_secs());
+        let job_deadline = start_time + job_timeout;
 
         // 4. Build domain entities and execute OCR fallback where policy dictates
         let artifact_id = ParserArtifactId::new();
@@ -130,6 +128,8 @@ impl DocxOcrProducer {
 
         let mut global_span_sequence: u32 = 0;
         let mut total_full_text = String::new();
+        let mut ocr_pages_count: u32 = 0;
+        let max_ocr_pages = self.ocr_config.effective_max_pages();
 
         for parsed_page in parsed_doc.pages {
             let page_num = parsed_page.page_number;
@@ -146,12 +146,50 @@ impl DocxOcrProducer {
                 .should_trigger_ocr(native_text.len(), parsed_page.has_embedded_images)
                 && !parsed_page.media_items.is_empty()
             {
+                // Enforce OCR page ceiling on pages actually submitted to OCR
+                ocr_pages_count += 1;
+                if ocr_pages_count > max_ocr_pages {
+                    return Err(DocxError::PackageLimitsExceeded {
+                        limit_name: "OCR_PAGE_LIMIT",
+                        actual: ocr_pages_count as u64,
+                        limit: max_ocr_pages as u64,
+                    });
+                }
+
+                // Check remaining job budget before running OCR
+                let now = Instant::now();
+                if now >= job_deadline {
+                    let elapsed = start_time.elapsed().as_secs();
+                    return Err(DocxError::Io {
+                        detail: format!(
+                            "OCR job wall-clock deadline exceeded: {elapsed}s (limit {}s)",
+                            job_timeout.as_secs()
+                        ),
+                    });
+                }
+
                 // OCR fallback execution on page images
                 let mut ocr_texts = Vec::new();
                 for media in &parsed_page.media_items {
+                    let now = Instant::now();
+                    if now >= job_deadline {
+                        let elapsed = start_time.elapsed().as_secs();
+                        return Err(DocxError::Io {
+                            detail: format!(
+                                "OCR job wall-clock deadline exceeded: {elapsed}s (limit {}s)",
+                                job_timeout.as_secs()
+                            ),
+                        });
+                    }
+                    let remaining_job_time = job_deadline.saturating_duration_since(now);
+
                     let ocr_res = self
                         .ocr_engine
-                        .ocr_image(&media.data, &media.content_type)
+                        .ocr_image_with_timeout(
+                            &media.data,
+                            &media.content_type,
+                            remaining_job_time,
+                        )
                         .await
                         .map_err(|ocr_err| match ocr_err {
                             OcrError::PageLimitExceeded { actual, limit } => {

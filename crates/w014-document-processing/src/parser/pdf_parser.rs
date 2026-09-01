@@ -80,20 +80,12 @@ impl PdfSafeParser {
         // 4. Pre-scan for decompression bomb signatures & malformed structures
         self.check_structure_and_safety(bytes)?;
 
-        // 5. Try PDFium native parser if library is available; otherwise run built-in safe extractor
+        // 5. Execute safe parser: PDFium if library is bound; otherwise pure-Rust safe extractor.
+        // SECURITY BOUNDARY (WI-0206): When PDFium rejects an input (malformed, corrupt, encrypted,
+        // ceiling exceeded, or parse error), it MUST fail closed. PDFium errors MUST NEVER be caught
+        // or bypassed by falling back to heuristic parsing.
         let parsed_artifact = if let Some(pdfium) = get_pdfium() {
-            match self.parse_with_pdfium(pdfium, bytes, request) {
-                Ok(art) => art,
-                Err(ParserFailure::UnsupportedFeature(_))
-                | Err(ParserFailure::EncryptedOrPasswordProtected) => {
-                    // Propagate unsupported/encryption errors directly
-                    return self.parse_with_pdfium(pdfium, bytes, request);
-                }
-                Err(_) => {
-                    // Fall back to pure Rust safe extractor on native parse errors
-                    self.parse_with_builtin_safe_extractor(bytes, request)?
-                }
-            }
+            self.parse_with_pdfium(pdfium, bytes, request)?
         } else {
             self.parse_with_builtin_safe_extractor(bytes, request)?
         };
@@ -157,7 +149,9 @@ impl PdfSafeParser {
                 total_stream_bytes = total_stream_bytes.saturating_add(stream_len);
                 cursor = actual_start + end + 9;
             } else {
-                break;
+                return Err(ParserFailure::CorruptedFile(
+                    "Stream missing matching 'endstream' delimiter".to_string(),
+                ));
             }
         }
 
@@ -207,7 +201,7 @@ impl PdfSafeParser {
         let mut parsed_blocks = Vec::new();
         let mut parsed_spans = Vec::new();
         let mut geometries = Vec::new();
-        let mut parser_warnings = Vec::new();
+        let mut parser_warnings = scan_security_warnings(bytes);
 
         let mut global_span_seq = 0;
 
@@ -217,6 +211,13 @@ impl PdfSafeParser {
             // Geometry & Raster limit check
             let width = page.width().value as f64;
             let height = page.height().value as f64;
+
+            if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                return Err(ParserFailure::CorruptedFile(format!(
+                    "Invalid page {page_number} dimensions: width={width}, height={height}"
+                )));
+            }
+
             let rotation = match page.rotation() {
                 Ok(r) => match r {
                     pdfium_render::prelude::PdfPageRenderRotation::Degrees90 => Rotation::Deg90,
@@ -318,36 +319,7 @@ impl PdfSafeParser {
         let content_str = String::from_utf8_lossy(bytes);
 
         // 1. Scan for annotations / Javascript / actions to ignore and record warnings
-        let mut parser_warnings = Vec::new();
-        if content_str.contains("/JavaScript") || content_str.contains("/JS") {
-            parser_warnings.push(ParserWarning {
-                code: "JAVASCRIPT_ACTIONS_IGNORED".to_string(),
-                page_number: None,
-                message: "Embedded JavaScript actions were detected and ignored".to_string(),
-            });
-        }
-        if content_str.contains("/Launch") {
-            parser_warnings.push(ParserWarning {
-                code: "LAUNCH_ACTIONS_IGNORED".to_string(),
-                page_number: None,
-                message: "Launch actions were detected and ignored".to_string(),
-            });
-        }
-        if content_str.contains("/URI") {
-            parser_warnings.push(ParserWarning {
-                code: "INERT_LINKS_RETAINED".to_string(),
-                page_number: None,
-                message: "URI links were parsed as inert text only; URLs were not followed"
-                    .to_string(),
-            });
-        }
-        if content_str.contains("/EmbeddedFiles") || content_str.contains("/FileAttachment") {
-            parser_warnings.push(ParserWarning {
-                code: "ATTACHMENTS_NOT_OPENED".to_string(),
-                page_number: None,
-                message: "Embedded file attachments were not recursively opened".to_string(),
-            });
-        }
+        let mut parser_warnings = scan_security_warnings(bytes);
 
         // 2. Parse text content from streams / text operators (`BT ... ET`, `Tj`, `TJ`, or raw readable blocks)
         let page_chunks = extract_text_chunks_from_pdf(bytes);
@@ -546,7 +518,7 @@ fn extract_text_chunks_from_pdf(bytes: &[u8]) -> Vec<String> {
             if !clean.trim().is_empty() {
                 chunks.push(clean);
             } else {
-                chunks.push("Document Content".to_string());
+                chunks.push(String::new());
             }
         }
     }
@@ -809,4 +781,39 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// Inspects raw PDF bytes for security markers to emit inert/ignored warnings.
+fn scan_security_warnings(bytes: &[u8]) -> Vec<ParserWarning> {
+    let content_str = String::from_utf8_lossy(bytes);
+    let mut warnings = Vec::new();
+    if content_str.contains("/JavaScript") || content_str.contains("/JS") {
+        warnings.push(ParserWarning {
+            code: "JAVASCRIPT_ACTIONS_IGNORED".to_string(),
+            page_number: None,
+            message: "Embedded JavaScript actions were detected and ignored".to_string(),
+        });
+    }
+    if content_str.contains("/Launch") {
+        warnings.push(ParserWarning {
+            code: "LAUNCH_ACTIONS_IGNORED".to_string(),
+            page_number: None,
+            message: "Launch actions were detected and ignored".to_string(),
+        });
+    }
+    if content_str.contains("/URI") {
+        warnings.push(ParserWarning {
+            code: "INERT_LINKS_RETAINED".to_string(),
+            page_number: None,
+            message: "URI links were parsed as inert text only; URLs were not followed".to_string(),
+        });
+    }
+    if content_str.contains("/EmbeddedFiles") || content_str.contains("/FileAttachment") {
+        warnings.push(ParserWarning {
+            code: "ATTACHMENTS_NOT_OPENED".to_string(),
+            page_number: None,
+            message: "Embedded file attachments were not recursively opened".to_string(),
+        });
+    }
+    warnings
 }
