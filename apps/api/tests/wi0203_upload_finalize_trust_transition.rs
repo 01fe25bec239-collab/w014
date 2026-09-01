@@ -29,8 +29,8 @@ use w014_api::create_app_with_pool;
 use w014_api::routes::documents::{UploadFinalizeDto, UploadIntentDto};
 use w014_application::persistence::{
     DocumentRepository, MembershipRepository, ObjectArtifactRepository, OrganizationRepository,
-    PrincipalRepository, ProgramRepository, SessionRepository, UploadIntentRepository,
-    WorkspaceRepository,
+    PrincipalRepository, ProgramRepository, QuarantineRecordRepository, SessionRepository,
+    UploadIntentRepository, WorkspaceRepository,
 };
 use w014_application::services::DocumentService;
 use w014_authn::csrf::{CSRF_HEADER_NAME, CsrfConfig, derive_csrf_token};
@@ -43,7 +43,7 @@ use w014_domain::program::Program;
 use w014_domain::workspace::Workspace;
 use w014_domain::{
     ArtifactKind, Document, DocumentClass, EncryptionMode, IntentStatus, MediaType, ObjectArtifact,
-    ObjectKey, Sha256, StorageTier, UploadIntent,
+    ObjectKey, QuarantineStatus, Sha256, StorageTier, UploadIntent,
 };
 use w014_persistence::harness::TestDatabase;
 use w014_persistence::runner::{MIGRATOR, MigrationRunner};
@@ -256,7 +256,7 @@ async fn test_wi0203_gate01_authoritative_upload_finalize_pdf_happy_path() {
     // 5. Verify database facts within workspace
     let ver_uuid = Uuid::parse_str(&finalize_dto.document_version_id).unwrap();
     let art_uuid = Uuid::parse_str(&finalize_dto.object_artifact_id).unwrap();
-    let qr_uuid = Uuid::parse_str(&finalize_dto.quarantine_record_id).unwrap();
+    let _qr_uuid = Uuid::parse_str(&finalize_dto.quarantine_record_id).unwrap();
     let job_uuid = Uuid::parse_str(&finalize_dto.scan_job_id).unwrap();
 
     // DocumentVersion fact
@@ -284,7 +284,7 @@ async fn test_wi0203_gate01_authoritative_upload_finalize_pdf_happy_path() {
 
     // ObjectArtifact fact
     let artifact_row = sqlx::query(
-        "SELECT artifact_kind, storage_bucket, object_key, byte_length, content_sha256, storage_tier, sse_mode \
+        "SELECT artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode, kms_key_ref, retention_until \
          FROM object_artifacts WHERE workspace_id = $1 AND object_artifact_id = $2",
     )
     .bind(ws.id.as_uuid())
@@ -293,11 +293,7 @@ async fn test_wi0203_gate01_authoritative_upload_finalize_pdf_happy_path() {
     .await
     .unwrap();
 
-    assert_eq!(artifact_row.get::<String, _>("artifact_kind"), "original");
-    assert_eq!(
-        artifact_row.get::<String, _>("storage_bucket"),
-        "w014-documents"
-    );
+    assert_eq!(artifact_row.get::<String, _>("artifact_kind"), "raw_upload");
     assert_eq!(
         artifact_row.get::<String, _>("object_key"),
         intent_dto.opaque_object_key
@@ -306,33 +302,47 @@ async fn test_wi0203_gate01_authoritative_upload_finalize_pdf_happy_path() {
         artifact_row.get::<i64, _>("byte_length"),
         sample_bytes.len() as i64
     );
-    assert_eq!(artifact_row.get::<String, _>("storage_tier"), "hot");
-    assert_eq!(artifact_row.get::<String, _>("sse_mode"), "sse_aes256");
+    assert_eq!(
+        artifact_row.get::<Vec<u8>, _>("content_sha256"),
+        sha256_val.as_bytes()
+    );
+    assert_eq!(
+        artifact_row.get::<String, _>("media_type"),
+        "application/pdf"
+    );
+    assert_eq!(artifact_row.get::<String, _>("sse_mode"), "aws:kms");
+    assert_eq!(artifact_row.get::<Option<String>, _>("kms_key_ref"), None);
+    assert_eq!(
+        artifact_row.get::<Option<chrono::DateTime<Utc>>, _>("retention_until"),
+        None
+    );
 
-    // QuarantineRecord fact
-    let qr_row = sqlx::query(
-        "SELECT upload_intent_id, document_version_id, object_artifact_id, scanner_name, status \
-         FROM quarantine_records WHERE workspace_id = $1 AND quarantine_record_id = $2",
+    // QuarantineRecord fact: physical scan verdict row is deferred until scanner execution,
+    // and repository yields the pending intake representation.
+    let qr_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM quarantine_records WHERE workspace_id = $1 AND upload_intent_id = $2",
     )
     .bind(ws.id.as_uuid())
-    .bind(qr_uuid)
+    .bind(Uuid::parse_str(&intent_dto.id).unwrap())
     .fetch_one(db.pool())
     .await
     .unwrap();
+    assert_eq!(qr_count, 0);
 
+    let mut conn = db.pool().acquire().await.unwrap();
+    let qr = QuarantineRecordRepository::get_latest_by_intent(
+        &mut conn,
+        ws.id,
+        UploadIntentId::from_uuid(Uuid::parse_str(&intent_dto.id).unwrap()),
+    )
+    .await
+    .unwrap()
+    .expect("quarantine representation must exist");
+    assert_eq!(qr.status, QuarantineStatus::Pending);
     assert_eq!(
-        qr_row.get::<Uuid, _>("upload_intent_id"),
+        qr.upload_intent_id.into_uuid(),
         Uuid::parse_str(&intent_dto.id).unwrap()
     );
-    assert_eq!(
-        qr_row.get::<Option<Uuid>, _>("document_version_id"),
-        Some(ver_uuid)
-    );
-    assert_eq!(
-        qr_row.get::<Option<Uuid>, _>("object_artifact_id"),
-        Some(art_uuid)
-    );
-    assert_eq!(qr_row.get::<String, _>("status"), "pending");
 
     // UploadIntent consumption
     let intent_row = sqlx::query(
@@ -1359,6 +1369,7 @@ async fn test_wi0203_gate14_object_head_required_missing_storage_upload() {
     };
 
     // We do NOT stage anything in mock storage -> HEAD returns None
+    DocumentService::ensure_test_storage_injected();
 
     let req = Request::builder()
         .uri(format!(
