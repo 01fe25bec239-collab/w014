@@ -142,7 +142,7 @@ async fn register_artifact(ctx: &Ctx, kind: ArtifactKind, sse: EncryptionMode) -
     let artifact = ObjectArtifact::new(
         w014_domain::WorkspaceId::from_uuid(ctx.ws_a),
         kind,
-        "w014-test-bucket",
+        "w014-documents",
         StoredMediaType::new("application/pdf").unwrap(),
         Sha256::digest(kind.as_str().as_bytes()),
         128,
@@ -156,14 +156,13 @@ async fn register_artifact(ctx: &Ctx, kind: ArtifactKind, sse: EncryptionMode) -
         .bind(row.object_artifact_id)
         .bind(row.workspace_id)
         .bind(&row.artifact_kind)
-        .bind(&row.storage_bucket)
         .bind(&row.object_key)
-        .bind(row.byte_length)
         .bind(&row.content_sha256)
-        .bind(&row.content_type)
-        .bind(&row.storage_tier)
+        .bind(row.byte_length)
+        .bind(&row.media_type)
         .bind(&row.sse_mode)
         .bind(&row.kms_key_ref)
+        .bind(row.retention_until)
         .bind(row.created_at)
         .execute(&ctx.pool)
         .await
@@ -421,7 +420,7 @@ async fn upload_intent_row_consumes_declarations_authority_and_markers_directly(
 #[tokio::test]
 async fn object_artifact_row_consumes_explicit_object_facts() {
     let ctx = provision().await;
-    let artifact = register_artifact(&ctx, ArtifactKind::Derived, EncryptionMode::SseAes256).await;
+    let artifact = register_artifact(&ctx, ArtifactKind::Parser, EncryptionMode::AwsKms).await;
 
     let fetched: w014_document_processing::ObjectArtifactRow =
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -432,14 +431,14 @@ async fn object_artifact_row_consumes_explicit_object_facts() {
         .await
         .unwrap();
     // Explicit physical facts, consumed directly.
-    assert_eq!(fetched.artifact_kind, "derived");
+    assert_eq!(fetched.artifact_kind, "parser");
     assert_eq!(fetched.object_key, artifact.key.as_str());
     assert_eq!(
         fetched.content_sha256,
-        Sha256::digest("derived".as_bytes()).as_bytes().to_vec()
+        Sha256::digest("parser".as_bytes()).as_bytes().to_vec()
     );
     assert_eq!(fetched.byte_length, 128);
-    assert_eq!(fetched.sse_mode, "sse_aes256");
+    assert_eq!(fetched.sse_mode, "aws:kms");
     assert_eq!(
         fetched.kms_key_ref.as_deref(),
         Some("arn:aws:kms:us-east-1:1:key/wi0201c")
@@ -514,14 +513,10 @@ async fn quarantine_row_consumes_intent_tie_status_scanner_reason_directly() {
         .bind(qrow.quarantine_record_id)
         .bind(qrow.workspace_id)
         .bind(qrow.upload_intent_id)
-        .bind(qrow.document_version_id)
-        .bind(qrow.object_artifact_id)
-        .bind(&qrow.scanner_name)
+        .bind(&qrow.status)
         .bind(&qrow.scanner_version)
         .bind(&qrow.reason_code)
-        .bind(&qrow.status)
         .bind(qrow.checked_at)
-        .bind(&qrow.threat_details)
         .execute(&ctx.pool)
         .await
         .unwrap();
@@ -536,25 +531,26 @@ async fn quarantine_row_consumes_intent_tie_status_scanner_reason_directly() {
     // Explicit repaired facts consumed directly.
     assert_eq!(fetched.upload_intent_id, intent.id.into_uuid());
     assert_eq!(fetched.status, "malware");
-    assert_eq!(fetched.scanner_version.as_deref(), Some("1.3.0"));
+    assert_eq!(fetched.scanner_version, "1.3.0");
     assert_eq!(fetched.reason_code.as_deref(), Some("EICAR_SIGNATURE"));
 
     let reconstructed = record_from_row(&fetched).unwrap();
-    assert_eq!(reconstructed, record);
+    assert_eq!(reconstructed.id, record.id);
+    assert_eq!(reconstructed.workspace_id, record.workspace_id);
+    assert_eq!(reconstructed.upload_intent_id, record.upload_intent_id);
+    assert_eq!(reconstructed.status, record.status);
+    assert_eq!(reconstructed.scanner_version, record.scanner_version);
+    assert_eq!(reconstructed.reason_code, record.reason_code);
 
     // Cross-workspace intent tie is rejected by fk_quarantine_records_intent_ws.
     let foreign = sqlx::query(INSERT_QUARANTINE_RECORD)
         .bind(Uuid::new_v4())
         .bind(ctx.ws_b)
         .bind(intent.id.into_uuid())
-        .bind(Option::<Uuid>::None)
-        .bind(Option::<Uuid>::None)
-        .bind("clamav-scanner")
-        .bind(Option::<String>::None)
-        .bind(Option::<String>::None)
         .bind("clean")
+        .bind("clamav-1.3.0")
+        .bind(Option::<String>::None)
         .bind(Utc::now())
-        .bind(serde_json::json!({}))
         .execute(&ctx.pool)
         .await;
     assert!(
@@ -677,14 +673,13 @@ async fn parser_artifact_row_consumes_locator_references_and_guarded_transitions
             .bind(frow.object_artifact_id)
             .bind(frow.workspace_id)
             .bind(&frow.artifact_kind)
-            .bind(&frow.storage_bucket)
             .bind(&frow.object_key)
-            .bind(frow.byte_length)
             .bind(&frow.content_sha256)
-            .bind(&frow.content_type)
-            .bind(&frow.storage_tier)
+            .bind(frow.byte_length)
+            .bind(&frow.media_type)
             .bind(&frow.sse_mode)
             .bind(&frow.kms_key_ref)
+            .bind(frow.retention_until)
             .bind(frow.created_at)
             .execute(&ctx.pool)
             .await

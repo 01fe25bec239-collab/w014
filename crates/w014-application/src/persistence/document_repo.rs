@@ -74,17 +74,20 @@ const FINALIZE_UPLOAD_INTENT: &str = "UPDATE upload_intents \
      SET object_artifact_id = $1, status = 'verified', finalized_at = $2 \
      WHERE workspace_id = $3 AND upload_intent_id = $4 AND status IN ('initiated', 'uploaded')";
 
-const SELECT_OBJECT_ARTIFACT_BY_ID: &str = "SELECT object_artifact_id, workspace_id, artifact_kind, storage_bucket, object_key, byte_length, content_sha256, content_type, storage_tier, sse_mode, kms_key_ref, created_at \
+const SELECT_OBJECT_ARTIFACT_BY_ID: &str = "SELECT object_artifact_id, workspace_id, artifact_kind, object_key, byte_length, content_sha256, media_type, sse_mode, kms_key_ref, retention_until, created_at \
      FROM object_artifacts WHERE workspace_id = $1 AND object_artifact_id = $2";
 
-const SELECT_QUARANTINE_RECORD_BY_ID: &str = "SELECT quarantine_record_id, workspace_id, upload_intent_id, document_version_id, object_artifact_id, scanner_name, scanner_version, reason_code, status, checked_at, threat_details \
+const SELECT_QUARANTINE_RECORD_BY_ID: &str = "SELECT quarantine_record_id, workspace_id, upload_intent_id, status, scanner_version, reason_code, checked_at \
      FROM quarantine_records WHERE workspace_id = $1 AND quarantine_record_id = $2";
 
-const SELECT_QUARANTINE_RECORD_BY_INTENT: &str = "SELECT quarantine_record_id, workspace_id, upload_intent_id, document_version_id, object_artifact_id, scanner_name, scanner_version, reason_code, status, checked_at, threat_details \
+const SELECT_QUARANTINE_RECORD_BY_INTENT: &str = "SELECT quarantine_record_id, workspace_id, upload_intent_id, status, scanner_version, reason_code, checked_at \
      FROM quarantine_records WHERE workspace_id = $1 AND upload_intent_id = $2 ORDER BY checked_at DESC LIMIT 1";
 
-const SELECT_QUARANTINE_RECORD_BY_VERSION: &str = "SELECT quarantine_record_id, workspace_id, upload_intent_id, document_version_id, object_artifact_id, scanner_name, scanner_version, reason_code, status, checked_at, threat_details \
-     FROM quarantine_records WHERE workspace_id = $1 AND document_version_id = $2 ORDER BY checked_at DESC LIMIT 1";
+const SELECT_QUARANTINE_RECORD_BY_VERSION: &str = "SELECT qr.quarantine_record_id, qr.workspace_id, qr.upload_intent_id, qr.status, qr.scanner_version, qr.reason_code, qr.checked_at \
+     FROM quarantine_records qr \
+     JOIN upload_intents ui ON qr.upload_intent_id = ui.upload_intent_id AND qr.workspace_id = ui.workspace_id \
+     JOIN document_versions dv ON dv.object_artifact_id = ui.object_artifact_id AND dv.workspace_id = ui.workspace_id \
+     WHERE dv.workspace_id = $1 AND dv.document_version_id = $2 ORDER BY qr.checked_at DESC LIMIT 1";
 
 /// Repository operations for logical Documents.
 pub struct DocumentRepository;
@@ -497,14 +500,13 @@ impl ObjectArtifactRepository {
             .bind(new_row.object_artifact_id)
             .bind(new_row.workspace_id)
             .bind(&new_row.artifact_kind)
-            .bind(&new_row.storage_bucket)
             .bind(&new_row.object_key)
-            .bind(new_row.byte_length)
             .bind(&new_row.content_sha256)
-            .bind(&new_row.content_type)
-            .bind(&new_row.storage_tier)
+            .bind(new_row.byte_length)
+            .bind(&new_row.media_type)
             .bind(&new_row.sse_mode)
             .bind(new_row.kms_key_ref.as_deref())
+            .bind(new_row.retention_until)
             .bind(new_row.created_at)
             .execute(&mut *tx)
             .await
@@ -634,14 +636,10 @@ impl QuarantineRecordRepository {
             .bind(new_row.quarantine_record_id)
             .bind(new_row.workspace_id)
             .bind(new_row.upload_intent_id)
-            .bind(new_row.document_version_id)
-            .bind(new_row.object_artifact_id)
-            .bind(&new_row.scanner_name)
-            .bind(new_row.scanner_version.as_deref())
-            .bind(new_row.reason_code.as_deref())
             .bind(&new_row.status)
+            .bind(&new_row.scanner_version)
+            .bind(new_row.reason_code.as_deref())
             .bind(new_row.checked_at)
-            .bind(&new_row.threat_details)
             .execute(&mut *tx)
             .await
             .map_err(PersistenceError::Connection)?;
@@ -691,7 +689,31 @@ impl QuarantineRecordRepository {
                     .map_err(|e| PersistenceError::Operation(e.to_string()))?;
                 Ok(Some(rec))
             }
-            None => Ok(None),
+            None => {
+                let intent_created_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+                    "SELECT created_at FROM upload_intents WHERE workspace_id = $1 AND upload_intent_id = $2",
+                )
+                .bind(workspace_id.as_uuid())
+                .bind(intent_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(PersistenceError::Connection)?;
+
+                if let Some(created_at) = intent_created_at {
+                    let pending = QuarantineRecord::from_outcome(
+                        workspace_id,
+                        intent_id,
+                        w014_domain::QuarantineStatus::Pending,
+                        "pipeline-intake",
+                        None,
+                        created_at,
+                    )
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                    Ok(Some(pending))
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 
@@ -714,7 +736,34 @@ impl QuarantineRecordRepository {
                     .map_err(|e| PersistenceError::Operation(e.to_string()))?;
                 Ok(Some(rec))
             }
-            None => Ok(None),
+            None => {
+                let intent_info: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+                    "SELECT ui.upload_intent_id, ui.created_at \
+                     FROM upload_intents ui \
+                     JOIN document_versions dv ON dv.object_artifact_id = ui.object_artifact_id AND dv.workspace_id = ui.workspace_id \
+                     WHERE dv.workspace_id = $1 AND dv.document_version_id = $2",
+                )
+                .bind(workspace_id.as_uuid())
+                .bind(version_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(PersistenceError::Connection)?;
+
+                if let Some((intent_uuid, created_at)) = intent_info {
+                    let pending = QuarantineRecord::from_outcome(
+                        workspace_id,
+                        UploadIntentId::from_uuid(intent_uuid),
+                        w014_domain::QuarantineStatus::Pending,
+                        "pipeline-intake",
+                        None,
+                        created_at,
+                    )
+                    .map_err(|e| PersistenceError::Operation(e.to_string()))?;
+                    Ok(Some(pending))
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 }

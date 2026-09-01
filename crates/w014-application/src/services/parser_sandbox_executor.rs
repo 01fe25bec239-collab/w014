@@ -75,13 +75,17 @@ impl ParserSandboxJobExecutor {
             "SELECT 1 FROM jobs \
              WHERE job_id = $1 \
                AND workspace_id = $2 \
-               AND lease_token = $3 \
-               AND lease_generation = $4 \
-               AND attempt_count = $5 \
-               AND status = 'running'",
+               AND lease_holder = $3 \
+               AND lease_token = $4 \
+               AND lease_generation = $5 \
+               AND attempt_count = $6 \
+               AND status = 'running' \
+               AND lease_expires_at IS NOT NULL \
+               AND lease_expires_at > clock_timestamp()",
         )
         .bind(handle.job_id)
         .bind(handle.workspace_id)
+        .bind(&handle.worker_id)
         .bind(handle.lease_token)
         .bind(handle.lease_generation)
         .bind(handle.attempt_number)

@@ -8,6 +8,7 @@ pub mod membership_service;
 pub mod oidc_service;
 pub mod parser_sandbox_executor;
 pub mod session_service;
+pub mod storage;
 pub mod workspace_init;
 
 pub use capability_service::CapabilityGrantService;
@@ -22,4 +23,5 @@ pub use membership_service::MembershipService;
 pub use oidc_service::OidcPersistenceService;
 pub use parser_sandbox_executor::ParserSandboxJobExecutor;
 pub use session_service::SessionService;
+pub use storage::{S3StorageAdapter, S3StorageConfig};
 pub use workspace_init::WorkspaceInitializationService;

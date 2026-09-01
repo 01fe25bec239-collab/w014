@@ -42,7 +42,9 @@ pub use ids::{
 pub use json::BoundedJson;
 pub use media::{MediaType, StoredMediaType};
 pub use membership::{Membership, MembershipRole};
-pub use object_artifacts::{ArtifactKind, EncryptionMode, ObjectArtifact, ObjectKey, StorageTier};
+pub use object_artifacts::{
+    ArtifactKind, EncryptionMode, ObjectArtifact, ObjectKey, SseMode, StorageTier,
+};
 pub use organization::Organization;
 pub use parser::{
     BlockKind, BoundingBox, ExtractionMethod, LocatorVersion, ParserArtifact, ParserBlock,

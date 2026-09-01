@@ -128,6 +128,57 @@ async fn setup_fixture() -> TestFixture {
     }
 }
 
+/// Helper to stage bytes and finalize upload without running malware scan.
+async fn finalize_staged_upload(
+    f: &TestFixture,
+    filename: &str,
+    media_type: MediaType,
+    bytes: &[u8],
+) -> (UploadIntent, DocumentVersionId, ObjectArtifactId) {
+    let mut tx = f.test_db.pool().begin().await.unwrap();
+
+    let intent = UploadIntent::new(
+        f.ws_a.id,
+        f.principal.id,
+        None,
+        filename,
+        media_type,
+        bytes.len() as i64,
+        Some(Sha256::digest(bytes)),
+        Utc::now() + ChronoDuration::minutes(5),
+    )
+    .unwrap();
+    UploadIntentRepository::insert(&mut tx, &intent)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let bucket = "w014-documents";
+    let key = intent.opaque_object_key.as_str();
+    DocumentService::stage_mock_upload_bytes(bucket, key, bytes, media_type.as_str());
+
+    let idemp_store = PostgresIdempotencyStore::new();
+    let mut tx = f.test_db.pool().begin().await.unwrap();
+    let finalize_res = DocumentService::execute_finalize_upload_tx(
+        &mut tx,
+        &f.awc_a,
+        f.principal.id,
+        intent.id,
+        Utc::now(),
+        None,
+        &idemp_store,
+    )
+    .await
+    .expect("finalize must succeed");
+    tx.commit().await.unwrap();
+
+    (
+        finalize_res.intent,
+        finalize_res.version.id,
+        finalize_res.artifact.id,
+    )
+}
+
 /// Helper to stage bytes, finalize upload, and run malware scan to clean state.
 async fn finalize_and_clean_scan(
     f: &TestFixture,
@@ -558,8 +609,7 @@ async fn test_wi0205_gate02_malware_gate_precondition_enforcement() {
 
         let pdf_bytes = b"%PDF-1.7 integrity test document";
         let (intent, version_id, artifact_id) =
-            finalize_and_clean_scan(&f, "integrity.pdf", MediaType::ApplicationPdf, pdf_bytes)
-                .await;
+            finalize_staged_upload(&f, "integrity.pdf", MediaType::ApplicationPdf, pdf_bytes).await;
 
         // Force insert an IntegrityFailed quarantine record
         let mut tx = f.test_db.pool().begin().await.unwrap();

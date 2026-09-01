@@ -121,6 +121,60 @@ impl QuarantineRecord {
         )
     }
 
+    /// Records a new immutable scan outcome using Prompt-12 physical facts.
+    ///
+    /// # Errors
+    /// Fails closed on invalid scanner version or reason code.
+    pub fn from_outcome(
+        workspace_id: WorkspaceId,
+        upload_intent_id: UploadIntentId,
+        status: QuarantineStatus,
+        scanner_version: impl Into<String>,
+        reason_code: Option<String>,
+        checked_at: DateTime<Utc>,
+    ) -> Result<Self, DomainError> {
+        let s_version = scanner_version.into();
+        validate_bounded_non_empty("scanner_version", &s_version, MAX_SHORT_LABEL_BYTES)?;
+        if let Some(ref code) = reason_code {
+            validate_bounded_non_empty("reason_code", code, MAX_REASON_CODE_BYTES)?;
+        }
+        Ok(Self {
+            id: QuarantineRecordId::new(),
+            workspace_id,
+            upload_intent_id,
+            document_version_id: None,
+            object_artifact_id: None,
+            status,
+            scanner_name: "clamav".to_string(),
+            scanner_version: Some(s_version),
+            reason_code,
+            checked_at,
+            threat_details: BoundedJson::empty(),
+        })
+    }
+
+    /// Reconstructs a QuarantineRecord with a specific QuarantineRecordId.
+    pub fn reconstruct_from_row(
+        id: QuarantineRecordId,
+        workspace_id: WorkspaceId,
+        upload_intent_id: UploadIntentId,
+        status: QuarantineStatus,
+        scanner_version: impl Into<String>,
+        reason_code: Option<String>,
+        checked_at: DateTime<Utc>,
+    ) -> Result<Self, DomainError> {
+        let mut rec = Self::from_outcome(
+            workspace_id,
+            upload_intent_id,
+            status,
+            scanner_version,
+            reason_code,
+            checked_at,
+        )?;
+        rec.id = id;
+        Ok(rec)
+    }
+
     /// Opens a fresh pending record for a rescan of the same intent:
     /// rescans append brand-new records rather than rewriting history.
     ///
