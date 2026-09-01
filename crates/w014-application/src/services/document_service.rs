@@ -9,7 +9,7 @@
 //! - Download signing for immutable object artifacts (max 5 minutes TTL)
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,8 @@ use crate::persistence::{
     ChangeEventRepository, DependencyKeyRepository, DocumentRepository, DocumentVersionRepository,
     ObjectArtifactRepository, UploadIntentRepository,
 };
-use crate::services::{IdempotencyCoordinator, S3StorageAdapter};
+use crate::services::IdempotencyCoordinator;
+use crate::services::storage::{ObjectStorage, S3StorageAdapter, TestStorageAdapter};
 
 /// Maximum presigned GET download URL lifetime: 5 minutes (300s).
 pub const MAX_DOWNLOAD_TTL_SECS: i64 = 300;
@@ -42,10 +43,12 @@ pub const MAX_DOWNLOAD_TTL_SECS: i64 = 300;
 /// Maximum attempt budget for malware scanning: 2 attempts (initial scan + exactly 1 retry).
 pub const MALWARE_SCAN_MAX_ATTEMPTS: i32 = 2;
 
-/// Shared in-memory mock storage registry for deterministic test execution.
-pub(crate) static MOCK_OBJECT_STORAGE: LazyLock<
-    RwLock<HashMap<(String, String), StoredObjectMetadata>>,
-> = LazyLock::new(|| RwLock::new(HashMap::new()));
+/// Explicitly injected storage authority (test-only override).
+static INJECTED_STORAGE: RwLock<Option<Arc<dyn ObjectStorage>>> = RwLock::new(None);
+
+/// Process-local test storage instance for deterministic test execution.
+static TEST_STORAGE_INSTANCE: LazyLock<Arc<TestStorageAdapter>> =
+    LazyLock::new(|| Arc::new(TestStorageAdapter::new()));
 
 /// Authoritative object metadata returned by object storage HEAD queries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,43 +144,44 @@ pub fn can_manage_documents(awc: &AuthorizedWorkspaceContext) -> bool {
 pub struct DocumentService;
 
 impl DocumentService {
-    /// Generates a bounded presigned PUT contract for an opaque object key.
-    pub fn generate_presigned_put(
+    /// Generates a bounded presigned PUT contract for an opaque object key, propagating any error.
+    pub fn try_generate_presigned_put(
         _bucket: &str,
         object_key: &str,
         media_type: MediaType,
         content_length: i64,
         sha256_b64: Option<&str>,
         expires_at: DateTime<Utc>,
+    ) -> Result<PresignedPutContract, FinalizeUploadError> {
+        Self::current_storage().generate_presigned_put(
+            object_key,
+            media_type,
+            content_length,
+            sha256_b64,
+            expires_at,
+        )
+    }
+
+    /// Generates a bounded presigned PUT contract for an opaque object key.
+    ///
+    /// Fails closed if presigning fails for any reason; NEVER produces an unsigned URL.
+    pub fn generate_presigned_put(
+        bucket: &str,
+        object_key: &str,
+        media_type: MediaType,
+        content_length: i64,
+        sha256_b64: Option<&str>,
+        expires_at: DateTime<Utc>,
     ) -> PresignedPutContract {
-        let adapter = S3StorageAdapter::default_adapter();
-        adapter
-            .generate_presigned_put(
-                object_key,
-                media_type,
-                content_length,
-                sha256_b64,
-                expires_at,
-            )
-            .unwrap_or_else(|_| {
-                let upload_url = format!(
-                    "{}/{}",
-                    adapter.base_url(),
-                    object_key.trim_start_matches('/')
-                );
-                let mut headers = HashMap::new();
-                headers.insert("content-type".to_string(), media_type.as_str().to_string());
-                headers.insert("content-length".to_string(), content_length.to_string());
-                if let Some(sha) = sha256_b64 {
-                    headers.insert("x-amz-checksum-sha256".to_string(), sha.to_string());
-                }
-                PresignedPutContract {
-                    upload_url,
-                    method: "PUT".to_string(),
-                    expires_at,
-                    headers,
-                }
-            })
+        Self::try_generate_presigned_put(
+            bucket,
+            object_key,
+            media_type,
+            content_length,
+            sha256_b64,
+            expires_at,
+        )
+        .expect("Presigned PUT generation failed")
     }
 
     /// Generates a bounded presigned GET contract for an immutable object artifact.
@@ -186,18 +190,7 @@ impl DocumentService {
         original_filename: &str,
         expires_at: DateTime<Utc>,
     ) -> PresignedGetContract {
-        let adapter = S3StorageAdapter::default_adapter();
-        let mut contract = adapter.generate_presigned_get(artifact, original_filename, expires_at);
-
-        // Compatibility fallback for unmigrated test suites expecting signature=valid:
-        let is_prod = std::env::var("APP_ENV")
-            .map(|v| v == "production")
-            .unwrap_or(false);
-        if !is_prod && !contract.download_url.contains("signature=valid") {
-            contract.download_url = format!("{}&signature=valid", contract.download_url);
-        }
-
-        contract
+        Self::current_storage().generate_presigned_get(artifact, original_filename, expires_at)
     }
 
     /// Atomic AcceptVersion transaction execution.
@@ -407,6 +400,8 @@ impl DocumentService {
     }
 
     /// Stages an object into the mock storage registry for testing and deterministic verification.
+    ///
+    /// Explicitly activates test storage authority for deterministic test execution.
     pub fn stage_mock_upload(
         bucket: impl Into<String>,
         key: impl Into<String>,
@@ -416,66 +411,94 @@ impl DocumentService {
     ) {
         let b = bucket.into();
         let k = key.into();
+        let ct = content_type.into();
         let meta = StoredObjectMetadata {
             bucket: b.clone(),
             key: k.clone(),
             byte_length,
             content_sha256,
-            content_type: content_type.into(),
+            content_type: ct.clone(),
             etag: Some(format!("\"{}\"", content_sha256.to_hex())),
             bytes: None,
         };
-        let mut store = MOCK_OBJECT_STORAGE.write().expect("storage lock poisoned");
-        store.insert((b, k), meta);
+        TEST_STORAGE_INSTANCE.stage_object(b, k, &[], ct);
+        let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
+        *w = Some(TEST_STORAGE_INSTANCE.clone());
+        let _ = meta;
     }
 
     /// Stages raw bytes into mock storage, computing SHA-256 and byte length automatically.
+    ///
+    /// Explicitly activates test storage authority for deterministic test execution.
     pub fn stage_mock_upload_bytes(
         bucket: impl Into<String>,
         key: impl Into<String>,
         bytes: &[u8],
         content_type: impl Into<String>,
     ) {
-        let b = bucket.into();
-        let k = key.into();
-        let sha256 = Sha256::digest(bytes);
-        let meta = StoredObjectMetadata {
-            bucket: b.clone(),
-            key: k.clone(),
-            byte_length: bytes.len() as i64,
-            content_sha256: sha256,
-            content_type: content_type.into(),
-            etag: Some(format!("\"{}\"", sha256.to_hex())),
-            bytes: Some(bytes.to_vec()),
-        };
-        let mut store = MOCK_OBJECT_STORAGE.write().expect("storage lock poisoned");
-        store.insert((b, k), meta);
+        TEST_STORAGE_INSTANCE.stage_object(bucket, key, bytes, content_type);
+        let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
+        *w = Some(TEST_STORAGE_INSTANCE.clone());
     }
 
-    /// Clears the mock storage registry.
+    /// Clears the mock storage registry and resets to production S3 storage authority.
     pub fn clear_mock_storage() {
-        let mut store = MOCK_OBJECT_STORAGE.write().expect("storage lock poisoned");
-        store.clear();
+        TEST_STORAGE_INSTANCE.clear();
+        let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
+        *w = None;
+    }
+
+    /// Explicitly injects a custom storage authority (e.g. for testing).
+    pub fn inject_storage(storage: Arc<dyn ObjectStorage>) {
+        let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
+        *w = Some(storage);
+    }
+
+    /// Clears any explicitly injected storage, restoring default production S3 storage.
+    pub fn clear_injected_storage() {
+        let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
+        *w = None;
+    }
+
+    /// Returns true if an explicit test storage adapter is currently active.
+    pub fn is_test_storage_active() -> bool {
+        INJECTED_STORAGE
+            .read()
+            .expect("storage lock poisoned")
+            .is_some()
+    }
+
+    /// Ensures test storage authority is active (used by legacy test fixtures).
+    pub fn ensure_test_storage_injected() {
+        let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
+        if w.is_none() {
+            *w = Some(TEST_STORAGE_INSTANCE.clone());
+        }
+    }
+
+    /// Returns the currently active storage authority (defaulting to production S3 adapter).
+    pub fn current_storage() -> Arc<dyn ObjectStorage> {
+        let r = INJECTED_STORAGE.read().expect("storage lock poisoned");
+        if let Some(ref s) = *r {
+            return s.clone();
+        }
+        Arc::new(S3StorageAdapter::default_adapter().clone())
     }
 
     /// Performs an authoritative HEAD query against the storage provider.
-    pub fn head_object(
+    pub async fn head_object(
         bucket: &str,
         key: &str,
     ) -> Result<Option<StoredObjectMetadata>, FinalizeUploadError> {
-        let store = MOCK_OBJECT_STORAGE.read().expect("storage lock poisoned");
-        Ok(store.get(&(bucket.to_string(), key.to_string())).cloned())
+        Self::current_storage().head_object(bucket, key).await
     }
 
     /// Performs an authoritative byte retrieval query against the storage provider.
-    pub fn get_object_bytes(
+    pub async fn get_object_bytes(
         bucket: &str,
         key: &str,
     ) -> Result<Option<Vec<u8>>, FinalizeUploadError> {
-        let store = MOCK_OBJECT_STORAGE.read().expect("storage lock poisoned");
-        Ok(store
-            .get(&(bucket.to_string(), key.to_string()))
-            .and_then(|m| m.bytes.clone()))
+        Self::current_storage().get_object_bytes(bucket, key).await
     }
 
     /// Atomic UploadFinalize transaction execution (Prompt-16R / WI-0203).
@@ -541,7 +564,7 @@ impl DocumentService {
         let bucket = "w014-documents";
         let object_key = intent.opaque_object_key.as_str();
 
-        let head_meta = Self::head_object(bucket, object_key)?.ok_or_else(|| {
+        let head_meta = Self::head_object(bucket, object_key).await?.ok_or_else(|| {
             FinalizeUploadError::PreconditionFailed(format!(
                 "Uploaded object not found in storage: PUT was not completed for key '{object_key}'"
             ))

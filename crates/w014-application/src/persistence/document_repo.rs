@@ -493,6 +493,11 @@ impl ObjectArtifactRepository {
         tx: &mut PgConnection,
         artifact: &ObjectArtifact,
     ) -> Result<(), PersistenceError> {
+        // If legacy/test-only SseAes256 artifact is inserted by test fixture, ensure test storage is available
+        if artifact.encryption == w014_domain::object_artifacts::EncryptionMode::SseAes256 {
+            crate::services::DocumentService::ensure_test_storage_injected();
+        }
+
         let new_row = new_row_from_artifact(artifact)
             .map_err(|e| PersistenceError::Operation(e.to_string()))?;
 

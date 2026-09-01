@@ -40,12 +40,14 @@ use crate::persistence::{
     QuarantineRecordRepository, SourceSpanRepository,
 };
 use crate::services::DocumentService;
+use crate::services::storage::ObjectStorage;
 
 /// Durable job executor for parser sandbox execution.
 pub struct ParserSandboxJobExecutor {
     pool: PgPool,
     runner: Arc<dyn SandboxRunner>,
     profile: SandboxSecurityProfile,
+    storage: Arc<dyn ObjectStorage>,
 }
 
 impl ParserSandboxJobExecutor {
@@ -56,7 +58,15 @@ impl ParserSandboxJobExecutor {
             pool,
             runner,
             profile: SandboxSecurityProfile::frozen_default(),
+            storage: DocumentService::current_storage(),
         }
+    }
+
+    /// Sets the authoritative storage provider (e.g. for test dependency injection).
+    #[must_use]
+    pub fn with_storage(mut self, storage: Arc<dyn ObjectStorage>) -> Self {
+        self.storage = storage;
+        self
     }
 
     /// Sets a custom sandbox security profile.
@@ -288,24 +298,26 @@ impl ParserSandboxJobExecutor {
         drop(conn);
 
         // 6. Fetch exact immutable bytes from server storage
-        let object_bytes =
-            DocumentService::get_object_bytes(&artifact.bucket, artifact.key.as_str())
-                .map_err(|e| {
-                    JobExecutionFailure::retryable(
-                        "STORAGE_ERROR",
-                        format!("Storage retrieval error: {e}"),
-                    )
-                })?
-                .ok_or_else(|| {
-                    JobExecutionFailure::retryable(
-                        "OBJECT_NOT_FOUND_IN_STORAGE",
-                        format!(
-                            "Object bytes not found in storage bucket '{}' key '{}'",
-                            artifact.bucket,
-                            artifact.key.as_str()
-                        ),
-                    )
-                })?;
+        let object_bytes = self
+            .storage
+            .get_object_bytes(&artifact.bucket, artifact.key.as_str())
+            .await
+            .map_err(|e| {
+                JobExecutionFailure::retryable(
+                    "STORAGE_ERROR",
+                    format!("Storage retrieval error: {e}"),
+                )
+            })?
+            .ok_or_else(|| {
+                JobExecutionFailure::retryable(
+                    "OBJECT_NOT_FOUND_IN_STORAGE",
+                    format!(
+                        "Object bytes not found in storage bucket '{}' key '{}'",
+                        artifact.bucket,
+                        artifact.key.as_str()
+                    ),
+                )
+            })?;
 
         // 7. Verify byte length and SHA-256 digest before sandbox handoff
         if object_bytes.len() as i64 != artifact.byte_length {

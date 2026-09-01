@@ -7,14 +7,15 @@
 //! - Bounded PUT (<= 15m) and GET (<= 5m) lifespans
 //! - Checksum-bound upload verification (`x-amz-checksum-sha256`)
 //! - Strict Content-Type and Content-Length authorization
-//! - Authoritative object HEAD
-//! - Real worker byte retrieval
+//! - Authoritative object HEAD (fail-closed, no mock fallback)
+//! - Real worker byte retrieval (fail-closed, no mock fallback)
 //! - Prompt-12 cloud SSE-KMS (`aws:kms`) and local (`local`) mapping
+//! - Explicit test storage injection for deterministic test execution
 //! - No permanent object URLs stored in product state
 //! - No browser bucket credentials exposed
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -25,8 +26,7 @@ use w014_domain::object_artifacts::ObjectArtifact;
 use w014_domain::sha256::Sha256;
 
 use crate::services::document_service::{
-    FinalizeUploadError, MOCK_OBJECT_STORAGE, PresignedGetContract, PresignedPutContract,
-    StoredObjectMetadata,
+    FinalizeUploadError, PresignedGetContract, PresignedPutContract, StoredObjectMetadata,
 };
 
 type HmacSha256 = Hmac<HashingSha256>;
@@ -35,6 +35,42 @@ const DEFAULT_BUCKET: &str = "w014-documents";
 const DEFAULT_REGION: &str = "us-east-1";
 const MAX_PUT_EXPIRATION_SECS: i64 = 900; // 15 minutes max
 const MAX_GET_EXPIRATION_SECS: i64 = 300; // 5 minutes max
+
+/// Authoritative object storage contract implemented by production and test providers.
+#[async_trait::async_trait]
+pub trait ObjectStorage: Send + Sync {
+    /// Generates a bounded presigned PUT contract.
+    fn generate_presigned_put(
+        &self,
+        object_key: &str,
+        media_type: MediaType,
+        content_length: i64,
+        sha256_b64: Option<&str>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<PresignedPutContract, FinalizeUploadError>;
+
+    /// Generates a bounded presigned GET download contract.
+    fn generate_presigned_get(
+        &self,
+        artifact: &ObjectArtifact,
+        original_filename: &str,
+        expires_at: DateTime<Utc>,
+    ) -> PresignedGetContract;
+
+    /// Authoritative object HEAD verifying presence, length, and digest.
+    async fn head_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<StoredObjectMetadata>, FinalizeUploadError>;
+
+    /// Authoritative worker byte retrieval.
+    async fn get_object_bytes(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, FinalizeUploadError>;
+}
 
 /// Configuration for real S3-compatible storage.
 #[derive(Debug, Clone)]
@@ -92,6 +128,31 @@ impl S3StorageConfig {
             sse_mode,
             kms_key_id,
         }
+    }
+
+    /// Validates that all required S3 configuration values are present. Fails closed.
+    pub fn validate(&self) -> Result<(), FinalizeUploadError> {
+        if self.bucket.trim().is_empty() {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "S3 configuration error: bucket must not be empty".to_string(),
+            ));
+        }
+        if self.region.trim().is_empty() {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "S3 configuration error: region must not be empty".to_string(),
+            ));
+        }
+        if self.access_key_id.trim().is_empty() {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "S3 configuration error: access_key_id must not be empty".to_string(),
+            ));
+        }
+        if self.secret_access_key.trim().is_empty() {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "S3 configuration error: secret_access_key must not be empty".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -228,7 +289,7 @@ impl S3StorageAdapter {
 
         // Build headers map for signing (must include host)
         let mut signed_headers_map: Vec<(&str, String)> = Vec::new();
-        signed_headers_map.push(("host", host.clone()));
+        signed_headers_map.push(("host", host));
         for (h, v) in extra_signed_headers {
             signed_headers_map.push((h, (*v).to_string()));
         }
@@ -295,6 +356,7 @@ impl S3StorageAdapter {
     /// Generates a bounded presigned PUT contract.
     ///
     /// Validates:
+    /// - Required S3 configuration (fail-closed)
     /// - Server-owned opaque key shape (fail-closed)
     /// - Bounded TTL (clamped to max 900s)
     /// - Required Content-Type and Content-Length authorization
@@ -308,6 +370,8 @@ impl S3StorageAdapter {
         sha256_b64: Option<&str>,
         expires_at: DateTime<Utc>,
     ) -> Result<PresignedPutContract, FinalizeUploadError> {
+        self.config.validate()?;
+
         // Enforce server-owned opaque key shape
         if object_key.starts_with('/') || object_key.contains("//") || object_key.contains("..") {
             return Err(FinalizeUploadError::PreconditionFailed(
@@ -316,7 +380,34 @@ impl S3StorageAdapter {
             ));
         }
 
+        // Validate content length
+        if content_length < 1 {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "Content length must be at least 1 byte".to_string(),
+            ));
+        }
+        if content_length > w014_domain::limits::MAX_UPLOAD_BYTES {
+            return Err(FinalizeUploadError::PayloadTooLarge(format!(
+                "Content length {content_length} exceeds max allowed upload limit"
+            )));
+        }
+
+        // Validate checksum if provided
+        if let Some(sha_b64) = sha256_b64 {
+            Sha256::from_base64("x-amz-checksum-sha256", sha_b64).map_err(|e| {
+                FinalizeUploadError::PreconditionFailed(format!(
+                    "Invalid SHA-256 base64 checksum: {e}"
+                ))
+            })?;
+        }
+
         let now = Utc::now();
+        if expires_at <= now {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "Presigned PUT expiration must be in the future".to_string(),
+            ));
+        }
+
         let remaining_secs = (expires_at - now).num_seconds().max(1);
         let bounded_secs = remaining_secs.min(MAX_PUT_EXPIRATION_SECS) as u64;
         let effective_expires_at = now + chrono::Duration::seconds(bounded_secs as i64);
@@ -325,10 +416,10 @@ impl S3StorageAdapter {
         let mut signed_headers = Vec::new();
 
         let content_type_str = media_type.as_str().to_string();
-        headers.insert("content-type".to_string(), content_type_str.clone());
+        headers.insert("content-type".to_string(), content_type_str);
 
         let content_length_str = content_length.to_string();
-        headers.insert("content-length".to_string(), content_length_str.clone());
+        headers.insert("content-length".to_string(), content_length_str);
 
         let sha_owned;
         if let Some(sha) = sha256_b64 {
@@ -376,6 +467,8 @@ impl S3StorageAdapter {
     /// - Bounded TTL (clamped to max 300s)
     /// - AWS SigV4 signed URL
     /// - No permanent object URL stored in product state
+    /// - No mock fallback
+    /// - No fake signature injection
     pub fn generate_presigned_get(
         &self,
         artifact: &ObjectArtifact,
@@ -401,88 +494,286 @@ impl S3StorageAdapter {
     }
 
     /// Authoritative HEAD request verifying object existence, length, content type, and digest.
+    ///
+    /// Always executes real HTTP request against configured endpoint or AWS standard endpoint.
+    /// Fails closed on missing configuration or network errors. Never falls back to mock storage.
     pub async fn head_object(
         &self,
         bucket: &str,
         key: &str,
     ) -> Result<Option<StoredObjectMetadata>, FinalizeUploadError> {
-        // If an endpoint is configured and reachable, attempt authoritative real S3 HEAD
-        if let Some(ref _ep) = self.config.endpoint {
-            let url = format!(
-                "{}/{}",
-                self.base_url(),
-                self.canonical_path(key).trim_start_matches('/')
-            );
-            if let Ok(resp) = self.client.head(&url).send().await {
-                if resp.status().is_success() {
-                    let content_length = resp
-                        .headers()
-                        .get(reqwest::header::CONTENT_LENGTH)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<i64>().ok())
-                        .unwrap_or(0);
+        self.config.validate()?;
 
-                    let content_type = resp
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("application/octet-stream")
-                        .to_string();
-
-                    let etag = resp
-                        .headers()
-                        .get(reqwest::header::ETAG)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string);
-
-                    // Fetch bytes if available or retrieve digest
-                    let dummy_sha = Sha256::digest(b"");
-                    return Ok(Some(StoredObjectMetadata {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        byte_length: content_length,
-                        content_sha256: dummy_sha,
-                        content_type,
-                        etag,
-                        bytes: None,
-                    }));
-                } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                    return Ok(None);
-                }
-            }
+        if key.starts_with('/') || key.contains("//") || key.contains("..") {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "Invalid server object key: must not start with '/', contain '//' or '..'"
+                    .to_string(),
+            ));
         }
 
-        // Test-mode fallback: check process-local test store if populated by tests
-        let store = MOCK_OBJECT_STORAGE.read().expect("storage lock poisoned");
-        Ok(store.get(&(bucket.to_string(), key.to_string())).cloned())
+        let signed_url = self.generate_sigv4_presigned_url("HEAD", key, Utc::now(), 300, &[]);
+
+        let resp =
+            self.client.head(&signed_url).send().await.map_err(|e| {
+                FinalizeUploadError::Internal(format!("S3 HEAD network failure: {e}"))
+            })?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !resp.status().is_success() {
+            return Err(FinalizeUploadError::Internal(format!(
+                "S3 HEAD authoritative error: HTTP {}",
+                resp.status()
+            )));
+        }
+
+        let content_length = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        let content_sha256 = resp
+            .headers()
+            .get("x-amz-checksum-sha256")
+            .or_else(|| resp.headers().get("x-amz-meta-content-sha256"))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Sha256::from_base64("x-amz-checksum-sha256", v).ok())
+            .unwrap_or_else(|| Sha256::digest(b""));
+
+        Ok(Some(StoredObjectMetadata {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            byte_length: content_length,
+            content_sha256,
+            content_type,
+            etag,
+            bytes: None,
+        }))
     }
 
     /// Real worker byte retrieval.
+    ///
+    /// Always executes real HTTP request against configured endpoint or AWS standard endpoint.
+    /// Fails closed on missing configuration or network errors. Never falls back to mock storage.
     pub async fn get_object_bytes(
+        &self,
+        _bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, FinalizeUploadError> {
+        self.config.validate()?;
+
+        if key.starts_with('/') || key.contains("//") || key.contains("..") {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "Invalid server object key: must not start with '/', contain '//' or '..'"
+                    .to_string(),
+            ));
+        }
+
+        let signed_url = self.generate_sigv4_presigned_url("GET", key, Utc::now(), 300, &[]);
+
+        let resp =
+            self.client.get(&signed_url).send().await.map_err(|e| {
+                FinalizeUploadError::Internal(format!("S3 GET network failure: {e}"))
+            })?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !resp.status().is_success() {
+            return Err(FinalizeUploadError::Internal(format!(
+                "S3 GET authoritative error: HTTP {}",
+                resp.status()
+            )));
+        }
+
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| FinalizeUploadError::Internal(format!("S3 GET read error: {e}")))?;
+
+        Ok(Some(bytes.to_vec()))
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStorage for S3StorageAdapter {
+    fn generate_presigned_put(
+        &self,
+        object_key: &str,
+        media_type: MediaType,
+        content_length: i64,
+        sha256_b64: Option<&str>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<PresignedPutContract, FinalizeUploadError> {
+        self.generate_presigned_put(
+            object_key,
+            media_type,
+            content_length,
+            sha256_b64,
+            expires_at,
+        )
+    }
+
+    fn generate_presigned_get(
+        &self,
+        artifact: &ObjectArtifact,
+        original_filename: &str,
+        expires_at: DateTime<Utc>,
+    ) -> PresignedGetContract {
+        self.generate_presigned_get(artifact, original_filename, expires_at)
+    }
+
+    async fn head_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<StoredObjectMetadata>, FinalizeUploadError> {
+        self.head_object(bucket, key).await
+    }
+
+    async fn get_object_bytes(
         &self,
         bucket: &str,
         key: &str,
     ) -> Result<Option<Vec<u8>>, FinalizeUploadError> {
-        // If an endpoint is configured, attempt authoritative real S3 GET
-        if let Some(ref _ep) = self.config.endpoint {
-            let url = format!(
-                "{}/{}",
-                self.base_url(),
-                self.canonical_path(key).trim_start_matches('/')
-            );
-            if let Ok(resp) = self.client.get(&url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(bytes) = resp.bytes().await {
-                        return Ok(Some(bytes.to_vec()));
-                    }
-                } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                    return Ok(None);
-                }
-            }
+        self.get_object_bytes(bucket, key).await
+    }
+}
+
+/// Explicit test storage adapter for deterministic test execution.
+///
+/// MUST be explicitly injected; NEVER used as default production storage authority.
+#[derive(Debug, Default)]
+pub struct TestStorageAdapter {
+    storage: RwLock<HashMap<(String, String), StoredObjectMetadata>>,
+}
+
+impl TestStorageAdapter {
+    pub fn new() -> Self {
+        Self {
+            storage: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn stage_object(
+        &self,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        bytes: &[u8],
+        content_type: impl Into<String>,
+    ) {
+        let b = bucket.into();
+        let k = key.into();
+        let sha256 = Sha256::digest(bytes);
+        let meta = StoredObjectMetadata {
+            bucket: b.clone(),
+            key: k.clone(),
+            byte_length: bytes.len() as i64,
+            content_sha256: sha256,
+            content_type: content_type.into(),
+            etag: Some(format!("\"{}\"", sha256.to_hex())),
+            bytes: Some(bytes.to_vec()),
+        };
+        let mut store = self.storage.write().expect("storage lock poisoned");
+        store.insert((b, k), meta);
+    }
+
+    pub fn clear(&self) {
+        let mut store = self.storage.write().expect("storage lock poisoned");
+        store.clear();
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStorage for TestStorageAdapter {
+    fn generate_presigned_put(
+        &self,
+        object_key: &str,
+        media_type: MediaType,
+        content_length: i64,
+        sha256_b64: Option<&str>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<PresignedPutContract, FinalizeUploadError> {
+        if object_key.starts_with('/') || object_key.contains("//") || object_key.contains("..") {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "Invalid server object key: must not start with '/', contain '//' or '..'"
+                    .to_string(),
+            ));
         }
 
-        // Test-mode fallback: check process-local test store if populated by tests
-        let store = MOCK_OBJECT_STORAGE.read().expect("storage lock poisoned");
+        let upload_url = format!(
+            "https://storage.local/w014-documents/{}",
+            object_key.trim_start_matches('/')
+        );
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), media_type.as_str().to_string());
+        headers.insert("content-length".to_string(), content_length.to_string());
+        if let Some(sha) = sha256_b64 {
+            headers.insert("x-amz-checksum-sha256".to_string(), sha.to_string());
+        }
+        Ok(PresignedPutContract {
+            upload_url,
+            method: "PUT".to_string(),
+            expires_at,
+            headers,
+        })
+    }
+
+    fn generate_presigned_get(
+        &self,
+        artifact: &ObjectArtifact,
+        original_filename: &str,
+        expires_at: DateTime<Utc>,
+    ) -> PresignedGetContract {
+        let download_url = format!(
+            "https://storage.local/{}/{}?expires={}&signature=valid",
+            artifact.bucket,
+            artifact.key.as_str(),
+            expires_at.timestamp()
+        );
+        PresignedGetContract {
+            download_url,
+            expires_at,
+            content_type: artifact.media_type.as_str().to_string(),
+            byte_size: artifact.byte_length,
+            sha256_hash: artifact.content_sha256.to_hex(),
+            original_filename: original_filename.to_string(),
+        }
+    }
+
+    async fn head_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<StoredObjectMetadata>, FinalizeUploadError> {
+        let store = self.storage.read().expect("storage lock poisoned");
+        Ok(store.get(&(bucket.to_string(), key.to_string())).cloned())
+    }
+
+    async fn get_object_bytes(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, FinalizeUploadError> {
+        let store = self.storage.read().expect("storage lock poisoned");
         Ok(store
             .get(&(bucket.to_string(), key.to_string()))
             .and_then(|m| m.bytes.clone()))
