@@ -11,11 +11,16 @@
 //! - Full provenance preserved for OCR spans (`raw_range = None`, `extraction = ExtractionMethod::Ocr`)
 //! - Fail closed on error: NO GUESS, NO AI FALLBACK
 
+use std::time::Duration;
+
 use w014_document_processing::ocr::{
-    CriticalTokenType, MAX_OCR_PAGES, MAX_PAGE_DURATION_SECS, MAX_RASTER_PIXELS,
-    MockTesseractEngine, OcrEngine, OcrError, OcrPolicyConfig, ReviewIntegritySignal, TARGET_DPI,
+    CriticalTokenType, MAX_JOB_WALL_CLOCK_SECS, MAX_OCR_PAGES, MAX_PAGE_DURATION_SECS,
+    MAX_RASTER_PIXELS, MockTesseractEngine, OcrEngine, OcrError, OcrPolicyConfig,
+    ProcessTesseractEngine, ReviewIntegritySignal, SpanProvenanceFactory, TARGET_DPI,
     evaluate_native_vs_ocr, inspect_and_validate_raster,
 };
+use w014_domain::ids::{DocumentVersionId, ParserArtifactId, WorkspaceId};
+use w014_domain::{ExtractionMethod, LocatorVersion, OffsetRange};
 
 fn make_valid_png_bytes(width: u32, height: u32) -> Vec<u8> {
     let mut png = Vec::new();
@@ -162,6 +167,132 @@ fn test_critical_token_missing_in_ocr_signals_review() {
         )
     });
     assert!(did_mismatch, "Missing DID in OCR must be flagged");
+}
+
+#[test]
+fn test_ocr_job_and_page_limits_ceiling_enforced() {
+    let default_config = OcrPolicyConfig::default();
+    assert_eq!(default_config.job_timeout_secs, MAX_JOB_WALL_CLOCK_SECS);
+    assert_eq!(default_config.page_timeout_secs, MAX_PAGE_DURATION_SECS);
+    assert_eq!(default_config.max_pages, MAX_OCR_PAGES);
+    assert_eq!(default_config.effective_job_timeout_secs(), 1800);
+    assert_eq!(default_config.effective_page_timeout_secs(), 15);
+    assert_eq!(default_config.effective_max_pages(), 250);
+
+    // Over-configured values MUST be bounded by frozen constants
+    let over_config = OcrPolicyConfig {
+        max_pages: 9999,
+        page_timeout_secs: 9999,
+        job_timeout_secs: 9999,
+        max_raster_pixels: 999_999_999,
+        target_dpi: 1200,
+        low_text_threshold: 50,
+    };
+    assert_eq!(over_config.effective_max_pages(), 250);
+    assert_eq!(over_config.effective_page_timeout_secs(), 15);
+    assert_eq!(over_config.effective_job_timeout_secs(), 1800);
+    assert_eq!(over_config.effective_max_raster_pixels(), 40_000_000);
+    assert_eq!(over_config.effective_target_dpi(), 300);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_process_tesseract_timeout_kills_and_reaps_child() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut temp_script = tempfile::NamedTempFile::new().unwrap();
+    write!(temp_script, "#!/bin/sh\nsleep 60\n").unwrap();
+    let script_path = temp_script.path().to_path_buf();
+
+    let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script_path, perms).unwrap();
+
+    let engine = ProcessTesseractEngine::new(&script_path).with_config(OcrPolicyConfig {
+        page_timeout_secs: 1,
+        ..Default::default()
+    });
+
+    let img = make_valid_png_bytes(100, 100);
+    let start = std::time::Instant::now();
+    let res = engine
+        .ocr_image_with_timeout(&img, "image/png", Duration::from_millis(200))
+        .await;
+
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "Subprocess execution must terminate promptly on timeout"
+    );
+    assert!(
+        matches!(res, Err(OcrError::Timeout { .. })),
+        "Subprocess timeout must fail closed with OcrError::Timeout"
+    );
+}
+
+#[tokio::test]
+async fn test_mock_tesseract_delayed_execution_bounded_by_max_duration() {
+    let mock = MockTesseractEngine::delayed(Duration::from_millis(500), "delayed text");
+    let img = make_valid_png_bytes(100, 100);
+
+    // Call with 50ms ceiling < 500ms mock delay -> must time out
+    let res = mock
+        .ocr_image_with_timeout(&img, "image/png", Duration::from_millis(50))
+        .await;
+    assert!(matches!(res, Err(OcrError::Timeout { .. })));
+
+    // Call with 1000ms ceiling > 500ms mock delay -> must succeed
+    let res_ok = mock
+        .ocr_image_with_timeout(&img, "image/png", Duration::from_millis(1000))
+        .await;
+    assert!(res_ok.is_ok());
+    assert_eq!(res_ok.unwrap().raw_text, "delayed text");
+}
+
+#[test]
+fn test_ocr_provenance_full_fidelity_and_canonical_hash() {
+    let ws_id = WorkspaceId::new();
+    let doc_ver_id = DocumentVersionId::new();
+    let artifact_id = ParserArtifactId::new();
+    let loc_ver = LocatorVersion::new("w014-docx-p0-v1").unwrap();
+
+    let factory = SpanProvenanceFactory::new(ws_id, doc_ver_id, artifact_id, loc_ver);
+
+    // OCR span: raw_range is strictly None, extraction is ExtractionMethod::Ocr
+    let ocr_span = factory
+        .build_ocr_span(
+            1,
+            0,
+            OffsetRange::new(0, 15).unwrap(),
+            None,
+            "OCR parsed text",
+            Some(0.85),
+        )
+        .unwrap();
+
+    assert_eq!(ocr_span.extraction, ExtractionMethod::Ocr);
+    assert_eq!(ocr_span.raw_range, None);
+    assert_eq!(ocr_span.provenance.page_number, 1);
+    assert_eq!(ocr_span.quality_score, Some(0.85));
+
+    // Native span: raw_range may exist, extraction is ExtractionMethod::NativeText
+    let native_span = factory
+        .build_native_span(
+            1,
+            1,
+            OffsetRange::new(0, 18).unwrap(),
+            Some(OffsetRange::new(100, 118).unwrap()),
+            Some(vec!["Section 1".to_string()]),
+            "Native parsed text",
+        )
+        .unwrap();
+
+    assert_eq!(native_span.extraction, ExtractionMethod::NativeText);
+    assert_eq!(
+        native_span.raw_range,
+        Some(OffsetRange::new(100, 118).unwrap())
+    );
+    assert_eq!(native_span.quality_score, Some(1.0));
 }
 
 #[tokio::test]

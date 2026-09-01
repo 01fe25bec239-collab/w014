@@ -69,6 +69,12 @@ impl ClamAvClient {
         &self.config
     }
 
+    /// Returns the authoritative effective scan timeout clamped to MAX_SCAN_TIMEOUT_SECS (120s ceiling).
+    #[must_use]
+    pub fn effective_timeout(&self) -> std::time::Duration {
+        self.config.effective_timeout()
+    }
+
     /// Establishes a TCP connection to the clamd daemon.
     async fn connect(&self) -> Result<TcpStream, ScannerError> {
         let addr = format!("{}:{}", self.config.host, self.config.port);
@@ -77,35 +83,67 @@ impl ClamAvClient {
         })
     }
 
-    /// Queries clamd for version and signature timestamp information.
+    /// Queries clamd for version and signature timestamp information without an independent timeout.
+    async fn query_version_internal(&self) -> Result<ClamAvVersionInfo, ScannerError> {
+        let mut stream = self.connect().await?;
+
+        // Send VERSION command (zVERSION\0)
+        stream.write_all(b"zVERSION\0").await.map_err(|e| {
+            ScannerError::Connection(format!("Failed to write VERSION command: {e}"))
+        })?;
+        stream.flush().await.map_err(|e| {
+            ScannerError::Connection(format!("Failed to flush VERSION command: {e}"))
+        })?;
+
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).await.map_err(|e| {
+            ScannerError::Connection(format!("Failed to read VERSION response: {e}"))
+        })?;
+
+        let raw = String::from_utf8_lossy(&buf[..n])
+            .trim_matches(|c| c == '\0' || c == '\r' || c == '\n')
+            .to_string();
+
+        Self::parse_clamav_version_response(&raw)
+    }
+
+    /// Queries clamd for version and signature timestamp information bounded by effective timeout ceiling.
     pub async fn query_version_raw(&self) -> Result<ClamAvVersionInfo, ScannerError> {
-        let fut = async {
-            let mut stream = self.connect().await?;
-
-            // Send VERSION command (zVERSION\0)
-            stream.write_all(b"zVERSION\0").await.map_err(|e| {
-                ScannerError::Connection(format!("Failed to write VERSION command: {e}"))
-            })?;
-            stream.flush().await.map_err(|e| {
-                ScannerError::Connection(format!("Failed to flush VERSION command: {e}"))
-            })?;
-
-            let mut buf = [0u8; 512];
-            let n = stream.read(&mut buf).await.map_err(|e| {
-                ScannerError::Connection(format!("Failed to read VERSION response: {e}"))
-            })?;
-
-            let raw = String::from_utf8_lossy(&buf[..n])
-                .trim_matches(|c| c == '\0' || c == '\r' || c == '\n')
-                .to_string();
-
-            Self::parse_clamav_version_response(&raw)
-        };
-
-        match timeout(self.config.timeout, fut).await {
-            Ok(res) => res,
-            Err(_) => Err(ScannerError::Timeout(self.config.timeout.as_secs())),
+        let effective_timeout = self.effective_timeout();
+        let timeout_secs = effective_timeout.as_secs();
+        if effective_timeout.is_zero() {
+            return Err(ScannerError::Timeout(timeout_secs));
         }
+
+        match timeout(effective_timeout, self.query_version_internal()).await {
+            Ok(res) => res,
+            Err(_) => Err(ScannerError::Timeout(timeout_secs)),
+        }
+    }
+
+    /// Internal helper for signature freshness checking without an independent timeout.
+    async fn check_signatures_internal(&self) -> Result<SignatureHealth, ScannerError> {
+        let now = Utc::now();
+
+        if let Some(override_ts) = self.signature_timestamp_override {
+            let version_str = match self.query_version_internal().await {
+                Ok(info) => Some(info.version),
+                Err(_) => None,
+            };
+            return Ok(SignatureHealthPolicy::evaluate(
+                override_ts,
+                now,
+                version_str,
+            ));
+        }
+
+        let version_info = self.query_version_internal().await?;
+
+        Ok(SignatureHealthPolicy::evaluate(
+            version_info.signature_timestamp,
+            now,
+            Some(version_info.version),
+        ))
     }
 
     /// Parses the raw clamd VERSION response string fail-closed.
@@ -420,27 +458,16 @@ pub fn sanitize_threat_name(raw: &str) -> String {
 #[async_trait]
 impl MalwareScanner for ClamAvClient {
     async fn check_signatures(&self) -> Result<SignatureHealth, ScannerError> {
-        let now = Utc::now();
-
-        if let Some(override_ts) = self.signature_timestamp_override {
-            let version_str = match self.query_version_raw().await {
-                Ok(info) => Some(info.version),
-                Err(_) => None,
-            };
-            return Ok(SignatureHealthPolicy::evaluate(
-                override_ts,
-                now,
-                version_str,
-            ));
+        let effective_timeout = self.effective_timeout();
+        let timeout_secs = effective_timeout.as_secs();
+        if effective_timeout.is_zero() {
+            return Err(ScannerError::Timeout(timeout_secs));
         }
 
-        let version_info = self.query_version_raw().await?;
-
-        Ok(SignatureHealthPolicy::evaluate(
-            version_info.signature_timestamp,
-            now,
-            Some(version_info.version),
-        ))
+        match timeout(effective_timeout, self.check_signatures_internal()).await {
+            Ok(res) => res,
+            Err(_) => Err(ScannerError::Timeout(timeout_secs)),
+        }
     }
 
     async fn scan(&self, bytes: &[u8]) -> Result<ScanOutcome, ScannerError> {
@@ -452,39 +479,46 @@ impl MalwareScanner for ClamAvClient {
             ));
         }
 
-        // Check signature freshness first; fail closed if unhealthy
-        let sig_health = self.check_signatures().await?;
-        if sig_health.is_unhealthy() {
-            return Err(ScannerError::UnhealthySignature(
-                sig_health
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "Signatures exceed 24h freshness limit".to_string()),
-            ));
+        let effective_timeout = self.effective_timeout();
+        let timeout_secs = effective_timeout.as_secs();
+        if effective_timeout.is_zero() {
+            return Err(ScannerError::Timeout(timeout_secs));
         }
 
         let start_time = Instant::now();
-        let stream = self.connect().await?;
+        let deadline = tokio::time::Instant::now() + effective_timeout;
 
-        // Enforce scan timeout (120s)
-        let verdict = match timeout(self.config.timeout, self.execute_instream(stream, bytes)).await
-        {
-            Ok(scan_res) => scan_res?,
-            Err(_) => {
-                return Err(ScannerError::Timeout(self.config.timeout.as_secs()));
+        let scan_fut = async {
+            // Check signature freshness first; fail closed if unhealthy
+            let sig_health = self.check_signatures_internal().await?;
+            if sig_health.is_unhealthy() {
+                return Err(ScannerError::UnhealthySignature(
+                    sig_health
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "Signatures exceed 24h freshness limit".to_string()),
+                ));
             }
+
+            let stream = self.connect().await?;
+            let verdict = self.execute_instream(stream, bytes).await?;
+
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+
+            Ok(ScanOutcome {
+                verdict,
+                scanner_name: SCANNER_NAME_CLAMAV.to_string(),
+                scanner_version: sig_health.signature_version.clone(),
+                signature_health: sig_health,
+                scanned_at: Utc::now(),
+                scan_duration_ms: duration_ms,
+            })
         };
 
-        let duration_ms = start_time.elapsed().as_millis() as u64;
-
-        Ok(ScanOutcome {
-            verdict,
-            scanner_name: SCANNER_NAME_CLAMAV.to_string(),
-            scanner_version: sig_health.signature_version.clone(),
-            signature_health: sig_health,
-            scanned_at: Utc::now(),
-            scan_duration_ms: duration_ms,
-        })
+        match tokio::time::timeout_at(deadline, scan_fut).await {
+            Ok(res) => res,
+            Err(_) => Err(ScannerError::Timeout(timeout_secs)),
+        }
     }
 }
 
@@ -867,5 +901,55 @@ mod tests {
                 threat_name: "A".repeat(127)
             }
         );
+    }
+
+    #[test]
+    fn test_clamav_client_effective_timeout_ceiling_enforcement() {
+        use std::time::Duration;
+
+        // Default configuration
+        let c_default = ClamAvClient::new(ClamAvConfig::default());
+        assert_eq!(c_default.effective_timeout(), Duration::from_secs(120));
+
+        // Smaller than 120s -> Preserved
+        let c_1s = ClamAvClient::new(ClamAvConfig {
+            timeout: Duration::from_secs(1),
+            ..Default::default()
+        });
+        assert_eq!(c_1s.effective_timeout(), Duration::from_secs(1));
+
+        let c_50s = ClamAvClient::new(ClamAvConfig {
+            timeout: Duration::from_secs(50),
+            ..Default::default()
+        });
+        assert_eq!(c_50s.effective_timeout(), Duration::from_secs(50));
+
+        // Exactly 120s
+        let c_120s = ClamAvClient::new(ClamAvConfig {
+            timeout: Duration::from_secs(120),
+            ..Default::default()
+        });
+        assert_eq!(c_120s.effective_timeout(), Duration::from_secs(120));
+
+        // 121s -> Clamped to 120s ceiling
+        let c_121s = ClamAvClient::new(ClamAvConfig {
+            timeout: Duration::from_secs(121),
+            ..Default::default()
+        });
+        assert_eq!(c_121s.effective_timeout(), Duration::from_secs(120));
+
+        // 600s -> Clamped to 120s ceiling
+        let c_600s = ClamAvClient::new(ClamAvConfig {
+            timeout: Duration::from_secs(600),
+            ..Default::default()
+        });
+        assert_eq!(c_600s.effective_timeout(), Duration::from_secs(120));
+
+        // u64::MAX -> Clamped to 120s ceiling
+        let c_max = ClamAvClient::new(ClamAvConfig {
+            timeout: Duration::from_secs(u64::MAX),
+            ..Default::default()
+        });
+        assert_eq!(c_max.effective_timeout(), Duration::from_secs(120));
     }
 }

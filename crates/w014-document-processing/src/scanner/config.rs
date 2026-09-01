@@ -58,6 +58,12 @@ impl ClamAvConfig {
         }
     }
 
+    /// Returns the effective scan timeout bounded by `MAX_SCAN_TIMEOUT_SECS` (120s ceiling).
+    #[must_use]
+    pub fn effective_timeout(&self) -> Duration {
+        self.timeout.min(Duration::from_secs(MAX_SCAN_TIMEOUT_SECS))
+    }
+
     /// Loads configuration from environment variables with fallback to defaults.
     ///
     /// The effective scan timeout is bounded by `MAX_SCAN_TIMEOUT_SECS` (120s)
@@ -181,5 +187,48 @@ mod tests {
         unsafe {
             std::env::remove_var("W014_CLAMAV_TIMEOUT_SECS");
         }
+    }
+
+    #[test]
+    fn test_clamav_config_effective_timeout_ceiling_matrix() {
+        // Direct config modifications cannot exceed 120s ceiling
+        let cfg_default = ClamAvConfig::default();
+        assert_eq!(cfg_default.effective_timeout(), Duration::from_secs(120));
+
+        let cfg_1 = ClamAvConfig {
+            timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        assert_eq!(cfg_1.effective_timeout(), Duration::from_secs(1));
+
+        let cfg_120 = ClamAvConfig {
+            timeout: Duration::from_secs(120),
+            ..Default::default()
+        };
+        assert_eq!(cfg_120.effective_timeout(), Duration::from_secs(120));
+
+        let cfg_121 = ClamAvConfig {
+            timeout: Duration::from_secs(121),
+            ..Default::default()
+        };
+        assert_eq!(cfg_121.effective_timeout(), Duration::from_secs(120));
+
+        let cfg_600 = ClamAvConfig {
+            timeout: Duration::from_secs(600),
+            ..Default::default()
+        };
+        assert_eq!(cfg_600.effective_timeout(), Duration::from_secs(120));
+
+        let cfg_max = ClamAvConfig {
+            timeout: Duration::from_secs(u64::MAX),
+            ..Default::default()
+        };
+        assert_eq!(cfg_max.effective_timeout(), Duration::from_secs(120));
+
+        let cfg_1m = ClamAvConfig {
+            timeout: Duration::from_secs(1_000_000),
+            ..Default::default()
+        };
+        assert_eq!(cfg_1m.effective_timeout(), Duration::from_secs(120));
     }
 }

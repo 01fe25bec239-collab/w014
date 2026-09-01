@@ -54,6 +54,56 @@ impl Default for OcrPolicyConfig {
 }
 
 impl OcrPolicyConfig {
+    /// Returns the effective page count limit, bounded by `MAX_OCR_PAGES` (<= 250).
+    #[must_use]
+    pub const fn effective_max_pages(&self) -> u32 {
+        if self.max_pages > MAX_OCR_PAGES {
+            MAX_OCR_PAGES
+        } else {
+            self.max_pages
+        }
+    }
+
+    /// Returns the effective per-page timeout in seconds, bounded by `MAX_PAGE_DURATION_SECS` (<= 15s).
+    #[must_use]
+    pub const fn effective_page_timeout_secs(&self) -> u64 {
+        if self.page_timeout_secs > MAX_PAGE_DURATION_SECS {
+            MAX_PAGE_DURATION_SECS
+        } else {
+            self.page_timeout_secs
+        }
+    }
+
+    /// Returns the effective total job timeout in seconds, bounded by `MAX_JOB_WALL_CLOCK_SECS` (<= 1800s).
+    #[must_use]
+    pub const fn effective_job_timeout_secs(&self) -> u64 {
+        if self.job_timeout_secs > MAX_JOB_WALL_CLOCK_SECS {
+            MAX_JOB_WALL_CLOCK_SECS
+        } else {
+            self.job_timeout_secs
+        }
+    }
+
+    /// Returns the effective max raster pixels, bounded by `MAX_RASTER_PIXELS` (<= 40 MP).
+    #[must_use]
+    pub const fn effective_max_raster_pixels(&self) -> u64 {
+        if self.max_raster_pixels > MAX_RASTER_PIXELS {
+            MAX_RASTER_PIXELS
+        } else {
+            self.max_raster_pixels
+        }
+    }
+
+    /// Returns the effective target DPI, bounded by `TARGET_DPI` (<= 300).
+    #[must_use]
+    pub const fn effective_target_dpi(&self) -> u32 {
+        if self.target_dpi > TARGET_DPI {
+            TARGET_DPI
+        } else {
+            self.target_dpi
+        }
+    }
+
     /// Checks whether OCR should be triggered for a page given native text and image presence.
     #[must_use]
     pub fn should_trigger_ocr(&self, native_text_len: usize, has_images: bool) -> bool {
