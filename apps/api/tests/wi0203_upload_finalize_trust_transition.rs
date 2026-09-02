@@ -538,6 +538,7 @@ async fn test_wi0203_gate04_multiversion_sequential_version_numbering() {
                     "filename": "v1.pdf",
                     "media_type": "application/pdf",
                     "byte_length": bytes_v1.len() as i64,
+                    "sha256_b64": Sha256::digest(bytes_v1).to_base64(),
                 })
                 .to_string(),
             ))
@@ -593,6 +594,7 @@ async fn test_wi0203_gate04_multiversion_sequential_version_numbering() {
                     "filename": "v2.pdf",
                     "media_type": "application/pdf",
                     "byte_length": bytes_v2.len() as i64,
+                    "sha256_b64": Sha256::digest(bytes_v2).to_base64(),
                 })
                 .to_string(),
             ))
@@ -727,6 +729,7 @@ async fn test_wi0203_gate06_revoked_after_presign_recheck() {
                     "filename": "rev.pdf",
                     "media_type": "application/pdf",
                     "byte_length": sample_bytes.len() as i64,
+                    "sha256_b64": Sha256::digest(sample_bytes).to_base64(),
                 })
                 .to_string(),
             ))
@@ -815,6 +818,7 @@ async fn test_wi0203_gate07_document_upload_capability_reauthorization() {
                     "filename": "read.pdf",
                     "media_type": "application/pdf",
                     "byte_length": sample_bytes.len() as i64,
+                    "sha256_b64": Sha256::digest(sample_bytes).to_base64(),
                 })
                 .to_string(),
             ))
@@ -923,6 +927,7 @@ async fn test_wi0203_gate09_idempotency_replay_and_mismatch() {
                     "filename": "idemp.pdf",
                     "media_type": "application/pdf",
                     "byte_length": sample_bytes.len() as i64,
+                    "sha256_b64": Sha256::digest(sample_bytes).to_base64(),
                 })
                 .to_string(),
             ))
@@ -1185,6 +1190,7 @@ async fn test_wi0203_gate12_already_finalized_intent_new_key_rejected() {
                     "filename": "dbl.pdf",
                     "media_type": "application/pdf",
                     "byte_length": sample_bytes.len() as i64,
+                    "sha256_b64": Sha256::digest(sample_bytes).to_base64(),
                 })
                 .to_string(),
             ))
@@ -1283,6 +1289,7 @@ async fn test_wi0203_gate13_cross_workspace_finalize_rejected() {
                     "filename": "b.pdf",
                     "media_type": "application/pdf",
                     "byte_length": sample_bytes.len() as i64,
+                    "sha256_b64": Sha256::digest(sample_bytes).to_base64(),
                 })
                 .to_string(),
             ))
@@ -1358,6 +1365,7 @@ async fn test_wi0203_gate14_object_head_required_missing_storage_upload() {
                     "filename": "no_upload.pdf",
                     "media_type": "application/pdf",
                     "byte_length": 4096,
+                    "sha256_b64": Sha256::digest(b"dummy no upload content").to_base64(),
                 })
                 .to_string(),
             ))
@@ -1427,6 +1435,7 @@ async fn test_wi0203_gate15_byte_length_mismatch_rejected() {
                     "filename": "len.pdf",
                     "media_type": "application/pdf",
                     "byte_length": 5000,
+                    "sha256_b64": Sha256::digest(&[0u8; 5000]).to_base64(),
                 })
                 .to_string(),
             ))
@@ -1581,6 +1590,7 @@ async fn test_wi0203_gate17_content_type_mismatch_rejected() {
                     "filename": "mime.pdf",
                     "media_type": "application/pdf",
                     "byte_length": sample_bytes.len() as i64,
+                    "sha256_b64": Sha256::digest(sample_bytes).to_base64(),
                 })
                 .to_string(),
             ))
@@ -1844,4 +1854,127 @@ async fn test_wi0203_gate21_csrf_protection_on_finalize() {
 
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_wi0203_gate22_sha256_mandatory_and_empty_digest_rejected() {
+    let db = provision_migrated_db().await;
+    let config = create_test_config();
+    let app = create_test_app(&config, db.pool().clone());
+
+    let org = create_org(&db, "Org Gate 22", "org-gate22").await;
+    let prog = create_program(&db, org.id, "Prog Gate 22", "prog-gate22").await;
+    let ws = create_workspace(&db, &prog, "WS Gate 22", "ws-gate22").await;
+
+    let user = create_principal(&db, org.id, "user_gate22@test.com", "User Gate 22").await;
+    add_membership(&db, ws.id, user.id, MembershipRole::Admin).await;
+    let (cookie, csrf) = create_session_and_csrf(&db, user.id, &config).await;
+
+    let doc = {
+        let mut tx = db.pool().begin().await.unwrap();
+        let d = Document::new(ws.id, "Doc Gate 22", DocumentClass::Pdf, Some(user.id)).unwrap();
+        DocumentRepository::insert(&mut tx, &d).await.unwrap();
+        tx.commit().await.unwrap();
+        d
+    };
+
+    // 1. Missing sha256_b64 field -> 400 Bad Request
+    let req = Request::builder()
+        .uri(format!(
+            "/api/v1/workspaces/{}/documents/{}/upload-intents",
+            ws.id, doc.id
+        ))
+        .method("POST")
+        .header(COOKIE, &cookie)
+        .header(CSRF_HEADER_NAME, &csrf)
+        .header(ORIGIN, "http://127.0.0.1:3000")
+        .header("idempotency-key", "gate22-missing")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "filename": "missing.pdf",
+                "media_type": "application/pdf",
+                "byte_length": 1024,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Empty string sha256_b64 -> 400 Bad Request
+    let req = Request::builder()
+        .uri(format!(
+            "/api/v1/workspaces/{}/documents/{}/upload-intents",
+            ws.id, doc.id
+        ))
+        .method("POST")
+        .header(COOKIE, &cookie)
+        .header(CSRF_HEADER_NAME, &csrf)
+        .header(ORIGIN, "http://127.0.0.1:3000")
+        .header("idempotency-key", "gate22-empty-str")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "filename": "empty_str.pdf",
+                "media_type": "application/pdf",
+                "byte_length": 1024,
+                "sha256_b64": "   ",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Empty digest fallback -> 400 Bad Request
+    let empty_digest_b64 = Sha256::digest(b"").to_base64();
+    let req = Request::builder()
+        .uri(format!(
+            "/api/v1/workspaces/{}/documents/{}/upload-intents",
+            ws.id, doc.id
+        ))
+        .method("POST")
+        .header(COOKIE, &cookie)
+        .header(CSRF_HEADER_NAME, &csrf)
+        .header(ORIGIN, "http://127.0.0.1:3000")
+        .header("idempotency-key", "gate22-empty-digest")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "filename": "empty_digest.pdf",
+                "media_type": "application/pdf",
+                "byte_length": 1024,
+                "sha256_b64": empty_digest_b64,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Malformed base64 -> 400 Bad Request
+    let req = Request::builder()
+        .uri(format!(
+            "/api/v1/workspaces/{}/documents/{}/upload-intents",
+            ws.id, doc.id
+        ))
+        .method("POST")
+        .header(COOKIE, &cookie)
+        .header(CSRF_HEADER_NAME, &csrf)
+        .header(ORIGIN, "http://127.0.0.1:3000")
+        .header("idempotency-key", "gate22-malformed")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "filename": "malformed.pdf",
+                "media_type": "application/pdf",
+                "byte_length": 1024,
+                "sha256_b64": "not-valid-base64!",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

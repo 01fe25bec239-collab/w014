@@ -61,6 +61,8 @@ pub struct StoredObjectMetadata {
     pub etag: Option<String>,
     #[serde(skip)]
     pub bytes: Option<Vec<u8>>,
+    pub sse_mode: w014_domain::EncryptionMode,
+    pub kms_key_id: Option<String>,
 }
 
 /// Output bundle returned by authoritative upload finalization.
@@ -150,7 +152,7 @@ impl DocumentService {
         object_key: &str,
         media_type: MediaType,
         content_length: i64,
-        sha256_b64: Option<&str>,
+        sha256_b64: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<PresignedPutContract, FinalizeUploadError> {
         Self::current_storage().generate_presigned_put(
@@ -170,9 +172,9 @@ impl DocumentService {
         object_key: &str,
         media_type: MediaType,
         content_length: i64,
-        sha256_b64: Option<&str>,
+        sha256_b64: &str,
         expires_at: DateTime<Utc>,
-    ) -> PresignedPutContract {
+    ) -> Result<PresignedPutContract, FinalizeUploadError> {
         Self::try_generate_presigned_put(
             bucket,
             object_key,
@@ -181,7 +183,6 @@ impl DocumentService {
             sha256_b64,
             expires_at,
         )
-        .expect("Presigned PUT generation failed")
     }
 
     /// Generates a bounded presigned GET contract for an immutable object artifact.
@@ -189,7 +190,7 @@ impl DocumentService {
         artifact: &ObjectArtifact,
         original_filename: &str,
         expires_at: DateTime<Utc>,
-    ) -> PresignedGetContract {
+    ) -> Result<PresignedGetContract, FinalizeUploadError> {
         Self::current_storage().generate_presigned_get(artifact, original_filename, expires_at)
     }
 
@@ -412,19 +413,29 @@ impl DocumentService {
         let b = bucket.into();
         let k = key.into();
         let ct = content_type.into();
+        let (sse_mode, kms_key_id) = TEST_STORAGE_INSTANCE.encryption_posture();
         let meta = StoredObjectMetadata {
-            bucket: b.clone(),
-            key: k.clone(),
+            bucket: b,
+            key: k,
             byte_length,
             content_sha256,
-            content_type: ct.clone(),
+            content_type: ct,
             etag: Some(format!("\"{}\"", content_sha256.to_hex())),
             bytes: None,
+            sse_mode,
+            kms_key_id,
         };
-        TEST_STORAGE_INSTANCE.stage_object(b, k, &[], ct);
+        TEST_STORAGE_INSTANCE.stage_metadata(meta);
         let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
         *w = Some(TEST_STORAGE_INSTANCE.clone());
-        let _ = meta;
+    }
+
+    /// Configures the encryption posture on the process-local test storage adapter.
+    pub fn set_test_storage_encryption_posture(
+        mode: w014_domain::EncryptionMode,
+        kms_key_id: Option<String>,
+    ) {
+        TEST_STORAGE_INSTANCE.set_encryption_posture(mode, kms_key_id);
     }
 
     /// Stages raw bytes into mock storage, computing SHA-256 and byte length automatically.
@@ -591,15 +602,27 @@ impl DocumentService {
             )));
         }
 
-        // Verify exact SHA-256 checksum
-        if let Some(ref declared_sha) = intent.expected_sha256_b64
-            && &head_meta.content_sha256 != declared_sha
-        {
+        // Mandatory SHA-256 verification (FINALIZE_WITHOUT_EXPECTED_CHECKSUM: IMPOSSIBLE)
+        let declared_sha = intent.expected_sha256_b64.as_ref().ok_or_else(|| {
+            FinalizeUploadError::PreconditionFailed(
+                "UploadIntent missing mandatory expected SHA-256 checksum: finalize impossible"
+                    .to_string(),
+            )
+        })?;
+
+        if &head_meta.content_sha256 != declared_sha {
             return Err(FinalizeUploadError::UnprocessableEntity(format!(
                 "Object SHA-256 checksum mismatch: declared '{}', actual '{}'",
                 declared_sha.to_base64(),
                 head_meta.content_sha256.to_base64()
             )));
+        }
+
+        // SHA256_EMPTY_DIGEST_FALLBACK: ABSENT
+        if head_meta.content_sha256 == Sha256::digest(b"") {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "Uploaded object SHA-256 digest cannot be empty digest fallback".to_string(),
+            ));
         }
 
         // Verify conservative Content-Type matches expected media type
@@ -614,7 +637,7 @@ impl DocumentService {
         let stored_media_type = w014_domain::StoredMediaType::new(expected_mime)
             .map_err(|e| FinalizeUploadError::UnsupportedMediaType(e.to_string()))?;
 
-        // 4. Persist immutable ObjectArtifact fact
+        // 4. Persist immutable ObjectArtifact fact derived directly from actual storage authority
         let artifact = ObjectArtifact::reconstruct(
             w014_domain::ids::ObjectArtifactId::new(),
             awc.workspace_id(),
@@ -625,8 +648,8 @@ impl DocumentService {
             head_meta.byte_length,
             stored_media_type,
             w014_domain::StorageTier::Hot,
-            w014_domain::EncryptionMode::AwsKms,
-            None,
+            head_meta.sse_mode,
+            head_meta.kms_key_id,
             now,
         )?;
         ObjectArtifactRepository::insert(tx, &artifact).await?;

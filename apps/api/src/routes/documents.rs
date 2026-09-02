@@ -36,6 +36,7 @@ use w014_application::persistence::{
     DocumentRepository, DocumentVersionRepository, ObjectArtifactRepository, PrincipalRepository,
     UploadIntentRepository,
 };
+use w014_application::services::document_service::FinalizeUploadError;
 use w014_application::services::{
     DocumentService, IdempotencyCoordinator, can_manage_documents, can_read_documents,
     can_upload_documents,
@@ -988,15 +989,28 @@ pub async fn create_upload_intent_handler(
         ));
     }
 
-    // Validate optional sha256_b64
-    let sha256_opt = if let Some(ref b64) = payload.sha256_b64 {
-        Some(
-            Sha256::from_base64("sha256_b64", b64)
-                .map_err(|e| ProblemDetails::bad_request(e.to_string(), Some(req_path.clone())))?,
-        )
-    } else {
-        None
-    };
+    // Mandatory SHA-256 validation (CREATE_UPLOAD_SHA256_REQUIRED: YES, SHA256_EMPTY_DIGEST_FALLBACK: ABSENT)
+    let sha256_raw = payload
+        .sha256_b64
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ProblemDetails::bad_request(
+                "sha256_b64 is required: upload-intent checksum integrity is mandatory",
+                Some(req_path.clone()),
+            )
+        })?;
+
+    let sha256 = Sha256::from_base64("sha256_b64", sha256_raw)
+        .map_err(|e| ProblemDetails::bad_request(e.to_string(), Some(req_path.clone())))?;
+
+    if sha256 == Sha256::digest(b"") {
+        return Err(ProblemDetails::bad_request(
+            "sha256_b64 cannot be the empty digest fallback",
+            Some(req_path.clone()),
+        ));
+    }
 
     let tx_opts = WorkspaceTxOptions::new()
         .with_client_workspace(awc.workspace_id())
@@ -1091,7 +1105,7 @@ pub async fn create_upload_intent_handler(
         filename_trimmed,
         media_type,
         payload.byte_length,
-        sha256_opt,
+        Some(sha256),
         expires_at,
     )
     .map_err(|e| ProblemDetails::bad_request(e.to_string(), Some(req_path.clone())))?;
@@ -1136,13 +1150,16 @@ pub async fn create_upload_intent_handler(
         intent.opaque_object_key.as_str(),
         media_type,
         payload.byte_length,
-        intent
-            .expected_sha256_b64
-            .as_ref()
-            .map(|s| s.to_base64())
-            .as_deref(),
+        sha256_raw,
         expires_at,
-    );
+    )
+    .map_err(|e| match e {
+        FinalizeUploadError::PreconditionFailed(msg) => {
+            precondition_failed(msg, Some(req_path.clone()))
+        }
+        FinalizeUploadError::PayloadTooLarge(msg) => payload_too_large(msg, Some(req_path.clone())),
+        other => ProblemDetails::internal_server_error(Some(other.to_string())),
+    })?;
 
     let dto = UploadIntentDto {
         id: intent.id.to_string(),
@@ -1795,13 +1812,19 @@ pub async fn download_version_handler(
     .ok_or_else(|| {
         ProblemDetails::not_found(
             format!("ObjectArtifact '{}' not found", version.object_artifact_id),
-            Some(req_path),
+            Some(req_path.clone()),
         )
     })?;
 
     let expires_at = now + Duration::minutes(5);
     let presigned_get =
-        DocumentService::generate_presigned_get(&artifact, &version.original_filename, expires_at);
+        DocumentService::generate_presigned_get(&artifact, &version.original_filename, expires_at)
+            .map_err(|e| match e {
+                FinalizeUploadError::PreconditionFailed(msg) => {
+                    precondition_failed(msg, Some(req_path))
+                }
+                other => ProblemDetails::internal_server_error(Some(other.to_string())),
+            })?;
 
     let dto = DownloadDto {
         download_url: presigned_get.download_url,

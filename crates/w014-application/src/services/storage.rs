@@ -31,10 +31,8 @@ use crate::services::document_service::{
 
 type HmacSha256 = Hmac<HashingSha256>;
 
-const DEFAULT_BUCKET: &str = "w014-documents";
-const DEFAULT_REGION: &str = "us-east-1";
-const MAX_PUT_EXPIRATION_SECS: i64 = 900; // 15 minutes max
-const MAX_GET_EXPIRATION_SECS: i64 = 300; // 5 minutes max
+pub const MAX_PUT_EXPIRATION_SECS: i64 = 600; // 10 minutes max (<= 600s)
+pub const MAX_GET_EXPIRATION_SECS: i64 = 300; // 5 minutes max (<= 300s)
 
 /// Authoritative object storage contract implemented by production and test providers.
 #[async_trait::async_trait]
@@ -45,7 +43,7 @@ pub trait ObjectStorage: Send + Sync {
         object_key: &str,
         media_type: MediaType,
         content_length: i64,
-        sha256_b64: Option<&str>,
+        sha256_b64: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<PresignedPutContract, FinalizeUploadError>;
 
@@ -55,7 +53,7 @@ pub trait ObjectStorage: Send + Sync {
         artifact: &ObjectArtifact,
         original_filename: &str,
         expires_at: DateTime<Utc>,
-    ) -> PresignedGetContract;
+    ) -> Result<PresignedGetContract, FinalizeUploadError>;
 
     /// Authoritative object HEAD verifying presence, length, and digest.
     async fn head_object(
@@ -70,6 +68,9 @@ pub trait ObjectStorage: Send + Sync {
         bucket: &str,
         key: &str,
     ) -> Result<Option<Vec<u8>>, FinalizeUploadError>;
+
+    /// Encryption posture (mode and optional KMS key ref) derived from storage authority.
+    fn encryption_posture(&self) -> (w014_domain::EncryptionMode, Option<String>);
 }
 
 /// Configuration for real S3-compatible storage.
@@ -91,26 +92,25 @@ impl Default for S3StorageConfig {
 }
 
 impl S3StorageConfig {
-    /// Loads configuration from environment variables or safe defaults.
+    /// Loads configuration from environment variables.
+    /// Fails closed with empty values if missing; no fallback placeholder credentials.
     pub fn from_env() -> Self {
         let bucket = std::env::var("S3_BUCKET_NAME")
             .or_else(|_| std::env::var("AWS_S3_BUCKET"))
-            .unwrap_or_else(|_| DEFAULT_BUCKET.to_string());
+            .unwrap_or_default();
 
         let region = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("S3_REGION"))
-            .unwrap_or_else(|_| DEFAULT_REGION.to_string());
+            .unwrap_or_default();
 
         let endpoint = std::env::var("AWS_ENDPOINT_URL")
             .or_else(|_| std::env::var("S3_ENDPOINT"))
             .ok()
             .filter(|e| !e.trim().is_empty());
 
-        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
-            .unwrap_or_else(|_| "w014-production-access-key".to_string());
+        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
 
-        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-            .unwrap_or_else(|_| "w014-production-secret-key-at-least-32-bytes".to_string());
+        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
 
         let sse_mode = std::env::var("S3_SSE_MODE").unwrap_or_else(|_| "aws:kms".to_string());
 
@@ -150,6 +150,28 @@ impl S3StorageConfig {
         if self.secret_access_key.trim().is_empty() {
             return Err(FinalizeUploadError::PreconditionFailed(
                 "S3 configuration error: secret_access_key must not be empty".to_string(),
+            ));
+        }
+        // Fail closed if placeholder credentials are used
+        if self.access_key_id == "w014-production-access-key"
+            || self.secret_access_key == "w014-production-secret-key-at-least-32-bytes"
+        {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "S3 configuration error: placeholder credentials are forbidden in production authority".to_string(),
+            ));
+        }
+        // Fail closed on malformed sse_mode
+        if self.sse_mode != "aws:kms" && self.sse_mode != "local" {
+            return Err(FinalizeUploadError::PreconditionFailed(format!(
+                "S3 configuration error: sse_mode '{}' is invalid; must be 'aws:kms' or 'local'",
+                self.sse_mode
+            )));
+        }
+        if let Some(ref ep) = self.endpoint
+            && ep.trim().is_empty()
+        {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "S3 configuration error: endpoint must not be blank if provided".to_string(),
             ));
         }
         Ok(())
@@ -358,16 +380,23 @@ impl S3StorageAdapter {
     /// Validates:
     /// - Required S3 configuration (fail-closed)
     /// - Server-owned opaque key shape (fail-closed)
-    /// - Bounded TTL (clamped to max 900s)
-    /// - Required Content-Type and Content-Length authorization
+    /// - Bounded TTL (clamped to max 600s)
+    /// - Required Content-Type, Content-Length, and SHA-256 authorization
     /// - Checksum-bound upload verification (`x-amz-checksum-sha256`)
     /// - Prompt-12 SSE-KMS (`aws:kms`) or local configuration
+    ///
+    /// The SigV4 signature binds:
+    /// - exact object key
+    /// - Content-Type
+    /// - Content-Length
+    /// - x-amz-checksum-sha256
+    /// - required SSE headers where applicable
     pub fn generate_presigned_put(
         &self,
         object_key: &str,
         media_type: MediaType,
         content_length: i64,
-        sha256_b64: Option<&str>,
+        sha256_b64: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<PresignedPutContract, FinalizeUploadError> {
         self.config.validate()?;
@@ -392,13 +421,14 @@ impl S3StorageAdapter {
             )));
         }
 
-        // Validate checksum if provided
-        if let Some(sha_b64) = sha256_b64 {
-            Sha256::from_base64("x-amz-checksum-sha256", sha_b64).map_err(|e| {
-                FinalizeUploadError::PreconditionFailed(format!(
-                    "Invalid SHA-256 base64 checksum: {e}"
-                ))
-            })?;
+        // Mandatory SHA-256 validation (PRESIGN_SHA256_REQUIRED: YES, SHA256_EMPTY_DIGEST_FALLBACK: ABSENT)
+        let parsed_sha = Sha256::from_base64("x-amz-checksum-sha256", sha256_b64).map_err(|e| {
+            FinalizeUploadError::PreconditionFailed(format!("Invalid SHA-256 base64 checksum: {e}"))
+        })?;
+        if parsed_sha == Sha256::digest(b"") {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "SHA-256 checksum cannot be empty digest fallback".to_string(),
+            ));
         }
 
         let now = Utc::now();
@@ -413,22 +443,22 @@ impl S3StorageAdapter {
         let effective_expires_at = now + chrono::Duration::seconds(bounded_secs as i64);
 
         let mut headers = HashMap::new();
-        let mut signed_headers = Vec::new();
+        let mut signed_headers: Vec<(&str, &str)> = Vec::new();
 
         let content_type_str = media_type.as_str().to_string();
-        headers.insert("content-type".to_string(), content_type_str);
+        headers.insert("content-type".to_string(), content_type_str.clone());
+        signed_headers.push(("content-type", content_type_str.as_str()));
 
         let content_length_str = content_length.to_string();
-        headers.insert("content-length".to_string(), content_length_str);
+        headers.insert("content-length".to_string(), content_length_str.clone());
+        signed_headers.push(("content-length", content_length_str.as_str()));
 
-        let sha_owned;
-        if let Some(sha) = sha256_b64 {
-            sha_owned = sha.to_string();
-            headers.insert("x-amz-checksum-sha256".to_string(), sha_owned.clone());
-            signed_headers.push(("x-amz-checksum-sha256", sha_owned.as_str()));
-        }
+        let sha_owned = sha256_b64.to_string();
+        headers.insert("x-amz-checksum-sha256".to_string(), sha_owned.clone());
+        signed_headers.push(("x-amz-checksum-sha256", sha_owned.as_str()));
 
         let sse_owned;
+        let kms_owned;
         if self.config.sse_mode == "aws:kms" {
             sse_owned = "aws:kms".to_string();
             headers.insert(
@@ -438,10 +468,15 @@ impl S3StorageAdapter {
             signed_headers.push(("x-amz-server-side-encryption", sse_owned.as_str()));
 
             if let Some(ref kms_key) = self.config.kms_key_id {
+                kms_owned = kms_key.clone();
                 headers.insert(
                     "x-amz-server-side-encryption-aws-kms-key-id".to_string(),
-                    kms_key.clone(),
+                    kms_owned.clone(),
                 );
+                signed_headers.push((
+                    "x-amz-server-side-encryption-aws-kms-key-id",
+                    kms_owned.as_str(),
+                ));
             }
         }
 
@@ -464,6 +499,8 @@ impl S3StorageAdapter {
     /// Generates a bounded presigned GET contract.
     ///
     /// Validates:
+    /// - Required S3 configuration (fail-closed)
+    /// - Server-owned key shape (fail-closed)
     /// - Bounded TTL (clamped to max 300s)
     /// - AWS SigV4 signed URL
     /// - No permanent object URL stored in product state
@@ -474,7 +511,19 @@ impl S3StorageAdapter {
         artifact: &ObjectArtifact,
         original_filename: &str,
         expires_at: DateTime<Utc>,
-    ) -> PresignedGetContract {
+    ) -> Result<PresignedGetContract, FinalizeUploadError> {
+        self.config.validate()?;
+
+        if artifact.key.as_str().starts_with('/')
+            || artifact.key.as_str().contains("//")
+            || artifact.key.as_str().contains("..")
+        {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "Invalid server object key: must not start with '/', contain '//' or '..'"
+                    .to_string(),
+            ));
+        }
+
         let now = Utc::now();
         let remaining_secs = (expires_at - now).num_seconds().max(1);
         let bounded_secs = remaining_secs.min(MAX_GET_EXPIRATION_SECS) as u64;
@@ -483,20 +532,21 @@ impl S3StorageAdapter {
         let download_url =
             self.generate_sigv4_presigned_url("GET", artifact.key.as_str(), now, bounded_secs, &[]);
 
-        PresignedGetContract {
+        Ok(PresignedGetContract {
             download_url,
             expires_at: effective_expires_at,
             content_type: artifact.media_type.as_str().to_string(),
             byte_size: artifact.byte_length,
             sha256_hash: artifact.content_sha256.to_hex(),
             original_filename: original_filename.to_string(),
-        }
+        })
     }
 
     /// Authoritative HEAD request verifying object existence, length, content type, and digest.
     ///
     /// Always executes real HTTP request against configured endpoint or AWS standard endpoint.
-    /// Fails closed on missing configuration or network errors. Never falls back to mock storage.
+    /// Fails closed on missing configuration, missing checksums, malformed checksums, empty digest fallbacks,
+    /// or network errors. Never falls back to mock storage.
     pub async fn head_object(
         &self,
         bucket: &str,
@@ -534,13 +584,21 @@ impl S3StorageAdapter {
             .get(reqwest::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                FinalizeUploadError::PreconditionFailed(
+                    "S3 HEAD authoritative error: missing or invalid Content-Length".to_string(),
+                )
+            })?;
 
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
+            .ok_or_else(|| {
+                FinalizeUploadError::PreconditionFailed(
+                    "S3 HEAD authoritative error: missing Content-Type".to_string(),
+                )
+            })?
             .to_string();
 
         let etag = resp
@@ -549,13 +607,62 @@ impl S3StorageAdapter {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
 
-        let content_sha256 = resp
+        // HEAD_SHA256_REQUIRED: YES, HEAD_MISSING_CHECKSUM: FAIL_CLOSED, HEAD_MALFORMED_CHECKSUM: FAIL_CLOSED
+        let sha_header = resp
             .headers()
             .get("x-amz-checksum-sha256")
             .or_else(|| resp.headers().get("x-amz-meta-content-sha256"))
+            .ok_or_else(|| {
+                FinalizeUploadError::PreconditionFailed(
+                    "S3 HEAD authoritative error: missing required x-amz-checksum-sha256 header"
+                        .to_string(),
+                )
+            })?;
+
+        let sha_str = sha_header.to_str().map_err(|_| {
+            FinalizeUploadError::PreconditionFailed(
+                "S3 HEAD authoritative error: malformed x-amz-checksum-sha256 header (invalid ASCII)".to_string(),
+            )
+        })?;
+
+        let content_sha256 =
+            Sha256::from_base64("x-amz-checksum-sha256", sha_str).map_err(|e| {
+                FinalizeUploadError::PreconditionFailed(format!(
+                    "S3 HEAD authoritative error: malformed x-amz-checksum-sha256 checksum: {e}"
+                ))
+            })?;
+
+        // SHA256_EMPTY_DIGEST_FALLBACK: ABSENT
+        if content_sha256 == Sha256::digest(b"") {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "S3 HEAD authoritative error: empty digest fallback is forbidden".to_string(),
+            ));
+        }
+
+        let (configured_mode, configured_key) = self.encryption_posture();
+        let sse_mode = if let Some(sse_hdr) = resp
+            .headers()
+            .get("x-amz-server-side-encryption")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| Sha256::from_base64("x-amz-checksum-sha256", v).ok())
-            .unwrap_or_else(|| Sha256::digest(b""));
+        {
+            if sse_hdr == "aws:kms" {
+                w014_domain::EncryptionMode::AwsKms
+            } else {
+                configured_mode
+            }
+        } else {
+            configured_mode
+        };
+
+        let kms_key_id = if sse_mode == w014_domain::EncryptionMode::AwsKms {
+            resp.headers()
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .or(configured_key)
+        } else {
+            None
+        };
 
         Ok(Some(StoredObjectMetadata {
             bucket: bucket.to_string(),
@@ -565,6 +672,8 @@ impl S3StorageAdapter {
             content_type,
             etag,
             bytes: None,
+            sse_mode,
+            kms_key_id,
         }))
     }
 
@@ -611,6 +720,20 @@ impl S3StorageAdapter {
 
         Ok(Some(bytes.to_vec()))
     }
+
+    /// Derives encryption posture (mode and optional KMS key ref) from configuration.
+    pub fn encryption_posture(&self) -> (w014_domain::EncryptionMode, Option<String>) {
+        let mode = match self.config.sse_mode.as_str() {
+            "aws:kms" => w014_domain::EncryptionMode::AwsKms,
+            _ => w014_domain::EncryptionMode::Local,
+        };
+        let key_ref = if mode == w014_domain::EncryptionMode::AwsKms {
+            self.config.kms_key_id.clone()
+        } else {
+            None
+        };
+        (mode, key_ref)
+    }
 }
 
 #[async_trait::async_trait]
@@ -620,7 +743,7 @@ impl ObjectStorage for S3StorageAdapter {
         object_key: &str,
         media_type: MediaType,
         content_length: i64,
-        sha256_b64: Option<&str>,
+        sha256_b64: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<PresignedPutContract, FinalizeUploadError> {
         self.generate_presigned_put(
@@ -637,7 +760,7 @@ impl ObjectStorage for S3StorageAdapter {
         artifact: &ObjectArtifact,
         original_filename: &str,
         expires_at: DateTime<Utc>,
-    ) -> PresignedGetContract {
+    ) -> Result<PresignedGetContract, FinalizeUploadError> {
         self.generate_presigned_get(artifact, original_filename, expires_at)
     }
 
@@ -656,21 +779,44 @@ impl ObjectStorage for S3StorageAdapter {
     ) -> Result<Option<Vec<u8>>, FinalizeUploadError> {
         self.get_object_bytes(bucket, key).await
     }
+
+    fn encryption_posture(&self) -> (w014_domain::EncryptionMode, Option<String>) {
+        self.encryption_posture()
+    }
 }
 
 /// Explicit test storage adapter for deterministic test execution.
 ///
 /// MUST be explicitly injected; NEVER used as default production storage authority.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TestStorageAdapter {
     storage: RwLock<HashMap<(String, String), StoredObjectMetadata>>,
+    sse_mode: RwLock<w014_domain::EncryptionMode>,
+    kms_key_id: RwLock<Option<String>>,
+}
+
+impl Default for TestStorageAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TestStorageAdapter {
     pub fn new() -> Self {
         Self {
             storage: RwLock::new(HashMap::new()),
+            sse_mode: RwLock::new(w014_domain::EncryptionMode::AwsKms),
+            kms_key_id: RwLock::new(None),
         }
+    }
+
+    pub fn set_encryption_posture(
+        &self,
+        mode: w014_domain::EncryptionMode,
+        kms_key_id: Option<String>,
+    ) {
+        *self.sse_mode.write().expect("storage lock poisoned") = mode;
+        *self.kms_key_id.write().expect("storage lock poisoned") = kms_key_id;
     }
 
     pub fn stage_object(
@@ -683,6 +829,12 @@ impl TestStorageAdapter {
         let b = bucket.into();
         let k = key.into();
         let sha256 = Sha256::digest(bytes);
+        let sse_mode = *self.sse_mode.read().expect("storage lock poisoned");
+        let kms_key_id = self
+            .kms_key_id
+            .read()
+            .expect("storage lock poisoned")
+            .clone();
         let meta = StoredObjectMetadata {
             bucket: b.clone(),
             key: k.clone(),
@@ -691,14 +843,24 @@ impl TestStorageAdapter {
             content_type: content_type.into(),
             etag: Some(format!("\"{}\"", sha256.to_hex())),
             bytes: Some(bytes.to_vec()),
+            sse_mode,
+            kms_key_id,
         };
         let mut store = self.storage.write().expect("storage lock poisoned");
         store.insert((b, k), meta);
     }
 
+    pub fn stage_metadata(&self, meta: StoredObjectMetadata) {
+        let mut store = self.storage.write().expect("storage lock poisoned");
+        store.insert((meta.bucket.clone(), meta.key.clone()), meta);
+    }
+
     pub fn clear(&self) {
         let mut store = self.storage.write().expect("storage lock poisoned");
         store.clear();
+        *self.sse_mode.write().expect("storage lock poisoned") =
+            w014_domain::EncryptionMode::AwsKms;
+        *self.kms_key_id.write().expect("storage lock poisoned") = None;
     }
 }
 
@@ -709,7 +871,7 @@ impl ObjectStorage for TestStorageAdapter {
         object_key: &str,
         media_type: MediaType,
         content_length: i64,
-        sha256_b64: Option<&str>,
+        sha256_b64: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<PresignedPutContract, FinalizeUploadError> {
         if object_key.starts_with('/') || object_key.contains("//") || object_key.contains("..") {
@@ -719,6 +881,37 @@ impl ObjectStorage for TestStorageAdapter {
             ));
         }
 
+        if content_length < 1 {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "Content length must be at least 1 byte".to_string(),
+            ));
+        }
+        if content_length > w014_domain::limits::MAX_UPLOAD_BYTES {
+            return Err(FinalizeUploadError::PayloadTooLarge(format!(
+                "Content length {content_length} exceeds max allowed upload limit"
+            )));
+        }
+
+        let parsed_sha = Sha256::from_base64("x-amz-checksum-sha256", sha256_b64).map_err(|e| {
+            FinalizeUploadError::PreconditionFailed(format!("Invalid SHA-256 base64 checksum: {e}"))
+        })?;
+        if parsed_sha == Sha256::digest(b"") {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "SHA-256 checksum cannot be empty digest fallback".to_string(),
+            ));
+        }
+
+        let now = Utc::now();
+        if expires_at <= now {
+            return Err(FinalizeUploadError::PreconditionFailed(
+                "Presigned PUT expiration must be in the future".to_string(),
+            ));
+        }
+
+        let remaining_secs = (expires_at - now).num_seconds().max(1);
+        let bounded_secs = remaining_secs.min(MAX_PUT_EXPIRATION_SECS);
+        let effective_expires_at = now + chrono::Duration::seconds(bounded_secs);
+
         let upload_url = format!(
             "https://storage.local/w014-documents/{}",
             object_key.trim_start_matches('/')
@@ -726,13 +919,26 @@ impl ObjectStorage for TestStorageAdapter {
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), media_type.as_str().to_string());
         headers.insert("content-length".to_string(), content_length.to_string());
-        if let Some(sha) = sha256_b64 {
-            headers.insert("x-amz-checksum-sha256".to_string(), sha.to_string());
+        headers.insert("x-amz-checksum-sha256".to_string(), sha256_b64.to_string());
+
+        let sse = *self.sse_mode.read().expect("storage lock poisoned");
+        if sse == w014_domain::EncryptionMode::AwsKms {
+            headers.insert(
+                "x-amz-server-side-encryption".to_string(),
+                "aws:kms".to_string(),
+            );
+            if let Some(ref k) = *self.kms_key_id.read().expect("storage lock poisoned") {
+                headers.insert(
+                    "x-amz-server-side-encryption-aws-kms-key-id".to_string(),
+                    k.clone(),
+                );
+            }
         }
+
         Ok(PresignedPutContract {
             upload_url,
             method: "PUT".to_string(),
-            expires_at,
+            expires_at: effective_expires_at,
             headers,
         })
     }
@@ -742,21 +948,26 @@ impl ObjectStorage for TestStorageAdapter {
         artifact: &ObjectArtifact,
         original_filename: &str,
         expires_at: DateTime<Utc>,
-    ) -> PresignedGetContract {
+    ) -> Result<PresignedGetContract, FinalizeUploadError> {
+        let now = Utc::now();
+        let remaining_secs = (expires_at - now).num_seconds().max(1);
+        let bounded_secs = remaining_secs.min(MAX_GET_EXPIRATION_SECS);
+        let effective_expires_at = now + chrono::Duration::seconds(bounded_secs);
+
         let download_url = format!(
             "https://storage.local/{}/{}?expires={}&signature=valid",
             artifact.bucket,
             artifact.key.as_str(),
-            expires_at.timestamp()
+            effective_expires_at.timestamp()
         );
-        PresignedGetContract {
+        Ok(PresignedGetContract {
             download_url,
-            expires_at,
+            expires_at: effective_expires_at,
             content_type: artifact.media_type.as_str().to_string(),
             byte_size: artifact.byte_length,
             sha256_hash: artifact.content_sha256.to_hex(),
             original_filename: original_filename.to_string(),
-        }
+        })
     }
 
     async fn head_object(
@@ -777,5 +988,15 @@ impl ObjectStorage for TestStorageAdapter {
         Ok(store
             .get(&(bucket.to_string(), key.to_string()))
             .and_then(|m| m.bytes.clone()))
+    }
+
+    fn encryption_posture(&self) -> (w014_domain::EncryptionMode, Option<String>) {
+        (
+            *self.sse_mode.read().expect("storage lock poisoned"),
+            self.kms_key_id
+                .read()
+                .expect("storage lock poisoned")
+                .clone(),
+        )
     }
 }
