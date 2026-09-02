@@ -19,12 +19,28 @@ pub const DEFAULT_PARSER_SANDBOX_BIN: &str = "w014-parser-sandbox";
 /// Environment variable to override the parser sandbox binary path.
 pub const ENV_PARSER_SANDBOX_BIN: &str = "W014_PARSER_SANDBOX_BIN";
 
+pub use w014_document_processing::sandbox::{
+    ENV_PARSER_SANDBOX_WRAPPER_ARGS, ENV_PARSER_SANDBOX_WRAPPER_BIN,
+};
+
 /// Creates the production parser sandbox runner from environment configuration or default.
+///
+/// Hardened with the authoritative platform-native isolation wrapper mechanism (e.g. bubblewrap
+/// on Linux, sandbox-exec on macOS), preserving server-controlled wrapper overrides
+/// via `ENV_PARSER_SANDBOX_WRAPPER_BIN` and fail-closed semantics when isolation is missing.
 #[must_use]
 pub fn create_default_sandbox_runner() -> Arc<dyn SandboxRunner> {
     let binary_path = std::env::var(ENV_PARSER_SANDBOX_BIN)
         .unwrap_or_else(|_| DEFAULT_PARSER_SANDBOX_BIN.to_string());
-    Arc::new(ProcessSandboxRunner::new(PathBuf::from(binary_path)))
+    let runner = ProcessSandboxRunner::new(PathBuf::from(binary_path));
+
+    let runner = if std::env::var_os(ENV_PARSER_SANDBOX_WRAPPER_BIN).is_some() {
+        runner
+    } else {
+        runner.with_platform_wrapper()
+    };
+
+    Arc::new(runner)
 }
 
 /// Builds the production `ExecutorRegistry` registering all authoritative job executors.
