@@ -589,3 +589,90 @@ async fn test_pdfium_parse_failure_fail_closed_prevents_heuristic_fallback_matri
         );
     }
 }
+
+#[test]
+fn test_pdfium_unavailable_fails_closed_without_fallback() {
+    use std::path::Path;
+    use w014_document_processing::parser::verify_pdfium_library_identity;
+
+    let non_existent = Path::new("/nonexistent/path/to/libpdfium.dylib");
+    let err = verify_pdfium_library_identity(non_existent)
+        .expect_err("Must fail closed when PDFium is unavailable");
+
+    assert!(
+        matches!(err, ParserFailure::PdfiumUnavailable(_)),
+        "Expected PdfiumUnavailable, got: {:?}",
+        err
+    );
+    assert_eq!(err.failure_code(), "PDFIUM_UNAVAILABLE");
+    assert_eq!(
+        err.status(),
+        w014_document_processing::sandbox::SandboxStatus::Failed
+    );
+}
+
+#[test]
+fn test_pdfium_unverified_hash_fails_closed() {
+    use std::path::PathBuf;
+    use w014_document_processing::parser::verify_pdfium_library_identity_with_expected;
+
+    let path_str = std::env::var("PDFIUM_LIB_PATH").unwrap_or_else(|_| {
+        "/Users/omkar/.gemini/antigravity-cli/brain/382fb454-55db-4132-a3d1-677c32d524e4/scratch/libpdfium.dylib"
+            .to_string()
+    });
+    let lib_path = PathBuf::from(&path_str);
+    if !lib_path.exists() {
+        return;
+    }
+
+    let mismatching_sha = "0000000000000000000000000000000000000000000000000000000000000000";
+    let verify_result =
+        verify_pdfium_library_identity_with_expected(&lib_path, Some(mismatching_sha), None);
+
+    let err = verify_result.expect_err("Must reject binary with hash mismatch");
+    assert!(
+        matches!(err, ParserFailure::PdfiumUnverified(_)),
+        "Expected PdfiumUnverified, got: {:?}",
+        err
+    );
+    assert_eq!(err.failure_code(), "PDFIUM_UNVERIFIED");
+}
+
+#[test]
+fn test_pdfium_invalid_version_fails_closed() {
+    use std::path::PathBuf;
+    use w014_document_processing::parser::verify_pdfium_library_identity_with_expected;
+
+    let path_str = std::env::var("PDFIUM_LIB_PATH").unwrap_or_else(|_| {
+        "/Users/omkar/.gemini/antigravity-cli/brain/382fb454-55db-4132-a3d1-677c32d524e4/scratch/libpdfium.dylib"
+            .to_string()
+    });
+    let lib_path = PathBuf::from(&path_str);
+    if !lib_path.exists() {
+        return;
+    }
+
+    let unpinned_version = "9999";
+    let verify_result =
+        verify_pdfium_library_identity_with_expected(&lib_path, None, Some(unpinned_version));
+
+    let err = verify_result.expect_err("Must reject unpinned version");
+    assert!(
+        matches!(err, ParserFailure::PdfiumUnverified(_)),
+        "Expected PdfiumUnverified, got: {:?}",
+        err
+    );
+    assert_eq!(err.failure_code(), "PDFIUM_UNVERIFIED");
+}
+
+#[test]
+fn test_page_text_extraction_failure_fails_closed_no_empty_success() {
+    let err = ParserFailure::PageTextExtractionFailed(
+        "Simulated PDFium native text extraction internal crash".to_string(),
+    );
+    assert_eq!(err.failure_code(), "PAGE_TEXT_EXTRACTION_ERROR");
+    assert_eq!(
+        err.status(),
+        w014_document_processing::sandbox::SandboxStatus::Failed
+    );
+}

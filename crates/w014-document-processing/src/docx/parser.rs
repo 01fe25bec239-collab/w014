@@ -9,9 +9,15 @@
 //! - Image references (`BlockKind::ImageText` / media items)
 //! - Page segmentation via `<w:br w:type="page"/>` and `<w:lastRenderedPageBreak/>`
 //! - Unicode NFC normalized offsets for blocks and spans
+//!
+//! Authoritative processing is routed through the frozen selected pure-Rust library
+//! `ooxmlsdk = "0.12.0"` (P0 OOXML backend).
 
-use quick_xml::events::Event;
-use quick_xml::reader::Reader;
+use std::io::Cursor;
+
+use ooxmlsdk::parts::wordprocessing_document::WordprocessingDocument;
+use ooxmlsdk::schemas::schemas_openxmlformats_org_wordprocessingml_2006_main as w;
+use ooxmlsdk::sdk::SdkType;
 use w014_domain::BlockKind;
 use w014_domain::limits::MAX_PAGE_NUMBER;
 
@@ -66,11 +72,12 @@ pub struct ParsedDocxDocument {
     pub media_count: usize,
 }
 
-/// DOCX P0 Safe Subset Parser.
+/// DOCX P0 Safe Subset Parser backed authoritatively by `ooxmlsdk 0.12.0`.
 pub struct DocxParser;
 
 impl DocxParser {
-    /// Parses a validated `DocxPackage` into structured pages, blocks, and section paths.
+    /// Parses a validated `DocxPackage` into structured pages, blocks, and section paths
+    /// using `ooxmlsdk` 0.12.0 schemas.
     ///
     /// # Errors
     /// Fails closed if XML parsing fails or page counts exceed frozen limits.
@@ -85,7 +92,7 @@ impl DocxParser {
             current_page_blocks.extend(header_blocks);
         }
 
-        // 2. Parse main document.xml
+        // 2. Parse main document.xml via authoritative ooxmlsdk
         parse_document_xml_into_pages(
             &package.document_xml,
             &mut current_page_blocks,
@@ -177,9 +184,27 @@ impl DocxParser {
             media_count,
         })
     }
+
+    /// Parses raw DOCX package bytes: executes preflight security limits, validates
+    /// OPC packaging structure via `WordprocessingDocument`, and extracts hierarchy.
+    pub fn parse_from_bytes(bytes: &[u8]) -> Result<ParsedDocxDocument, DocxError> {
+        // 1. Hostile limits & security preflight
+        let package = DocxPackage::open(bytes)?;
+
+        // 2. Validate OPC packaging conventions via ooxmlsdk WordprocessingDocument
+        let _doc = WordprocessingDocument::new(Cursor::new(bytes)).map_err(|e| {
+            DocxError::XmlParseError {
+                part_name: "[package]".to_string(),
+                detail: format!("ooxmlsdk WordprocessingDocument packaging error: {e}"),
+            }
+        })?;
+
+        // 3. Authoritative hierarchy extraction
+        Self::parse_package(&package)
+    }
 }
 
-/// Raw block collected during XML event streaming.
+/// Raw block collected during ooxmlsdk parsing.
 #[derive(Debug, Clone)]
 struct RawBlock {
     kind: BlockKind,
@@ -187,226 +212,246 @@ struct RawBlock {
     section_path: Vec<String>,
 }
 
-/// Parses `word/document.xml` using streaming XML events.
+/// Parses `word/document.xml` through `ooxmlsdk::schemas::...::Document`.
 fn parse_document_xml_into_pages(
     xml_text: &str,
     current_page_blocks: &mut Vec<RawBlock>,
     pages: &mut Vec<Vec<RawBlock>>,
     current_section_path: &mut Vec<String>,
 ) -> Result<(), DocxError> {
-    let mut reader = Reader::from_str(xml_text);
-    reader.config_mut().trim_text(false);
+    let doc =
+        w::Document::from_bytes(xml_text.as_bytes()).map_err(|e| DocxError::XmlParseError {
+            part_name: "word/document.xml".to_string(),
+            detail: format!("ooxmlsdk Document deserialization failed: {e}"),
+        })?;
 
-    let mut buf = Vec::new();
-
-    let mut inside_tbl = false;
-    let mut inside_tc = false;
-    let mut inside_t = false;
-
-    let mut current_p_style = String::new();
-    let mut current_p_text = String::new();
-    let mut has_page_break_in_p = false;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let local_name = e.local_name();
-                match local_name.as_ref() {
-                    b"tbl" => inside_tbl = true,
-                    b"tc" => inside_tc = true,
-                    b"p" => {
-                        current_p_style.clear();
-                        current_p_text.clear();
-                        has_page_break_in_p = false;
+    if let Some(body) = doc.body {
+        for choice in body.body_choice {
+            match choice {
+                w::BodyChoice::Paragraph(p) => {
+                    let (raw_block_opt, page_break) =
+                        parse_ooxml_paragraph(&p, false, current_section_path);
+                    if let Some(block) = raw_block_opt {
+                        current_page_blocks.push(block);
                     }
-                    b"pStyle" => {
-                        for attr in e.attributes().flatten() {
-                            if attr.key.local_name().as_ref() == b"val" {
-                                current_p_style = String::from_utf8_lossy(&attr.value).to_string();
+                    if page_break {
+                        let completed = std::mem::take(current_page_blocks);
+                        pages.push(completed);
+                    }
+                }
+                w::BodyChoice::Table(tbl) => {
+                    for choice2 in tbl.table_choice2 {
+                        if let w::TableChoice2::TableRow(row) = choice2 {
+                            for cell_choice in row.table_row_choice {
+                                if let w::TableRowChoice::TableCell(cell) = cell_choice {
+                                    for item in cell.table_cell_choice {
+                                        if let w::TableCellChoice::Paragraph(p) = item {
+                                            let (raw_block_opt, page_break) = parse_ooxml_paragraph(
+                                                &p,
+                                                true,
+                                                current_section_path,
+                                            );
+                                            if let Some(block) = raw_block_opt {
+                                                current_page_blocks.push(block);
+                                            }
+                                            if page_break {
+                                                let completed = std::mem::take(current_page_blocks);
+                                                pages.push(completed);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                    b"t" => inside_t = true,
-                    _ => {}
                 }
-            }
-            Ok(Event::Empty(e)) => {
-                let local_name = e.local_name();
-                match local_name.as_ref() {
-                    b"pStyle" => {
-                        for attr in e.attributes().flatten() {
-                            if attr.key.local_name().as_ref() == b"val" {
-                                current_p_style = String::from_utf8_lossy(&attr.value).to_string();
-                            }
-                        }
-                    }
-                    b"br" => {
-                        for attr in e.attributes().flatten() {
-                            if attr.key.local_name().as_ref() == b"type"
-                                && attr.value.as_ref() == b"page"
-                            {
-                                has_page_break_in_p = true;
-                            }
-                        }
-                    }
-                    b"lastRenderedPageBreak" => {
-                        has_page_break_in_p = true;
-                    }
-                    b"pageBreakBefore" => {
-                        has_page_break_in_p = true;
-                    }
-                    _ => {}
+                w::BodyChoice::Break(br) if br.r#type == Some(w::BreakValues::Page) => {
+                    let completed = std::mem::take(current_page_blocks);
+                    pages.push(completed);
                 }
+                _ => {}
             }
-            Ok(Event::Text(e)) => {
-                if inside_t {
-                    let decoded = e
-                        .unescape()
-                        .map_err(|err| DocxError::XmlParseError {
-                            part_name: "word/document.xml".to_string(),
-                            detail: format!("XML unescape error: {err}"),
-                        })?
-                        .to_string();
-                    current_p_text.push_str(&decoded);
-                }
-            }
-            Ok(Event::End(e)) => {
-                let local_name = e.local_name();
-                match local_name.as_ref() {
-                    b"tbl" => inside_tbl = false,
-                    b"tc" => inside_tc = false,
-                    b"t" => inside_t = false,
-                    b"p" => {
-                        // Classify block kind
-                        let trimmed = current_p_text.trim();
-                        let kind = if inside_tbl || inside_tc {
-                            BlockKind::TableCell
-                        } else if is_heading_style(&current_p_style) {
-                            BlockKind::Heading
-                        } else {
-                            BlockKind::Paragraph
-                        };
-
-                        // Update section path if Heading
-                        if kind == BlockKind::Heading && !trimmed.is_empty() {
-                            update_section_path(current_section_path, &current_p_style, trimmed);
-                        }
-
-                        if !current_p_text.is_empty() {
-                            current_page_blocks.push(RawBlock {
-                                kind,
-                                text: current_p_text.clone(),
-                                section_path: current_section_path.clone(),
-                            });
-                        }
-
-                        // Page break trigger
-                        if has_page_break_in_p {
-                            let completed_page = std::mem::take(current_page_blocks);
-                            pages.push(completed_page);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => {
-                return Err(DocxError::XmlParseError {
-                    part_name: "word/document.xml".to_string(),
-                    detail: format!("XML parse error: {e}"),
-                });
-            }
-            _ => {}
         }
-        buf.clear();
     }
 
     Ok(())
 }
 
-/// Parses standalone XML parts like headers or footers into raw blocks.
-fn parse_xml_part_blocks(xml_text: &str, kind: BlockKind) -> Result<Vec<RawBlock>, DocxError> {
-    let mut reader = Reader::from_str(xml_text);
-    reader.config_mut().trim_text(false);
-
-    let mut buf = Vec::new();
-    let mut blocks = Vec::new();
-    let mut inside_t = false;
-    let mut current_p_text = String::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                if e.local_name().as_ref() == b"t" {
-                    inside_t = true;
-                } else if e.local_name().as_ref() == b"p" {
-                    current_p_text.clear();
+/// Helper extracting text and page breaks from a run using ooxmlsdk AST.
+fn process_ooxml_run(run: &w::Run, text: &mut String, has_page_break: &mut bool) {
+    for r_choice in &run.run_choice {
+        match r_choice {
+            w::RunChoice::Text(t) => {
+                if let Some(content) = &t.0.xml_content {
+                    text.push_str(content.as_str());
                 }
             }
-            Ok(Event::Text(e)) => {
-                if inside_t {
-                    let decoded = e
-                        .unescape()
-                        .map_err(|err| DocxError::XmlParseError {
-                            part_name: "header/footer".to_string(),
-                            detail: format!("XML unescape error: {err}"),
-                        })?
-                        .to_string();
-                    current_p_text.push_str(&decoded);
+            w::RunChoice::Break(br) => {
+                if br.r#type == Some(w::BreakValues::Page) {
+                    *has_page_break = true;
                 }
             }
-            Ok(Event::End(e)) => {
-                if e.local_name().as_ref() == b"t" {
-                    inside_t = false;
-                } else if e.local_name().as_ref() == b"p" && !current_p_text.is_empty() {
-                    blocks.push(RawBlock {
-                        kind,
-                        text: current_p_text.clone(),
-                        section_path: Vec::new(),
-                    });
-                }
+            w::RunChoice::LastRenderedPageBreak => {
+                *has_page_break = true;
             }
-            Ok(Event::Eof) => break,
-            Err(e) => {
-                return Err(DocxError::XmlParseError {
-                    part_name: "header/footer".to_string(),
-                    detail: format!("XML parse error: {e}"),
-                });
+            w::RunChoice::TabChar => {
+                text.push('\t');
+            }
+            w::RunChoice::CarriageReturn => {
+                text.push('\r');
+            }
+            w::RunChoice::NoBreakHyphen => {
+                text.push('-');
             }
             _ => {}
         }
-        buf.clear();
+    }
+}
+
+/// Helper extracting text and page breaks from a paragraph using ooxmlsdk AST.
+fn parse_ooxml_paragraph(
+    p: &w::Paragraph,
+    is_table_cell: bool,
+    current_section_path: &mut Vec<String>,
+) -> (Option<RawBlock>, bool) {
+    let mut current_p_style = String::new();
+    let mut has_page_break = false;
+
+    if let Some(props) = &p.paragraph_properties {
+        if let Some(style) = &props.paragraph_style_id {
+            current_p_style = style.val.to_string();
+        }
+        if props.page_break_before.is_some() {
+            has_page_break = true;
+        }
+    }
+
+    let mut current_p_text = String::new();
+
+    for choice in &p.paragraph_choice {
+        match choice {
+            w::ParagraphChoice::WRun(run) => {
+                process_ooxml_run(run, &mut current_p_text, &mut has_page_break);
+            }
+            w::ParagraphChoice::Break(br) => {
+                if br.r#type == Some(w::BreakValues::Page) {
+                    has_page_break = true;
+                }
+            }
+            w::ParagraphChoice::Hyperlink(hl) => {
+                for h_choice in &hl.hyperlink_choice {
+                    if let w::HyperlinkChoice::WRun(run) = h_choice {
+                        process_ooxml_run(run, &mut current_p_text, &mut has_page_break);
+                    }
+                }
+            }
+            w::ParagraphChoice::SimpleField(sf) => {
+                for s_choice in &sf.simple_field_choice {
+                    if let w::SimpleFieldChoice::WRun(run) = s_choice {
+                        process_ooxml_run(run, &mut current_p_text, &mut has_page_break);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let trimmed = current_p_text.trim();
+    let kind = if is_table_cell {
+        BlockKind::TableCell
+    } else if is_heading_style(&current_p_style) {
+        BlockKind::Heading
+    } else {
+        BlockKind::Paragraph
+    };
+
+    if kind == BlockKind::Heading && !trimmed.is_empty() {
+        update_section_path(current_section_path, &current_p_style, trimmed);
+    }
+
+    let raw_block = if !current_p_text.is_empty() {
+        Some(RawBlock {
+            kind,
+            text: current_p_text,
+            section_path: current_section_path.clone(),
+        })
+    } else {
+        None
+    };
+
+    (raw_block, has_page_break)
+}
+
+/// Parses standalone XML parts like headers or footers into raw blocks via ooxmlsdk.
+fn parse_xml_part_blocks(xml_text: &str, kind: BlockKind) -> Result<Vec<RawBlock>, DocxError> {
+    let mut blocks = Vec::new();
+    let mut dummy_section = Vec::new();
+
+    if kind == BlockKind::Header {
+        let header =
+            w::Header::from_bytes(xml_text.as_bytes()).map_err(|e| DocxError::XmlParseError {
+                part_name: "header.xml".to_string(),
+                detail: format!("ooxmlsdk Header deserialization failed: {e}"),
+            })?;
+        for choice in header.header_choice {
+            if let w::HeaderChoice::Paragraph(p) = choice {
+                let (raw_block_opt, _) = parse_ooxml_paragraph(&p, false, &mut dummy_section);
+                if let Some(mut b) = raw_block_opt {
+                    b.kind = BlockKind::Header;
+                    blocks.push(b);
+                }
+            }
+        }
+    } else if kind == BlockKind::Footer {
+        let footer =
+            w::Footer::from_bytes(xml_text.as_bytes()).map_err(|e| DocxError::XmlParseError {
+                part_name: "footer.xml".to_string(),
+                detail: format!("ooxmlsdk Footer deserialization failed: {e}"),
+            })?;
+        for choice in footer.footer_choice {
+            if let w::FooterChoice::Paragraph(p) = choice {
+                let (raw_block_opt, _) = parse_ooxml_paragraph(&p, false, &mut dummy_section);
+                if let Some(mut b) = raw_block_opt {
+                    b.kind = BlockKind::Footer;
+                    blocks.push(b);
+                }
+            }
+        }
     }
 
     Ok(blocks)
 }
 
-fn is_heading_style(style: &str) -> bool {
-    let lower = style.to_lowercase();
-    lower.starts_with("heading")
-        || lower.starts_with("title")
-        || lower.starts_with("subtitle")
-        || lower.starts_with("head")
+/// Checks if a style identifier represents a heading (case-insensitive).
+fn is_heading_style(style_id: &str) -> bool {
+    let s = style_id.to_ascii_lowercase();
+    s.starts_with("heading") || s == "title" || s == "subtitle"
 }
 
-fn update_section_path(path: &mut Vec<String>, style: &str, heading_text: &str) {
-    let lower = style.to_lowercase();
-    let level = if lower.contains('1') || lower == "title" {
-        1
-    } else if lower.contains('2') || lower == "subtitle" {
-        2
-    } else if lower.contains('3') {
-        3
-    } else if lower.contains('4') {
-        4
-    } else {
-        1
-    };
-
-    while path.len() >= level {
-        path.pop();
+/// Extracts heading level from style identifier (e.g., "Heading 1" -> 1, "heading2" -> 2).
+fn heading_level_from_style(style_id: &str) -> usize {
+    let s = style_id.to_ascii_lowercase();
+    if s == "title" {
+        return 1;
     }
-    path.push(heading_text.to_string());
+    if s == "subtitle" {
+        return 2;
+    }
+    for ch in s.chars() {
+        if let Some(digit) = ch.to_digit(10) {
+            return digit.max(1) as usize;
+        }
+    }
+    1
+}
+
+/// Updates section path hierarchy based on heading level and text.
+fn update_section_path(section_path: &mut Vec<String>, style_id: &str, heading_text: &str) {
+    let level = heading_level_from_style(style_id);
+    while section_path.len() >= level {
+        section_path.pop();
+    }
+    section_path.push(heading_text.to_string());
 }
 
 #[cfg(test)]
@@ -414,7 +459,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_docx_paragraphs_and_headings() {
+    fn test_style_id_case_insensitivity() {
+        assert!(is_heading_style("Heading1"));
+        assert!(is_heading_style("heading1"));
+        assert!(is_heading_style("HEADING2"));
+        assert!(is_heading_style("Heading 3"));
+        assert!(is_heading_style("Title"));
+        assert!(is_heading_style("title"));
+        assert!(is_heading_style("Subtitle"));
+        assert!(!is_heading_style("Normal"));
+        assert!(!is_heading_style("BodyText"));
+    }
+
+    #[test]
+    fn test_section_path_hierarchy() {
         let doc_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
         <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:body>
@@ -430,7 +488,7 @@ mod tests {
                     <w:r><w:t>1.1 Scope</w:t></w:r>
                 </w:p>
                 <w:p>
-                    <w:r><w:t>Details of the project scope.</w:t></w:r>
+                    <w:r><w:t>Scope details paragraph.</w:t></w:r>
                 </w:p>
             </w:body>
         </w:document>"#;
@@ -502,5 +560,69 @@ mod tests {
         assert_eq!(parsed.pages[0].normalized_text, "Page 1 content");
         assert_eq!(parsed.pages[1].page_number, 2);
         assert_eq!(parsed.pages[1].normalized_text, "Page 2 content");
+    }
+
+    #[test]
+    fn test_ooxmlsdk_document_from_bytes() {
+        use ooxmlsdk::schemas::schemas_openxmlformats_org_wordprocessingml_2006_main::Document;
+        use ooxmlsdk::sdk::SdkType;
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:body>
+                <w:p><w:r><w:t>Hello World</w:t></w:r></w:p>
+            </w:body>
+        </w:document>"#;
+        let doc = Document::from_bytes(xml.as_bytes()).unwrap();
+        assert!(doc.body.is_some());
+    }
+
+    #[test]
+    fn test_ooxmlsdk_wordprocessing_document_new() {
+        use ooxmlsdk::parts::wordprocessing_document::WordprocessingDocument;
+        use std::io::Cursor;
+        use std::io::Write;
+        use zip::ZipWriter;
+        use zip::write::SimpleFileOptions;
+
+        let mut buf = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+            zip.start_file("[Content_Types].xml", options).unwrap();
+            zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+                    <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+                    <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+                    <Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+                </Types>").unwrap();
+
+            zip.start_file("_rels/.rels", options).unwrap();
+            zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+                    <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>\
+                </Relationships>").unwrap();
+
+            zip.start_file("word/document.xml", options).unwrap();
+            zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+                    <w:body>\
+                        <w:p><w:r><w:t>Hello World</w:t></w:r></w:p>\
+                    </w:body>\
+                </w:document>").unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let mut doc = WordprocessingDocument::new(Cursor::new(&buf))
+            .expect("WordprocessingDocument should open");
+        let main_part = doc
+            .main_document_part()
+            .expect("Main document part should exist");
+        let root = main_part
+            .root_element(&mut doc)
+            .expect("Root element should load");
+        assert!(root.body.is_some());
     }
 }

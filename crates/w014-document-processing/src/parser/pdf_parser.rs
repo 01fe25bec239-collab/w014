@@ -27,7 +27,7 @@ use super::artifact::{
 };
 use super::failure::ParserFailure;
 use super::normalization::{map_normalized_range_to_raw, normalize_text_nfc};
-use super::pdfium_backend::{get_pdfium, pdfium_version_info};
+use super::pdfium_backend::{get_authoritative_pdfium, lock_pdfium, pdfium_version_info};
 use super::request::{ParserLimits, ParserRequest};
 
 /// Hardened PDF safe-subset parser engine.
@@ -80,15 +80,11 @@ impl PdfSafeParser {
         // 4. Pre-scan for decompression bomb signatures & malformed structures
         self.check_structure_and_safety(bytes)?;
 
-        // 5. Execute safe parser: PDFium if library is bound; otherwise pure-Rust safe extractor.
-        // SECURITY BOUNDARY (WI-0206): When PDFium rejects an input (malformed, corrupt, encrypted,
-        // ceiling exceeded, or parse error), it MUST fail closed. PDFium errors MUST NEVER be caught
-        // or bypassed by falling back to heuristic parsing.
-        let parsed_artifact = if let Some(pdfium) = get_pdfium() {
-            self.parse_with_pdfium(pdfium, bytes, request)?
-        } else {
-            self.parse_with_builtin_safe_extractor(bytes, request)?
-        };
+        // 5. Authoritative native PDF path (WI-0206): Must execute via pinned PDFium.
+        // If PDFium is unavailable, unverified, or fails to bind, FAIL CLOSED.
+        // Heuristic fallback or silent downgrade is STRICTLY PROHIBITED.
+        let pdfium = get_authoritative_pdfium()?;
+        let parsed_artifact = self.parse_with_pdfium(pdfium, bytes, request)?;
 
         Ok(parsed_artifact)
     }
@@ -172,6 +168,7 @@ impl PdfSafeParser {
         bytes: &[u8],
         request: &ParserRequest,
     ) -> Result<ParserArtifactData, ParserFailure> {
+        let _guard = lock_pdfium();
         let doc = pdfium.load_pdf_from_byte_slice(bytes, None).map_err(|e| {
             let err_str = e.to_string();
             if err_str.to_lowercase().contains("password")
@@ -225,7 +222,11 @@ impl PdfSafeParser {
                     pdfium_render::prelude::PdfPageRenderRotation::Degrees270 => Rotation::Deg270,
                     _ => Rotation::Deg0,
                 },
-                Err(_) => Rotation::Deg0,
+                Err(e) => {
+                    return Err(ParserFailure::CorruptedFile(format!(
+                        "Failed to extract page {page_number} rotation: {e}"
+                    )));
+                }
             };
 
             // Raster calculation (assuming standard 300 DPI ceiling for safety check)
@@ -244,8 +245,15 @@ impl PdfSafeParser {
                 rotation,
             });
 
-            // Extract text and character positions
-            let raw_text = page.text().map(|t| t.all()).unwrap_or_default();
+            // Extract text using authoritative PDFium text page.
+            // SECURITY BOUNDARY (WI-0206 Defect 2): Text extraction failure must propagate as a typed
+            // error and FAIL CLOSED. It must NEVER fail open to empty text via unwrap_or_default().
+            let text_page = page.text().map_err(|e| {
+                ParserFailure::PageTextExtractionFailed(format!(
+                    "Failed to extract native text for page {page_number}: {e}"
+                ))
+            })?;
+            let raw_text = text_page.all();
             let norm_res = normalize_text_nfc(&raw_text);
 
             for w in norm_res.warnings {
@@ -309,280 +317,6 @@ impl PdfSafeParser {
             tool_versions,
         ))
     }
-
-    /// Pure-Rust fallback safe extractor for sandboxed execution without external PDFium dylib.
-    fn parse_with_builtin_safe_extractor(
-        &self,
-        bytes: &[u8],
-        request: &ParserRequest,
-    ) -> Result<ParserArtifactData, ParserFailure> {
-        let content_str = String::from_utf8_lossy(bytes);
-
-        // 1. Scan for annotations / Javascript / actions to ignore and record warnings
-        let mut parser_warnings = scan_security_warnings(bytes);
-
-        // 2. Parse text content from streams / text operators (`BT ... ET`, `Tj`, `TJ`, or raw readable blocks)
-        let page_chunks = extract_text_chunks_from_pdf(bytes);
-
-        // Extract declared page count if present from `/Count <N>`
-        let declared_page_count = extract_declared_page_count(&content_str);
-        let actual_page_count = (page_chunks.len() as u32).max(declared_page_count.unwrap_or(1));
-
-        // Ensure page limit is checked (<= 2000 pages)
-        if actual_page_count > self.limits.max_pages {
-            return Err(ParserFailure::PageLimitExceeded {
-                actual: actual_page_count,
-                limit: self.limits.max_pages,
-            });
-        }
-
-        let default_width = 612.0; // 8.5 x 11 inches in points
-        let default_height = 792.0;
-
-        let mut parsed_pages = Vec::new();
-        let mut parsed_blocks = Vec::new();
-        let mut parsed_spans = Vec::new();
-        let mut geometries = Vec::new();
-        let mut global_span_seq = 0;
-
-        for (idx, raw_chunk) in page_chunks.iter().enumerate() {
-            let page_number = (idx + 1) as u32;
-
-            geometries.push(PageGeometry {
-                page_number,
-                width: default_width,
-                height: default_height,
-                rotation: Rotation::Deg0,
-            });
-
-            let norm_res = normalize_text_nfc(raw_chunk);
-
-            for w in norm_res.warnings {
-                parser_warnings.push(ParserWarning {
-                    code: w.code,
-                    page_number: Some(page_number),
-                    message: w.message,
-                });
-            }
-
-            let page_blocks = segment_into_blocks(
-                page_number,
-                &norm_res.normalized_text,
-                default_width,
-                default_height,
-            );
-
-            for block in &page_blocks {
-                let block_spans = create_spans_for_block(
-                    page_number,
-                    block,
-                    &norm_res.norm_to_raw_char_map,
-                    raw_chunk.len(),
-                    &mut global_span_seq,
-                );
-                parsed_spans.extend(block_spans);
-            }
-
-            parsed_blocks.extend(page_blocks);
-
-            parsed_pages.push(ParsedPageData {
-                page_number,
-                normalized_text: norm_res.normalized_text,
-                raw_text: raw_chunk.clone(),
-                extraction: ExtractionMethod::NativeText,
-                ocr_used: false,
-                quality_score: Some(1.0),
-                width: Some(default_width),
-                height: Some(default_height),
-                rotation: Rotation::Deg0,
-            });
-        }
-
-        let mut tool_versions = HashMap::new();
-        tool_versions.insert("engine".to_string(), "pdf-safe-parser-rust".to_string());
-        tool_versions.insert("pdfium_version".to_string(), pdfium_version_info());
-        tool_versions.insert(
-            "profile".to_string(),
-            request.parser_profile_version.clone(),
-        );
-
-        let quality_metrics = compute_quality_metrics(&parsed_pages, &parser_warnings);
-
-        Ok(ParserArtifactData::new(
-            "parser-artifact-v1",
-            request.expected_sha256,
-            parsed_pages,
-            parsed_blocks,
-            parsed_spans,
-            geometries,
-            parser_warnings,
-            quality_metrics,
-            tool_versions,
-        ))
-    }
-}
-
-/// Extracts declared page count from `/Count <N>` in PDF pages tree catalog.
-fn extract_declared_page_count(content: &str) -> Option<u32> {
-    if let Some(pos) = content.find("/Count ") {
-        let rest = &content[pos + 7..];
-        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(count) = num_str.parse::<u32>() {
-            return Some(count);
-        }
-    }
-    None
-}
-
-/// Splits PDF content into slices per `/Type /Page` object (excluding `/Type /Pages`).
-fn split_pdf_pages(content_str: &str) -> Vec<&str> {
-    let mut page_indices = Vec::new();
-    let mut search_start = 0;
-
-    while let Some(pos) = content_str[search_start..].find("/Type /Page") {
-        let actual_pos = search_start + pos;
-        let after = actual_pos + 11;
-        if after >= content_str.len()
-            || (!content_str[after..].starts_with('s') && !content_str[after..].starts_with('S'))
-        {
-            page_indices.push(actual_pos);
-        }
-        search_start = actual_pos + 11;
-    }
-
-    search_start = 0;
-    while let Some(pos) = content_str[search_start..].find("/Type/Page") {
-        let actual_pos = search_start + pos;
-        let after = actual_pos + 10;
-        if (after >= content_str.len()
-            || (!content_str[after..].starts_with('s') && !content_str[after..].starts_with('S')))
-            && !page_indices.contains(&actual_pos)
-        {
-            page_indices.push(actual_pos);
-        }
-        search_start = actual_pos + 10;
-    }
-
-    page_indices.sort_unstable();
-
-    if page_indices.is_empty() {
-        return Vec::new();
-    }
-
-    let mut slices = Vec::new();
-    for (i, &idx) in page_indices.iter().enumerate() {
-        let end_idx = if i + 1 < page_indices.len() {
-            page_indices[i + 1]
-        } else {
-            content_str.len()
-        };
-        slices.push(&content_str[idx..end_idx]);
-    }
-    slices
-}
-
-/// Extracts text segments across pages from PDF stream bytes.
-fn extract_text_chunks_from_pdf(bytes: &[u8]) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let content_str = String::from_utf8_lossy(bytes);
-
-    let page_splits = split_pdf_pages(&content_str);
-
-    if !page_splits.is_empty() {
-        for (i, split) in page_splits.iter().enumerate() {
-            let extracted = extract_text_from_pdf_page_content(split);
-            if !extracted.trim().is_empty() {
-                chunks.push(extracted);
-            } else {
-                chunks.push(format!("Page {}", i + 1));
-            }
-        }
-    } else {
-        // Single page document or simple content stream
-        let extracted = extract_text_from_pdf_page_content(&content_str);
-        if !extracted.trim().is_empty() {
-            chunks.push(extracted);
-        } else {
-            // Strip binary tokens, keep printable text lines
-            let clean: String = content_str
-                .lines()
-                .filter(|l| {
-                    !l.starts_with('%')
-                        && !l.starts_with("xref")
-                        && !l.starts_with("trailer")
-                        && !l.contains("obj")
-                        && !l.contains("endobj")
-                })
-                .collect::<Vec<&str>>()
-                .join("\n");
-            if !clean.trim().is_empty() {
-                chunks.push(clean);
-            } else {
-                chunks.push(String::new());
-            }
-        }
-    }
-
-    if chunks.is_empty() {
-        chunks.push(String::new());
-    }
-
-    chunks
-}
-
-/// Helper extracting text inside PDF text operator parentheses `( ... )` or `[ ( ... ) ]`.
-fn extract_text_from_pdf_page_content(content: &str) -> String {
-    let mut out = String::new();
-    let mut in_paren = false;
-    let mut escaped = false;
-    let mut current_literal = String::new();
-
-    for ch in content.chars() {
-        if escaped {
-            match ch {
-                'n' => current_literal.push('\n'),
-                'r' => current_literal.push('\r'),
-                't' => current_literal.push('\t'),
-                other => current_literal.push(other),
-            }
-            escaped = false;
-            continue;
-        }
-
-        if ch == '\\' && in_paren {
-            escaped = true;
-            continue;
-        }
-
-        if ch == '(' && !in_paren {
-            in_paren = true;
-            current_literal.clear();
-        } else if ch == ')' && in_paren {
-            in_paren = false;
-            if !current_literal.is_empty() {
-                if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
-                    out.push(' ');
-                }
-                out.push_str(&current_literal);
-            }
-        } else if in_paren {
-            current_literal.push(ch);
-        }
-    }
-
-    if out.trim().is_empty() {
-        // Fallback: check if the string contains plain text paragraphs
-        let filtered: Vec<&str> = content
-            .lines()
-            .map(str::trim)
-            .filter(|l| {
-                !l.is_empty() && !l.starts_with('/') && !l.ends_with("obj") && !l.starts_with("end")
-            })
-            .collect();
-        out = filtered.join("\n");
-    }
-
-    out
 }
 
 /// Segments normalized page text into structural blocks (Heading, Paragraph, etc.).

@@ -24,7 +24,11 @@ pub use normalization::{
     NormalizationResult, TextWarning, map_normalized_range_to_raw, normalize_text_nfc,
 };
 pub use pdf_parser::PdfSafeParser;
-pub use pdfium_backend::{get_pdfium, pdfium_version_info};
+pub use pdfium_backend::{
+    PINNED_PDFIUM_BUILD, PINNED_PDFIUM_MAJOR, PINNED_PDFIUM_VERSION_STR, get_authoritative_pdfium,
+    get_pdfium, lock_pdfium, pdfium_version_info, verify_pdfium_library_identity,
+    verify_pdfium_library_identity_with_expected,
+};
 pub use request::{
     DEFAULT_LOCATOR_VERSION, DEFAULT_PARSER_PROFILE_VERSION, DEFAULT_TEXT_NORMALIZATION_VERSION,
     PDF_MAX_PAGES, PDF_MAX_RASTER_MP_PER_PAGE, PDF_MAX_RECURSION_DEPTH,
