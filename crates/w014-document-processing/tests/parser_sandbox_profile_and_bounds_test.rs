@@ -16,10 +16,10 @@ use uuid::Uuid;
 use w014_document_processing::sandbox::{
     FROZEN_MAX_CPU_CORES, FROZEN_MAX_MEMORY_BYTES, FROZEN_MAX_OUTPUT_BYTES, FROZEN_MAX_PIDS,
     FROZEN_MAX_TMPFS_BYTES, FROZEN_MAX_WALL_CLOCK_SECS, MockSandboxBehavior, MockSandboxRunner,
-    NON_ROOT_GID, NON_ROOT_UID, OutputValidationError, SANDBOX_PROTOCOL_VERSION,
-    SandboxCredentialsPolicy, SandboxError, SandboxFilesystemPolicy, SandboxInput,
-    SandboxNetworkPolicy, SandboxOutput, SandboxProcessPolicy, SandboxResourceCeilings,
-    SandboxRunner, SandboxSecurityProfile, SandboxStatus,
+    NON_ROOT_GID, NON_ROOT_UID, OutputValidationError, ProcessSandboxRunner,
+    SANDBOX_PROTOCOL_VERSION, SandboxCredentialsPolicy, SandboxError, SandboxFilesystemPolicy,
+    SandboxInput, SandboxNetworkPolicy, SandboxOutput, SandboxProcessPolicy,
+    SandboxResourceCeilings, SandboxRunner, SandboxSecurityProfile, SandboxStatus,
 };
 use w014_domain::ids::{DocumentVersionId, ObjectArtifactId, WorkspaceId};
 use w014_domain::{LocatorVersion, Sha256, StoredMediaType};
@@ -638,12 +638,55 @@ async fn test_process_sandbox_profile_enforcement_fail_closed_matrix() {
     bad_profile.ceilings.max_output_bytes = 10 * 1024 * 1024 + 1;
     let err = runner.run(&bad_profile, &input).await.unwrap_err();
     assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+
+    // Case 26: Valid profile BUT missing isolation wrapper -> Fail closed (unsandboxed direct execution impossible)
+    let good_profile = SandboxSecurityProfile::frozen_default();
+    let unisolated_runner = ProcessSandboxRunner::new("/bin/sh").with_args(["-c", "exit 0"]);
+    let err = unisolated_runner
+        .run(&good_profile, &input)
+        .await
+        .unwrap_err();
+    match err {
+        SandboxError::SandboxViolation {
+            ref violation_type,
+            ref detail,
+        } => {
+            assert_eq!(violation_type, "MISSING_ISOLATION_WRAPPER");
+            assert!(detail.contains("isolation wrapper"));
+        }
+        other => panic!("Expected MISSING_ISOLATION_WRAPPER, got {other:?}"),
+    }
+
+    // Case 27: Nonexistent isolation wrapper -> Fail closed
+    let bad_wrapper_runner = ProcessSandboxRunner::new("/bin/sh")
+        .with_wrapper("/nonexistent/bin/sandbox-wrapper-404", ["--isolated"]);
+    let err = bad_wrapper_runner
+        .run(&good_profile, &input)
+        .await
+        .unwrap_err();
+    match err {
+        SandboxError::SandboxViolation {
+            ref violation_type,
+            ref detail,
+        } => {
+            assert_eq!(violation_type, "ISOLATION_WRAPPER_NOT_FOUND");
+            assert!(detail.contains("sandbox-wrapper-404"));
+        }
+        other => panic!("Expected ISOLATION_WRAPPER_NOT_FOUND, got {other:?}"),
+    }
+}
+
+fn create_test_runner(args: &[&str]) -> ProcessSandboxRunner {
+    let runner = ProcessSandboxRunner::new("/bin/sh").with_args(args.iter().copied());
+    if let Some((wb, wa)) = ProcessSandboxRunner::platform_default_wrapper() {
+        runner.with_wrapper(wb, wa)
+    } else {
+        runner.with_wrapper("/usr/bin/env", ["--"])
+    }
 }
 
 #[tokio::test]
 async fn test_process_sandbox_credential_and_environment_scrubbing() {
-    use w014_document_processing::sandbox::ProcessSandboxRunner;
-
     // Set sensitive variables in parent environment
     unsafe {
         std::env::set_var("DATABASE_URL", "postgres://user:pass@localhost:5432/db");
@@ -683,7 +726,7 @@ async fn test_process_sandbox_credential_and_environment_scrubbing() {
         printf '{"protocol_version":"parser-sandbox-v1","document_version_id":"%s","object_artifact_id":"%s","input_sha256":"%s","status":"success","parser_name":"test-parser","parser_version":"1.0.0","locator_version":"w014-loc-v1","page_count":1,"block_count":1,"span_count":1,"text_sha256":"%s","execution_duration_ms":10,"failure_code":null,"failure_detail":null,"parsed_artifact":null}' "$W014_DOCUMENT_VERSION_ID" "$W014_OBJECT_ARTIFACT_ID" "$W014_INPUT_SHA256" "$W014_INPUT_SHA256"
     "#;
 
-    let runner = ProcessSandboxRunner::new("/bin/sh").with_args(["-c", check_script]);
+    let runner = create_test_runner(&["-c", check_script]);
     let output = runner
         .run(&profile, &input)
         .await
@@ -697,7 +740,6 @@ async fn test_process_sandbox_credential_and_environment_scrubbing() {
 #[tokio::test]
 async fn test_process_sandbox_wall_clock_timeout_terminates_and_reaps() {
     use std::time::Instant;
-    use w014_document_processing::sandbox::ProcessSandboxRunner;
 
     let ws_id = WorkspaceId::new();
     let dv_id = DocumentVersionId::new();
@@ -721,7 +763,7 @@ async fn test_process_sandbox_wall_clock_timeout_terminates_and_reaps() {
     profile.ceilings.max_wall_clock_seconds = 1; // Strict 1 second timeout
 
     // Run a process that attempts to sleep for 10 seconds
-    let runner = ProcessSandboxRunner::new("/bin/sh").with_args(["-c", "sleep 10"]);
+    let runner = create_test_runner(&["-c", "sleep 10"]);
 
     let start = Instant::now();
     let err = runner.run(&profile, &input).await.unwrap_err();
@@ -736,8 +778,6 @@ async fn test_process_sandbox_wall_clock_timeout_terminates_and_reaps() {
 
 #[tokio::test]
 async fn test_process_sandbox_oversized_stdout_terminates_during_streaming() {
-    use w014_document_processing::sandbox::ProcessSandboxRunner;
-
     let ws_id = WorkspaceId::new();
     let dv_id = DocumentVersionId::new();
     let oa_id = ObjectArtifactId::new();
@@ -760,8 +800,7 @@ async fn test_process_sandbox_oversized_stdout_terminates_during_streaming() {
     profile.ceilings.max_output_bytes = 4096; // Tight 4 KB bound for test
 
     // Script generates 100 KB of stdout (well exceeding the 4 KB bound)
-    let runner = ProcessSandboxRunner::new("/bin/sh")
-        .with_args(["-c", "head -c 102400 /dev/zero | tr '\\000' 'A'"]);
+    let runner = create_test_runner(&["-c", "head -c 102400 /dev/zero | tr '\\000' 'A'"]);
 
     let err = runner.run(&profile, &input).await.unwrap_err();
     match err {
@@ -777,8 +816,6 @@ async fn test_process_sandbox_oversized_stdout_terminates_during_streaming() {
 
 #[tokio::test]
 async fn test_process_sandbox_oversized_stderr_terminates_during_streaming() {
-    use w014_document_processing::sandbox::ProcessSandboxRunner;
-
     let ws_id = WorkspaceId::new();
     let dv_id = DocumentVersionId::new();
     let oa_id = ObjectArtifactId::new();
@@ -801,8 +838,7 @@ async fn test_process_sandbox_oversized_stderr_terminates_during_streaming() {
     profile.ceilings.max_output_bytes = 4096; // Tight 4 KB bound for test
 
     // Script generates 100 KB of stderr (well exceeding the 4 KB bound)
-    let runner = ProcessSandboxRunner::new("/bin/sh")
-        .with_args(["-c", "head -c 102400 /dev/zero | tr '\\000' 'E' >&2"]);
+    let runner = create_test_runner(&["-c", "head -c 102400 /dev/zero | tr '\\000' 'E' >&2"]);
 
     let err = runner.run(&profile, &input).await.unwrap_err();
     match err {
@@ -818,8 +854,6 @@ async fn test_process_sandbox_oversized_stderr_terminates_during_streaming() {
 
 #[tokio::test]
 async fn test_process_sandbox_crash_captures_bounded_stderr_and_fails_closed() {
-    use w014_document_processing::sandbox::ProcessSandboxRunner;
-
     let ws_id = WorkspaceId::new();
     let dv_id = DocumentVersionId::new();
     let oa_id = ObjectArtifactId::new();
@@ -840,8 +874,7 @@ async fn test_process_sandbox_crash_captures_bounded_stderr_and_fails_closed() {
 
     let profile = SandboxSecurityProfile::frozen_default();
 
-    let runner = ProcessSandboxRunner::new("/bin/sh")
-        .with_args(["-c", "echo 'Fatal memory fault inside parser' >&2; exit 2"]);
+    let runner = create_test_runner(&["-c", "echo 'Fatal memory fault inside parser' >&2; exit 2"]);
 
     let err = runner.run(&profile, &input).await.unwrap_err();
     match err {
@@ -852,5 +885,75 @@ async fn test_process_sandbox_crash_captures_bounded_stderr_and_fails_closed() {
             assert!(stderr.contains("Fatal memory fault inside parser"));
         }
         other => panic!("Expected ProcessCrash, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_process_sandbox_real_os_boundary_enforcement() {
+    let ws_id = WorkspaceId::new();
+    let dv_id = DocumentVersionId::new();
+    let oa_id = ObjectArtifactId::new();
+    let job_id = Uuid::new_v4();
+    let media_type = StoredMediaType::new("application/pdf").unwrap();
+    let sample_bytes = b"%PDF-1.7 scoped test bytes".to_vec();
+    let input = SandboxInput::new(
+        ws_id,
+        dv_id,
+        oa_id,
+        job_id,
+        media_type,
+        Sha256::digest(&sample_bytes),
+        sample_bytes.len() as i64,
+        sample_bytes,
+    )
+    .unwrap();
+
+    let profile = SandboxSecurityProfile::frozen_default();
+
+    // 1. Missing wrapper deterministically fails closed (direct execution is impossible)
+    let direct_runner = ProcessSandboxRunner::new("/bin/sh").with_args(["-c", "exit 0"]);
+    let err = direct_runner.run(&profile, &input).await.unwrap_err();
+    assert!(matches!(
+        err,
+        SandboxError::SandboxViolation {
+            ref violation_type,
+            ..
+        } if violation_type == "MISSING_ISOLATION_WRAPPER"
+    ));
+
+    // 2. If a platform wrapper is available, verify real OS boundary enforcement
+    if let Some((wb, wa)) = ProcessSandboxRunner::platform_default_wrapper() {
+        // Sub-test A: Root filesystem write is blocked by OS boundary (Fail Closed)
+        let write_attempt_script = "touch /etc/w014_hacked_root 2>&1";
+        let runner_write = ProcessSandboxRunner::new("/bin/sh")
+            .with_wrapper(wb.clone(), wa.clone())
+            .with_args(["-c", write_attempt_script]);
+        let err = runner_write.run(&profile, &input).await.unwrap_err();
+        assert!(
+            matches!(err, SandboxError::ProcessCrash { .. }),
+            "Attempt to write to root filesystem must fail closed via OS boundary, got {err:?}"
+        );
+
+        // Sub-test B: Network socket connect is blocked by OS boundary (Fail Closed)
+        let network_attempt_script = "nc -z -w 1 8.8.8.8 53 2>&1 || exit 42";
+        let runner_net = ProcessSandboxRunner::new("/bin/sh")
+            .with_wrapper(wb.clone(), wa.clone())
+            .with_args(["-c", network_attempt_script]);
+        let err = runner_net.run(&profile, &input).await.unwrap_err();
+        assert!(
+            matches!(err, SandboxError::ProcessCrash { .. }),
+            "Attempt to access network must fail closed via OS boundary, got {err:?}"
+        );
+
+        // Sub-test C: Docker socket communication is blocked by OS boundary
+        let docker_socket_script = "nc -U /var/run/docker.sock </dev/null 2>&1 || exit 88";
+        let runner_docker = ProcessSandboxRunner::new("/bin/sh")
+            .with_wrapper(wb, wa)
+            .with_args(["-c", docker_socket_script]);
+        let err = runner_docker.run(&profile, &input).await.unwrap_err();
+        assert!(
+            matches!(err, SandboxError::ProcessCrash { .. }),
+            "Docker socket communication must be blocked by OS boundary, got {err:?}"
+        );
     }
 }

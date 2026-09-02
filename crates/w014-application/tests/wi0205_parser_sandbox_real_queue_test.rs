@@ -1158,8 +1158,11 @@ async fn test_wi0205_gate08_process_sandbox_runner_real_queue_enforcement() {
             printf '{"protocol_version":"parser-sandbox-v1","document_version_id":"%s","object_artifact_id":"%s","input_sha256":"%s","status":"success","parser_name":"real-process-parser","parser_version":"1.0.0","locator_version":"w014-loc-v1","page_count":1,"block_count":1,"span_count":1,"text_sha256":"%s","execution_duration_ms":15,"failure_code":null,"failure_detail":null,"parsed_artifact":null}' "$W014_DOCUMENT_VERSION_ID" "$W014_OBJECT_ARTIFACT_ID" "$W014_INPUT_SHA256" "$W014_INPUT_SHA256"
         "#;
 
-        let runner =
-            Arc::new(ProcessSandboxRunner::new("/bin/sh").with_args(["-c", success_script]));
+        let runner = Arc::new(
+            ProcessSandboxRunner::new("/bin/sh")
+                .with_platform_wrapper()
+                .with_args(["-c", success_script]),
+        );
         let executor = ParserSandboxJobExecutor::new(f.test_db.pool().clone(), runner);
 
         let outcome = executor
@@ -1218,8 +1221,11 @@ async fn test_wi0205_gate08_process_sandbox_runner_real_queue_enforcement() {
 
         // Runner generates massive output stream (exceeding bound during streaming)
         let overflow_script = "head -c 20000000 /dev/zero | tr '\\000' 'A'";
-        let runner =
-            Arc::new(ProcessSandboxRunner::new("/bin/sh").with_args(["-c", overflow_script]));
+        let runner = Arc::new(
+            ProcessSandboxRunner::new("/bin/sh")
+                .with_platform_wrapper()
+                .with_args(["-c", overflow_script]),
+        );
         let mut custom_profile = SandboxSecurityProfile::frozen_default();
         custom_profile.ceilings.max_output_bytes = 10_000; // Tight bound for test
 
@@ -1272,7 +1278,11 @@ async fn test_wi0205_gate08_process_sandbox_runner_real_queue_enforcement() {
             .unwrap()
             .unwrap();
 
-        let runner = Arc::new(ProcessSandboxRunner::new("/bin/sh").with_args(["-c", "sleep 10"]));
+        let runner = Arc::new(
+            ProcessSandboxRunner::new("/bin/sh")
+                .with_platform_wrapper()
+                .with_args(["-c", "sleep 10"]),
+        );
         let mut custom_profile = SandboxSecurityProfile::frozen_default();
         custom_profile.ceilings.max_wall_clock_seconds = 1; // Strict 1s timeout
 
@@ -1296,6 +1306,61 @@ async fn test_wi0205_gate08_process_sandbox_runner_real_queue_enforcement() {
         assert_eq!(
             artifact_count, 0,
             "Zero parser artifacts must be persisted on timeout"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // CASE D: Real ProcessSandboxRunner Missing Wrapper -> Fails Closed & Commits Zero Truth
+    // -------------------------------------------------------------
+    {
+        let (_intent, version_id, artifact_id) = finalize_and_clean_scan(
+            &f,
+            "proc_nowrapper.pdf",
+            MediaType::ApplicationPdf,
+            pdf_bytes,
+        )
+        .await;
+
+        let _ = enqueue_parse_job(&f, JobKind::ParseDocumentPdf, version_id, artifact_id).await;
+
+        let claimed = f
+            .queue
+            .claim(
+                ClaimCriteria {
+                    queues: vec![QUEUE_DOCUMENT_PARSE.to_string()],
+                    kinds: vec![JobKind::ParseDocumentPdf],
+                    workspace: WorkspaceScope::Single(f.ws_a.id.into_uuid()),
+                    lease_duration: Duration::from_secs(30),
+                },
+                WorkerId::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Runner has NO wrapper configured (direct execution attempt fails closed)
+        let unisolated_runner =
+            Arc::new(ProcessSandboxRunner::new("/bin/sh").with_args(["-c", "exit 0"]));
+        let executor = ParserSandboxJobExecutor::new(f.test_db.pool().clone(), unisolated_runner);
+
+        let failure = executor
+            .execute_claimed(&claimed)
+            .await
+            .expect_err("unisolated direct execution must fail closed");
+
+        assert_eq!(failure.error_code, "SANDBOX_VIOLATION");
+        assert_eq!(failure.kind, FailureKind::Terminal);
+
+        let artifact_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM parser_artifacts WHERE document_version_id = $1",
+        )
+        .bind(version_id.as_uuid())
+        .fetch_one(f.test_db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            artifact_count, 0,
+            "Zero parser artifacts must be persisted when isolation wrapper is missing"
         );
     }
 }

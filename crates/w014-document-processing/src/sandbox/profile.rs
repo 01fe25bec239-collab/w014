@@ -327,6 +327,12 @@ impl SandboxCredentialsPolicy {
             "certificate",
             "cookie",
             "credential",
+            "storage",
+            "bucket",
+            "access_key",
+            "secret_key",
+            "mistral",
+            "ollama",
         ];
 
         let allowed_exact_keys: HashSet<&str> = [
