@@ -97,8 +97,11 @@ impl DocxOcrProducer {
         // The OCR page budget (MAX_OCR_PAGES = 250) applies strictly to pages submitted to OCR.
 
         // 3. Setup single bounded OCR job wall-clock deadline (<= 1800s total)
+        //    and frozen per-page wall-clock budget (<= 15s per OCR page, shared
+        //    across every image/media OCR operation on that page).
         let job_timeout = Duration::from_secs(self.ocr_config.effective_job_timeout_secs());
         let job_deadline = start_time + job_timeout;
+        let page_timeout = Duration::from_secs(self.ocr_config.effective_page_timeout_secs());
 
         // 4. Build domain entities and execute OCR fallback where policy dictates
         let artifact_id = ParserArtifactId::new();
@@ -168,10 +171,34 @@ impl DocxOcrProducer {
                     });
                 }
 
-                // OCR fallback execution on page images
+                // Establish ONE shared wall-clock deadline for this OCR page.
+                // Every image/media OCR operation on this page shares the SAME
+                // page_deadline; it MUST NOT reset between media operations.
+                let page_start = Instant::now();
+                let page_deadline = page_start + page_timeout;
+                if page_start >= page_deadline {
+                    return Err(DocxError::Io {
+                        detail: format!(
+                            "OCR page wall-clock deadline exceeded: 0s (limit {}s)",
+                            page_timeout.as_secs()
+                        ),
+                    });
+                }
+
+                // OCR fallback execution on page images (shared page budget)
                 let mut ocr_texts = Vec::new();
                 for media in &parsed_page.media_items {
                     let now = Instant::now();
+                    // Fail closed when the shared page budget is exhausted.
+                    if now >= page_deadline {
+                        let elapsed = page_start.elapsed().as_secs();
+                        return Err(DocxError::Io {
+                            detail: format!(
+                                "OCR page wall-clock deadline exceeded: {elapsed}s (limit {}s)",
+                                page_timeout.as_secs()
+                            ),
+                        });
+                    }
                     if now >= job_deadline {
                         let elapsed = start_time.elapsed().as_secs();
                         return Err(DocxError::Io {
@@ -181,15 +208,37 @@ impl DocxOcrProducer {
                             ),
                         });
                     }
+                    let remaining_page_time = page_deadline.saturating_duration_since(now);
                     let remaining_job_time = job_deadline.saturating_duration_since(now);
+                    // The child operation may receive at most
+                    // min(remaining_page_budget, remaining_job_budget).
+                    let child_budget = crate::ocr::tesseract::child_ocr_budget(
+                        remaining_page_time,
+                        remaining_job_time,
+                        page_timeout,
+                    );
+                    if child_budget.is_zero() {
+                        if remaining_page_time.is_zero() {
+                            let elapsed = page_start.elapsed().as_secs();
+                            return Err(DocxError::Io {
+                                detail: format!(
+                                    "OCR page wall-clock deadline exceeded: {elapsed}s (limit {}s)",
+                                    page_timeout.as_secs()
+                                ),
+                            });
+                        }
+                        let elapsed = start_time.elapsed().as_secs();
+                        return Err(DocxError::Io {
+                            detail: format!(
+                                "OCR job wall-clock deadline exceeded: {elapsed}s (limit {}s)",
+                                job_timeout.as_secs()
+                            ),
+                        });
+                    }
 
                     let ocr_res = self
                         .ocr_engine
-                        .ocr_image_with_timeout(
-                            &media.data,
-                            &media.content_type,
-                            remaining_job_time,
-                        )
+                        .ocr_image_with_timeout(&media.data, &media.content_type, child_budget)
                         .await
                         .map_err(|ocr_err| match ocr_err {
                             OcrError::PageLimitExceeded { actual, limit } => {
