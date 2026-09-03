@@ -552,10 +552,14 @@ async fn test_e20_upload_intent_presign_put_security_gates() {
     };
 
     // 1. Unsupported media type (e.g. text/plain) -> 415 Unsupported Media Type
+    // NOTE: sha256_b64 is REQUIRED on the transport contract, so include a
+    // canonical checksum to reach the media-type gate (otherwise serde rejects
+    // the missing required property before the handler runs).
     let bad_media_payload = json!({
         "filename": "notes.txt",
         "media_type": "text/plain",
-        "byte_length": 1024
+        "byte_length": 1024,
+        "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     });
     let req = Request::builder()
         .uri(format!(
@@ -574,10 +578,12 @@ async fn test_e20_upload_intent_presign_put_security_gates() {
     assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
     // 2. Oversized payload (> 100 MiB = 104857600 bytes) -> 413 Payload Too Large
+    // NOTE: include required sha256_b64 so the request reaches the byte-length gate.
     let oversized_payload = json!({
         "filename": "huge.pdf",
         "media_type": "application/pdf",
-        "byte_length": 104857601
+        "byte_length": 104857601,
+        "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     });
     let req = Request::builder()
         .uri(format!(
@@ -625,8 +631,8 @@ async fn test_e20_upload_intent_presign_put_security_gates() {
     assert_eq!(intent_dto.expected_media_type, "application/pdf");
     assert_eq!(intent_dto.expected_length, 2048576);
     assert_eq!(
-        intent_dto.expected_sha256_b64.as_deref(),
-        Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        intent_dto.expected_sha256_b64.as_str(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     );
     assert!(intent_dto.opaque_object_key.starts_with("upload-intents/"));
     assert_eq!(intent_dto.status, "initiated");

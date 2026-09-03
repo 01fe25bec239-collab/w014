@@ -155,13 +155,16 @@ pub struct DocumentVersionPage {
 }
 
 /// Request body for creating an upload intent.
+///
+/// WI0202/WI0203 authoritative transport contract: `sha256_b64` is REQUIRED.
+/// The OpenAPI schema must list it as a required property; requests without
+/// a checksum cannot be treated as valid authoritative create-upload requests.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateUploadIntentDto {
     pub filename: String,
     pub media_type: String,
     pub byte_length: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sha256_b64: Option<String>,
+    pub sha256_b64: String,
 }
 
 /// Presigned PUT contract returned in upload intent response.
@@ -174,6 +177,11 @@ pub struct PresignedPutDto {
 }
 
 /// Upload intent representation with presigned upload contract.
+///
+/// WI0202/WI0203 authoritative success truth: a successfully created intent
+/// always carries an expected SHA-256, so `expected_sha256_b64` is REQUIRED
+/// on the wire (not optional merely because the physical column is nullable
+/// for legacy rows).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct UploadIntentDto {
     pub id: String,
@@ -183,8 +191,7 @@ pub struct UploadIntentDto {
     pub filename: String,
     pub expected_media_type: String,
     pub expected_length: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_sha256_b64: Option<String>,
+    pub expected_sha256_b64: String,
     pub opaque_object_key: String,
     pub status: String,
     pub expires_at: DateTime<Utc>,
@@ -990,17 +997,17 @@ pub async fn create_upload_intent_handler(
     }
 
     // Mandatory SHA-256 validation (CREATE_UPLOAD_SHA256_REQUIRED: YES, SHA256_EMPTY_DIGEST_FALLBACK: ABSENT)
-    let sha256_raw = payload
-        .sha256_b64
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            ProblemDetails::bad_request(
-                "sha256_b64 is required: upload-intent checksum integrity is mandatory",
-                Some(req_path.clone()),
-            )
-        })?;
+    // Transport contract declares sha256_b64 as REQUIRED (non-Option String),
+    // so a missing property fails at serde/extractor time before reaching here.
+    // This runtime check additionally fails closed on empty/whitespace values.
+    let sha256_trimmed = payload.sha256_b64.trim();
+    if sha256_trimmed.is_empty() {
+        return Err(ProblemDetails::bad_request(
+            "sha256_b64 is required: upload-intent checksum integrity is mandatory",
+            Some(req_path.clone()),
+        ));
+    }
+    let sha256_raw = sha256_trimmed;
 
     let sha256 = Sha256::from_base64("sha256_b64", sha256_raw)
         .map_err(|e| ProblemDetails::bad_request(e.to_string(), Some(req_path.clone())))?;
@@ -1161,6 +1168,16 @@ pub async fn create_upload_intent_handler(
         other => ProblemDetails::internal_server_error(Some(other.to_string())),
     })?;
 
+    // Authoritative success truth: a successfully created intent always carries
+    // an expected SHA-256 (UPLOAD_INTENT_EXPECTED_SHA256_RUNTIME_REQUIRED: YES).
+    // Fail closed if the in-memory intent somehow lacks it; this is impossible
+    // for intents created through this handler.
+    let expected_sha256_b64 = intent
+        .expected_sha256_b64
+        .as_ref()
+        .map(|s| s.to_base64())
+        .ok_or_else(|| ProblemDetails::internal_server_error(Some(req_path.clone())))?;
+
     let dto = UploadIntentDto {
         id: intent.id.to_string(),
         workspace_id: intent.workspace_id.to_string(),
@@ -1168,7 +1185,7 @@ pub async fn create_upload_intent_handler(
         filename: intent.filename.clone(),
         expected_media_type: intent.expected_media_type.as_str().to_string(),
         expected_length: intent.expected_length,
-        expected_sha256_b64: intent.expected_sha256_b64.as_ref().map(|s| s.to_base64()),
+        expected_sha256_b64,
         opaque_object_key: intent.opaque_object_key.as_str().to_string(),
         status: intent.status.as_str().to_string(),
         expires_at: intent.expires_at,

@@ -438,10 +438,11 @@ async fn test_production_router_activates_wi0202_document_endpoints() {
     .await;
 
     // E20: POST /api/v1/workspaces/{workspace_id}/documents/{document_id}/upload-intents -> 401 Unauthenticated (route is registered, not 404)
+    // NOTE: sha256_b64 is REQUIRED; include it so the request reaches auth (not serde rejection).
     check_route(
         "POST",
         &format!("/api/v1/workspaces/{ws_id}/documents/{doc_id}/upload-intents"),
-        Some(r#"{"filename":"test.pdf","media_type":"application/pdf","byte_length":1024}"#),
+        Some(r#"{"filename":"test.pdf","media_type":"application/pdf","byte_length":1024,"sha256_b64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#),
         StatusCode::UNAUTHORIZED,
     )
     .await;

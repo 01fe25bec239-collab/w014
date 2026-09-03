@@ -1704,6 +1704,7 @@ async fn test_wi0203_gate18_oversize_upload_rejected() {
     let (cookie, csrf) = create_session_and_csrf(&db, user.id, &config).await;
 
     // E20 creation of oversized intent (>100 MiB) is rejected with 413 Payload Too Large
+    // NOTE: include required sha256_b64 so the request reaches the byte-length gate.
     let req = Request::builder()
         .uri(format!(
             "/api/v1/workspaces/{}/documents/{}/upload-intents",
@@ -1721,6 +1722,7 @@ async fn test_wi0203_gate18_oversize_upload_rejected() {
                 "filename": "huge.pdf",
                 "media_type": "application/pdf",
                 "byte_length": 104857601, // 100 MiB + 1
+                "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             })
             .to_string(),
         ))
@@ -1944,7 +1946,11 @@ async fn test_wi0203_gate22_sha256_mandatory_and_empty_digest_rejected() {
         d
     };
 
-    // 1. Missing sha256_b64 field -> 400 Bad Request
+    // 1. Missing sha256_b64 field -> transport contract REQUIRED violation.
+    // With sha256_b64 as a required String on CreateUploadIntentDto, axum's
+    // Json extractor rejects the missing property at the schema layer (422
+    // Unprocessable Entity). Any 4xx fail-closed rejection proves the request
+    // cannot be treated as a valid authoritative create-upload request.
     let req = Request::builder()
         .uri(format!(
             "/api/v1/workspaces/{}/documents/{}/upload-intents",
@@ -1966,7 +1972,12 @@ async fn test_wi0203_gate22_sha256_mandatory_and_empty_digest_rejected() {
         ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        resp.status() == StatusCode::UNPROCESSABLE_ENTITY
+            || resp.status() == StatusCode::BAD_REQUEST,
+        "missing sha256_b64 must fail closed, got {}",
+        resp.status()
+    );
 
     // 2. Empty string sha256_b64 -> 400 Bad Request
     let req = Request::builder()

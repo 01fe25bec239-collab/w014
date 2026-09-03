@@ -262,4 +262,114 @@ mod tests {
             .expect("E24 path must exist");
         assert!(e24.post.is_some(), "E24 POST method must exist");
     }
+
+    /// D1: WI0202/WI0203 authoritative transport contract must declare SHA-256 REQUIRED.
+    ///
+    /// Proves:
+    /// - CREATE_UPLOAD_REQUEST_SHA256_SCHEMA_REQUIRED: YES
+    /// - CREATE_UPLOAD_HANDLER_SHA256_REQUIRED: YES (via non-Option String type)
+    /// - OPENAPI_REQUIRED_PROPERTY: YES for both request and success DTOs
+    /// - CREATE_UPLOAD_SHA256_SCHEMA_REQUIRED: YES
+    #[test]
+    fn test_w2_d1_upload_sha256_openapi_required() {
+        let (_router, spec) = build_openapi_router();
+        let value =
+            serde_json::to_value(&spec).expect("OpenAPI spec should serialize to JSON value");
+
+        let schemas = value
+            .pointer("/components/schemas")
+            .expect("OpenAPI components.schemas must exist");
+
+        // --- CreateUploadIntentDto: sha256_b64 REQUIRED ---
+        let create_schema = schemas
+            .get("CreateUploadIntentDto")
+            .expect("CreateUploadIntentDto schema must exist");
+        let create_required = create_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("CreateUploadIntentDto must declare a required array");
+        let create_required_strs: Vec<&str> =
+            create_required.iter().filter_map(|v| v.as_str()).collect();
+        for field in ["filename", "media_type", "byte_length", "sha256_b64"] {
+            assert!(
+                create_required_strs.contains(&field),
+                "CreateUploadIntentDto.required must contain '{field}', got {create_required_strs:?}"
+            );
+        }
+        let create_props = create_schema
+            .get("properties")
+            .expect("CreateUploadIntentDto must declare properties");
+        assert!(
+            create_props.get("sha256_b64").is_some(),
+            "CreateUploadIntentDto.properties must contain sha256_b64"
+        );
+
+        // --- UploadIntentDto: expected_sha256_b64 REQUIRED (success truth) ---
+        let intent_schema = schemas
+            .get("UploadIntentDto")
+            .expect("UploadIntentDto schema must exist");
+        let intent_required = intent_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("UploadIntentDto must declare a required array");
+        let intent_required_strs: Vec<&str> =
+            intent_required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            intent_required_strs.contains(&"expected_sha256_b64"),
+            "UploadIntentDto.required must contain 'expected_sha256_b64', got {intent_required_strs:?}"
+        );
+        let intent_props = intent_schema
+            .get("properties")
+            .expect("UploadIntentDto must declare properties");
+        assert!(
+            intent_props.get("expected_sha256_b64").is_some(),
+            "UploadIntentDto.properties must contain expected_sha256_b64"
+        );
+    }
+
+    /// D1: serde-level proof that the authoritative request type cannot represent
+    /// a missing checksum as valid. `CreateUploadIntentDto` uses `String`
+    /// (not `Option<String>`), so deserializing without `sha256_b64` fails.
+    #[test]
+    fn test_w2_d1_create_upload_request_missing_sha256_invalid() {
+        use crate::routes::documents::CreateUploadIntentDto;
+
+        let missing = serde_json::json!({
+            "filename": "missing.pdf",
+            "media_type": "application/pdf",
+            "byte_length": 1024,
+        });
+        let err = serde_json::from_value::<CreateUploadIntentDto>(missing)
+            .expect_err("missing sha256_b64 must not deserialize as a valid request");
+        assert!(
+            err.to_string().contains("sha256_b64"),
+            "deserialization error must mention sha256_b64, got {err}"
+        );
+
+        // Success truth is also required: UploadIntentDto without expected digest is invalid.
+        use crate::routes::documents::UploadIntentDto;
+        let success_missing = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "workspace_id": "00000000-0000-0000-0000-000000000000",
+            "filename": "a.pdf",
+            "expected_media_type": "application/pdf",
+            "expected_length": 10,
+            "opaque_object_key": "upload-intents/k",
+            "status": "initiated",
+            "expires_at": "2030-01-01T00:00:00Z",
+            "created_at": "2030-01-01T00:00:00Z",
+            "presigned_put": {
+                "upload_url": "https://storage.local/x",
+                "method": "PUT",
+                "expires_at": "2030-01-01T00:00:00Z",
+                "headers": {}
+            }
+        });
+        let err = serde_json::from_value::<UploadIntentDto>(success_missing)
+            .expect_err("missing expected_sha256_b64 must not deserialize as valid success truth");
+        assert!(
+            err.to_string().contains("expected_sha256_b64"),
+            "deserialization error must mention expected_sha256_b64, got {err}"
+        );
+    }
 }
