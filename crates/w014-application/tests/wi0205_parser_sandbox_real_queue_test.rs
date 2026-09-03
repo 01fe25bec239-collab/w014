@@ -1159,7 +1159,8 @@ async fn test_wi0205_gate08_process_sandbox_runner_real_queue_enforcement() {
         "#;
 
         let runner = Arc::new(
-            ProcessSandboxRunner::new("/bin/sh")
+            ProcessSandboxRunner::new("sh")
+                .with_oci_image("ubuntu:24.04")
                 .with_platform_wrapper()
                 .with_args(["-c", success_script]),
         );
@@ -1222,7 +1223,8 @@ async fn test_wi0205_gate08_process_sandbox_runner_real_queue_enforcement() {
         // Runner generates massive output stream (exceeding bound during streaming)
         let overflow_script = "head -c 20000000 /dev/zero | tr '\\000' 'A'";
         let runner = Arc::new(
-            ProcessSandboxRunner::new("/bin/sh")
+            ProcessSandboxRunner::new("sh")
+                .with_oci_image("ubuntu:24.04")
                 .with_platform_wrapper()
                 .with_args(["-c", overflow_script]),
         );
@@ -1279,7 +1281,8 @@ async fn test_wi0205_gate08_process_sandbox_runner_real_queue_enforcement() {
             .unwrap();
 
         let runner = Arc::new(
-            ProcessSandboxRunner::new("/bin/sh")
+            ProcessSandboxRunner::new("sh")
+                .with_oci_image("ubuntu:24.04")
                 .with_platform_wrapper()
                 .with_args(["-c", "sleep 10"]),
         );
