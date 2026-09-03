@@ -81,14 +81,14 @@ pub use parser_blocks_row::{NewParserBlockRow, ParserBlockRow};
 pub use parser_pages_row::{NewParserPageRow, ParserPageRow};
 pub use quarantine_records_row::{NewQuarantineRecordRow, QuarantineRecordRow};
 pub use sandbox::{
-    FROZEN_MAX_CPU_CORES, FROZEN_MAX_MEMORY_BYTES, FROZEN_MAX_OUTPUT_BYTES, FROZEN_MAX_PIDS,
-    FROZEN_MAX_TMPFS_BYTES, FROZEN_MAX_WALL_CLOCK_SECS, MAX_BOUNDED_BLOCK_COUNT,
-    MAX_BOUNDED_PAGE_COUNT, MAX_BOUNDED_SPAN_COUNT, MAX_EXECUTION_DURATION_MS, MockSandboxBehavior,
-    MockSandboxRunner, NON_ROOT_GID, NON_ROOT_UID, OutputValidationError, PdfSandboxRunner,
-    ProcessSandboxRunner, SANDBOX_PROTOCOL_VERSION, SandboxCredentialsPolicy, SandboxError,
-    SandboxFilesystemPolicy, SandboxInput, SandboxNetworkPolicy, SandboxOutput,
-    SandboxProcessPolicy, SandboxResourceCeilings, SandboxRunner, SandboxSecurityProfile,
-    SandboxStatus,
+    ENV_PARSER_SANDBOX_WRAPPER_ARGS, ENV_PARSER_SANDBOX_WRAPPER_BIN, FROZEN_MAX_CPU_CORES,
+    FROZEN_MAX_MEMORY_BYTES, FROZEN_MAX_OUTPUT_BYTES, FROZEN_MAX_PIDS, FROZEN_MAX_TMPFS_BYTES,
+    FROZEN_MAX_WALL_CLOCK_SECS, MAX_BOUNDED_BLOCK_COUNT, MAX_BOUNDED_PAGE_COUNT,
+    MAX_BOUNDED_SPAN_COUNT, MAX_EXECUTION_DURATION_MS, MockSandboxBehavior, MockSandboxRunner,
+    NON_ROOT_GID, NON_ROOT_UID, OutputValidationError, PdfSandboxRunner, ProcessSandboxRunner,
+    SANDBOX_PROTOCOL_VERSION, SandboxCredentialsPolicy, SandboxError, SandboxFilesystemPolicy,
+    SandboxInput, SandboxNetworkPolicy, SandboxOutput, SandboxProcessPolicy,
+    SandboxResourceCeilings, SandboxRunner, SandboxSecurityProfile, SandboxStatus,
 };
 pub use scanner::{
     ClamAvClient, ClamAvConfig, ClamAvVersionInfo, DEFAULT_SCAN_TIMEOUT_SECS, EICAR_TEST_SIGNATURE,

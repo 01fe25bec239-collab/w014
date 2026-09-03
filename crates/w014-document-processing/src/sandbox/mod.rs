@@ -27,7 +27,9 @@ pub use output::{
     SandboxStatus,
 };
 pub use pdf::PdfSandboxRunner;
-pub use process::ProcessSandboxRunner;
+pub use process::{
+    ENV_PARSER_SANDBOX_WRAPPER_ARGS, ENV_PARSER_SANDBOX_WRAPPER_BIN, ProcessSandboxRunner,
+};
 pub use profile::{
     FROZEN_MAX_CPU_CORES, FROZEN_MAX_MEMORY_BYTES, FROZEN_MAX_OUTPUT_BYTES, FROZEN_MAX_PIDS,
     FROZEN_MAX_TMPFS_BYTES, FROZEN_MAX_WALL_CLOCK_SECS, NON_ROOT_GID, NON_ROOT_UID,

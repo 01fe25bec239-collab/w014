@@ -25,15 +25,17 @@ use w014_application::services::{
     DocumentService, MalwareScanJobExecutor, MembershipService, ParserSandboxJobExecutor,
 };
 use w014_authz::AuthorizedWorkspaceContext;
-use w014_document_processing::sandbox::MockSandboxRunner;
+use w014_document_processing::sandbox::{
+    MockSandboxRunner, ProcessSandboxRunner, SandboxError, SandboxInput, SandboxSecurityProfile,
+};
 use w014_document_processing::scanner::MockClamAvScanner;
-use w014_domain::ids::{DocumentVersionId, ObjectArtifactId};
+use w014_domain::ids::{DocumentVersionId, ObjectArtifactId, WorkspaceId};
 use w014_domain::membership::MembershipRole;
 use w014_domain::organization::Organization;
 use w014_domain::principal::Principal;
 use w014_domain::program::Program;
 use w014_domain::workspace::Workspace;
-use w014_domain::{MediaType, Sha256, UploadIntent};
+use w014_domain::{MediaType, Sha256, StoredMediaType, UploadIntent};
 use w014_jobs::job_identity::CanonicalJobIdentity;
 use w014_jobs::kind::{JobKind, QUEUE_DOCUMENT_PARSE, QUEUE_MALWARE_SCAN};
 use w014_jobs::models::{ClaimCriteria, WorkspaceScope};
@@ -47,7 +49,8 @@ use w014_persistence::harness::TestDatabase;
 use w014_persistence::idempotency::PostgresIdempotencyStore;
 use w014_persistence::runner::{MIGRATOR, MigrationRunner};
 use w014_worker::{
-    DEFAULT_PARSER_SANDBOX_BIN, ENV_PARSER_SANDBOX_BIN, build_production_executor_registry,
+    DEFAULT_PARSER_SANDBOX_BIN, ENV_PARSER_SANDBOX_BIN, ENV_PARSER_SANDBOX_WRAPPER_ARGS,
+    ENV_PARSER_SANDBOX_WRAPPER_BIN, build_production_executor_registry,
     create_default_sandbox_runner,
 };
 
@@ -846,7 +849,129 @@ fn test_default_sandbox_runner_factory() {
     // Default binary path is "w014-parser-sandbox"
     assert_eq!(DEFAULT_PARSER_SANDBOX_BIN, "w014-parser-sandbox");
     assert_eq!(ENV_PARSER_SANDBOX_BIN, "W014_PARSER_SANDBOX_BIN");
+    assert_eq!(
+        ENV_PARSER_SANDBOX_WRAPPER_BIN,
+        "W014_PARSER_SANDBOX_WRAPPER_BIN"
+    );
+    assert_eq!(
+        ENV_PARSER_SANDBOX_WRAPPER_ARGS,
+        "W014_PARSER_SANDBOX_WRAPPER_ARGS"
+    );
     drop(runner);
+}
+
+static PROD_SANDBOX_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct ScopedEnvVarReset(&'static str);
+impl Drop for ScopedEnvVarReset {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var(self.0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_production_sandbox_runner_composition_and_fail_closed_boundaries() {
+    let _lock = PROD_SANDBOX_TEST_MUTEX.lock().await;
+
+    let profile = SandboxSecurityProfile::frozen_default();
+    let sample_bytes = b"%PDF-1.7 scoped test bytes".to_vec();
+    let input = SandboxInput::new(
+        WorkspaceId::new(),
+        DocumentVersionId::new(),
+        ObjectArtifactId::new(),
+        Uuid::new_v4(),
+        StoredMediaType::new("application/pdf").unwrap(),
+        Sha256::digest(&sample_bytes),
+        sample_bytes.len() as i64,
+        sample_bytes,
+    )
+    .unwrap();
+
+    // 1. PRODUCTION_WRAPPER_COMPOSED & PRODUCTION_RUNNER_USES_ACCEPTED_ISOLATION:
+    // Production runner executes real sandboxed child process rather than MockSandboxRunner
+    // or direct unwrapped execution.
+    let runner = create_default_sandbox_runner();
+    let res = runner.run(&profile, &input).await;
+    assert!(
+        res.is_err(),
+        "Production runner must execute real sandboxed child process, not return mock success"
+    );
+    let err = res.unwrap_err();
+
+    if ProcessSandboxRunner::platform_default_wrapper().is_some() {
+        // Platform wrapper is available: wrapper was resolved and executed.
+        // It must NOT fail with MISSING_ISOLATION_WRAPPER.
+        match &err {
+            SandboxError::SandboxViolation { violation_type, .. } => {
+                assert_ne!(
+                    violation_type, "MISSING_ISOLATION_WRAPPER",
+                    "Production runner must have platform wrapper composed when platform wrapper is available"
+                );
+            }
+            SandboxError::ProcessCrash { .. } | SandboxError::IO { .. } => {
+                // Expected: wrapper executed and failed to exec non-existent dummy binary
+            }
+            other => panic!("Unexpected error from sandboxed runner execution: {other:?}"),
+        }
+    } else {
+        // Platform wrapper is not available on host: must fail closed without unsandboxed fallback.
+        match &err {
+            SandboxError::SandboxViolation { violation_type, .. } => {
+                assert_eq!(
+                    violation_type, "MISSING_ISOLATION_WRAPPER",
+                    "Missing platform wrapper on host must fail closed with MISSING_ISOLATION_WRAPPER"
+                );
+            }
+            other => panic!(
+                "Expected MISSING_ISOLATION_WRAPPER when no platform wrapper exists, got {other:?}"
+            ),
+        }
+    }
+
+    // 2. INVALID_WRAPPER_FAILS_CLOSED:
+    // Server-controlled environment wrapper configuration that points to nonexistent binary must fail closed.
+    {
+        let _reset = ScopedEnvVarReset(ENV_PARSER_SANDBOX_WRAPPER_BIN);
+        unsafe {
+            std::env::set_var(
+                ENV_PARSER_SANDBOX_WRAPPER_BIN,
+                "/nonexistent/bin/w014-invalid-sandbox-wrapper-404",
+            );
+        }
+        let runner_invalid = create_default_sandbox_runner();
+        let res_invalid = runner_invalid.run(&profile, &input).await;
+        match res_invalid {
+            Err(SandboxError::SandboxViolation { violation_type, .. }) => {
+                assert_eq!(
+                    violation_type, "ISOLATION_WRAPPER_NOT_FOUND",
+                    "Invalid wrapper must fail closed with ISOLATION_WRAPPER_NOT_FOUND"
+                );
+            }
+            other => panic!("Expected ISOLATION_WRAPPER_NOT_FOUND, got {other:?}"),
+        }
+    }
+
+    // 3. MISSING_WRAPPER_FAILS_CLOSED:
+    // Empty wrapper configuration in environment must fail closed.
+    {
+        let _reset = ScopedEnvVarReset(ENV_PARSER_SANDBOX_WRAPPER_BIN);
+        unsafe {
+            std::env::set_var(ENV_PARSER_SANDBOX_WRAPPER_BIN, "");
+        }
+        let runner_empty = create_default_sandbox_runner();
+        let res_empty = runner_empty.run(&profile, &input).await;
+        match res_empty {
+            Err(SandboxError::SandboxViolation { violation_type, .. }) => {
+                assert_eq!(
+                    violation_type, "MISSING_ISOLATION_WRAPPER",
+                    "Empty wrapper configuration must fail closed with MISSING_ISOLATION_WRAPPER"
+                );
+            }
+            other => panic!("Expected MISSING_ISOLATION_WRAPPER, got {other:?}"),
+        }
+    }
 }
 
 #[test]

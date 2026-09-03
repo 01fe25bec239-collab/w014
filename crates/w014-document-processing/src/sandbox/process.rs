@@ -28,6 +28,29 @@ use super::profile::{
 };
 use super::traits::SandboxRunner;
 
+/// Environment variable to override or configure the parser sandbox wrapper binary path.
+pub const ENV_PARSER_SANDBOX_WRAPPER_BIN: &str = "W014_PARSER_SANDBOX_WRAPPER_BIN";
+
+/// Environment variable to provide additional parser sandbox wrapper arguments.
+pub const ENV_PARSER_SANDBOX_WRAPPER_ARGS: &str = "W014_PARSER_SANDBOX_WRAPPER_ARGS";
+
+fn which_in_path(executable: &std::path::Path) -> Option<PathBuf> {
+    if executable.is_absolute() || executable.components().count() > 1 {
+        if executable.is_file() {
+            return Some(executable.to_path_buf());
+        }
+        return None;
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(executable);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Process sandbox runner that launches an external isolated process/harness.
 #[derive(Debug, Clone)]
 pub struct ProcessSandboxRunner {
@@ -70,6 +93,122 @@ impl ProcessSandboxRunner {
         self.wrapper_binary = Some(wrapper.into());
         self.wrapper_args = args.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// Discovers the platform-default isolation wrapper and returns its binary path and arguments.
+    #[must_use]
+    pub fn platform_default_wrapper() -> Option<(PathBuf, Vec<String>)> {
+        #[cfg(target_os = "linux")]
+        {
+            const BWRAP_PATH: &str = "/usr/bin/bwrap";
+            let bwrap_candidate = if std::path::Path::new(BWRAP_PATH).is_file() {
+                Some(PathBuf::from(BWRAP_PATH))
+            } else {
+                which_in_path(std::path::Path::new("bwrap"))
+            };
+
+            if let Some(bwrap) = bwrap_candidate {
+                let default_bwrap_args = vec![
+                    "--unshare-all".to_string(),
+                    "--ro-bind".to_string(),
+                    "/".to_string(),
+                    "/".to_string(),
+                    "--tmpfs".to_string(),
+                    "/tmp".to_string(),
+                    "--size".to_string(),
+                    "1073741824".to_string(),
+                    "--dev".to_string(),
+                    "/dev".to_string(),
+                    "--proc".to_string(),
+                    "/proc".to_string(),
+                    "--uid".to_string(),
+                    "65534".to_string(),
+                    "--gid".to_string(),
+                    "65534".to_string(),
+                    "--cap-drop".to_string(),
+                    "ALL".to_string(),
+                    "--new-session".to_string(),
+                    "--die-with-parent".to_string(),
+                ];
+                return Some((bwrap, default_bwrap_args));
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+            if std::path::Path::new(SANDBOX_EXEC_PATH).is_file() {
+                let seatbelt_profile = "(version 1) (deny default) (allow process-exec) (allow process-fork) (allow sysctl-read) (allow file-read*) (allow file-write* (subpath \"/private/tmp\")) (allow file-write* (subpath \"/tmp\")) (deny network*)".to_string();
+                return Some((
+                    PathBuf::from(SANDBOX_EXEC_PATH),
+                    vec!["-p".to_string(), seatbelt_profile],
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// Configures the platform-native isolation wrapper if available on the host system.
+    #[must_use]
+    pub fn with_platform_wrapper(mut self) -> Self {
+        if let Some((wrapper_bin, wrapper_args)) = Self::platform_default_wrapper() {
+            self.wrapper_binary = Some(wrapper_bin);
+            self.wrapper_args = wrapper_args;
+        }
+        self
+    }
+
+    /// Resolves the authoritative isolation wrapper executable and arguments.
+    ///
+    /// # Errors
+    /// Returns `SandboxError::SandboxViolation` if:
+    /// - An explicit wrapper is configured but does not exist on disk (`ISOLATION_WRAPPER_NOT_FOUND`)
+    /// - An environment wrapper is configured but does not exist on disk (`ISOLATION_WRAPPER_NOT_FOUND`)
+    /// - No isolation wrapper is configured or available (`MISSING_ISOLATION_WRAPPER`)
+    ///
+    /// Direct, unsandboxed execution on the host filesystem is strictly prohibited and fails closed.
+    pub fn resolve_isolation_wrapper(&self) -> Result<(PathBuf, Vec<String>), SandboxError> {
+        // 1. Explicit wrapper configured on runner instance
+        if let Some(ref wrapper) = self.wrapper_binary {
+            if !wrapper.is_file() && which_in_path(wrapper).is_none() {
+                return Err(SandboxError::SandboxViolation {
+                    violation_type: "ISOLATION_WRAPPER_NOT_FOUND".to_string(),
+                    detail: format!(
+                        "Configured sandbox isolation wrapper '{wrapper:?}' was not found on host filesystem"
+                    ),
+                });
+            }
+            return Ok((wrapper.clone(), self.wrapper_args.clone()));
+        }
+
+        // 2. Wrapper configured via environment variable W014_PARSER_SANDBOX_WRAPPER_BIN
+        if let Ok(env_wrapper) = std::env::var(ENV_PARSER_SANDBOX_WRAPPER_BIN) {
+            let env_wrapper = env_wrapper.trim();
+            if !env_wrapper.is_empty() {
+                let wrapper_path = PathBuf::from(env_wrapper);
+                if !wrapper_path.is_file() && which_in_path(&wrapper_path).is_none() {
+                    return Err(SandboxError::SandboxViolation {
+                        violation_type: "ISOLATION_WRAPPER_NOT_FOUND".to_string(),
+                        detail: format!(
+                            "Environment isolation wrapper '{env_wrapper}' ({ENV_PARSER_SANDBOX_WRAPPER_BIN}) was not found on host filesystem"
+                        ),
+                    });
+                }
+                let mut args = Vec::new();
+                if let Ok(env_args) = std::env::var(ENV_PARSER_SANDBOX_WRAPPER_ARGS) {
+                    args.extend(env_args.split_whitespace().map(String::from));
+                }
+                return Ok((wrapper_path, args));
+            }
+        }
+
+        // 3. Missing isolation wrapper: FAIL CLOSED.
+        // Direct unisolated host execution of untrusted parser binaries is strictly prohibited.
+        Err(SandboxError::SandboxViolation {
+            violation_type: "MISSING_ISOLATION_WRAPPER".to_string(),
+            detail: "Parser sandbox security profile requires an authoritative isolation wrapper or container harness to enforce OS isolation boundaries (read-only root, network isolation, drop capabilities, non-root uid); unisolated direct execution is strictly prohibited".to_string(),
+        })
     }
 
     /// Validates that all mandatory frozen sandbox boundary invariants are strictly satisfied.
@@ -215,18 +354,15 @@ impl SandboxRunner for ProcessSandboxRunner {
             })
         })?;
 
-        // 3. Build command with scrubbed environment and process-level isolation
-        let (program, args) = if let Some(ref wrapper) = self.wrapper_binary {
-            let mut combined_args = self.wrapper_args.clone();
-            combined_args.push(self.binary_path.to_string_lossy().to_string());
-            combined_args.extend(self.extra_args.clone());
-            (wrapper.clone(), combined_args)
-        } else {
-            (self.binary_path.clone(), self.extra_args.clone())
-        };
+        // 3. Resolve mandatory isolation wrapper (Fail Closed if missing or invalid)
+        let (wrapper_program, wrapper_args) = self.resolve_isolation_wrapper()?;
 
-        let mut cmd = Command::new(&program);
-        cmd.args(&args);
+        let mut combined_args = wrapper_args;
+        combined_args.push(self.binary_path.to_string_lossy().to_string());
+        combined_args.extend(self.extra_args.clone());
+
+        let mut cmd = Command::new(&wrapper_program);
+        cmd.args(&combined_args);
 
         // Clear all inherited environment variables
         cmd.env_clear();
