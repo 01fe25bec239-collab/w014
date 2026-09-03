@@ -27,6 +27,12 @@ pub const PINNED_PDFIUM_VERSION_STR: &str = "pdfium-151.0.7881.0";
 pub const KNOWN_AUTHORITATIVE_PDFIUM_SHA256: &[&str] = &[
     // macOS arm64 release build 7881
     "1bc45b15466b34cef96641ce25c77a876e70010c6b114f909dda2f5325fc5bd7",
+    // macOS x86_64 release build 7881
+    "4eaad6c3e8d786cf6f66a45d7d014edf5c65f372f98c3070e66595ebb50e43d9",
+    // Linux x86_64 release build 7881
+    "f728930966f503652b92acc89b9374a2eeca00ce42e26dccd3e4b5c5161b2d64",
+    // Linux aarch64 release build 7881
+    "6252fce3da45e7f0dc5b27f4d4e1a1456ca3f7734cdb04f927967df772127478",
 ];
 
 static AUTHORITATIVE_PDFIUM: OnceLock<Pdfium> = OnceLock::new();
@@ -38,7 +44,23 @@ pub fn lock_pdfium() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Resolves the candidate path for the PDFium dynamic library.
-fn resolve_candidate_library_path() -> Result<PathBuf, ParserFailure> {
+///
+/// Discovers candidates deterministically from:
+/// 1. `PDFIUM_LIB_PATH` environment variable (file or directory).
+/// 2. Crate and repository fixture directories.
+/// 3. Relative working directory and crate paths.
+/// 4. Executable / Cargo target directories.
+/// 5. Dynamic linker search directories (`DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH`).
+/// 6. Standard platform system library locations.
+///
+/// Security:
+/// Candidate path alone is NOT authority; filename alone is NOT authority.
+/// Candidates MUST undergo cryptographic binary SHA-256 and version verification.
+/// An unverified candidate causes immediate fail-closed rejection.
+pub fn resolve_candidate_library_path() -> Result<PathBuf, ParserFailure> {
+    let platform_name = Pdfium::pdfium_platform_library_name();
+
+    // 1. Explicit override via PDFIUM_LIB_PATH
     if let Ok(path_str) = std::env::var("PDFIUM_LIB_PATH") {
         let trimmed = path_str.trim();
         if trimmed.is_empty() {
@@ -46,31 +68,109 @@ fn resolve_candidate_library_path() -> Result<PathBuf, ParserFailure> {
                 "PDFIUM_LIB_PATH environment variable is empty".to_string(),
             ));
         }
-        let path = PathBuf::from(trimmed);
-        if !path.exists() {
+        let raw_path = PathBuf::from(trimmed);
+        let resolved = if raw_path.is_dir() {
+            raw_path.join(&platform_name)
+        } else {
+            raw_path
+        };
+        if !resolved.exists() {
             return Err(ParserFailure::PdfiumUnavailable(format!(
                 "Configured PDFIUM_LIB_PATH does not exist: {trimmed}"
             )));
         }
-        if !path.is_file() {
+        if !resolved.is_file() {
             return Err(ParserFailure::PdfiumUnavailable(format!(
                 "Configured PDFIUM_LIB_PATH is not a regular file: {trimmed}"
             )));
         }
-        Ok(path)
-    } else {
-        // Check platform default library name in system library paths
-        let default_name = Pdfium::pdfium_platform_library_name();
-        let default_path = PathBuf::from(&default_name);
-        if default_path.exists() && default_path.is_file() {
-            Ok(default_path)
-        } else {
-            Err(ParserFailure::PdfiumUnavailable(
-                "PDFium dynamic library is not installed or configured via PDFIUM_LIB_PATH"
-                    .to_string(),
-            ))
+        // Explicitly configured path must be verified
+        verify_pdfium_library_identity(&resolved)?;
+        return Ok(resolved);
+    }
+
+    // 2. Discover deterministic platform candidates
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+
+    // Crate and repository fixture paths
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    candidate_paths.push(manifest_dir.join("fixtures").join(&platform_name));
+    candidate_paths.push(manifest_dir.join("lib").join(&platform_name));
+    candidate_paths.push(
+        manifest_dir
+            .join("../..")
+            .join("fixtures")
+            .join(&platform_name),
+    );
+
+    // Working directory and relative workspace paths
+    candidate_paths
+        .push(PathBuf::from("crates/w014-document-processing/fixtures").join(&platform_name));
+    candidate_paths.push(PathBuf::from("fixtures").join(&platform_name));
+    candidate_paths.push(PathBuf::from(&platform_name));
+
+    // Executable directory and Target directory paths
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+    {
+        candidate_paths.push(exe_dir.join(&platform_name));
+        candidate_paths.push(exe_dir.join("deps").join(&platform_name));
+        if let Some(parent) = exe_dir.parent() {
+            candidate_paths.push(parent.join(&platform_name));
         }
     }
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        let t = PathBuf::from(target_dir.trim());
+        candidate_paths.push(t.join(&platform_name));
+        candidate_paths.push(t.join("debug").join(&platform_name));
+        candidate_paths.push(t.join("release").join(&platform_name));
+    }
+
+    // Dynamic linker library search paths
+    #[cfg(target_os = "macos")]
+    let dyld_var = "DYLD_LIBRARY_PATH";
+    #[cfg(not(target_os = "macos"))]
+    let dyld_var = "LD_LIBRARY_PATH";
+    if let Ok(lib_paths) = std::env::var(dyld_var) {
+        for dir in std::env::split_paths(&lib_paths) {
+            candidate_paths.push(dir.join(&platform_name));
+        }
+    }
+
+    // Standard platform system library locations
+    #[cfg(target_os = "macos")]
+    {
+        candidate_paths.push(PathBuf::from("/opt/homebrew/lib").join(&platform_name));
+        candidate_paths.push(PathBuf::from("/usr/local/lib").join(&platform_name));
+        candidate_paths.push(PathBuf::from("/usr/lib").join(&platform_name));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        candidate_paths.push(PathBuf::from("/usr/local/lib").join(&platform_name));
+        candidate_paths.push(PathBuf::from("/usr/lib").join(&platform_name));
+        candidate_paths.push(PathBuf::from("/usr/lib/x86_64-linux-gnu").join(&platform_name));
+        candidate_paths.push(PathBuf::from("/usr/lib/aarch64-linux-gnu").join(&platform_name));
+        candidate_paths.push(PathBuf::from("/lib").join(&platform_name));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        candidate_paths.push(PathBuf::from(r"C:\Windows\System32").join(&platform_name));
+    }
+
+    // Evaluate candidates deterministically:
+    // If a candidate exists, it MUST pass identity and version verification.
+    // An unverified candidate file fails closed immediately.
+    for candidate in candidate_paths {
+        if candidate.exists() && candidate.is_file() {
+            // Verify binary hash and version
+            verify_pdfium_library_identity(&candidate)?;
+            return Ok(candidate);
+        }
+    }
+
+    Err(ParserFailure::PdfiumUnavailable(
+        "PDFium dynamic library is not installed or configured via PDFIUM_LIB_PATH".to_string(),
+    ))
 }
 
 /// Verifies that the native library at `path` matches the pinned PDFium identity and version.

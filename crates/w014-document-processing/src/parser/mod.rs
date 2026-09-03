@@ -26,8 +26,8 @@ pub use normalization::{
 pub use pdf_parser::PdfSafeParser;
 pub use pdfium_backend::{
     PINNED_PDFIUM_BUILD, PINNED_PDFIUM_MAJOR, PINNED_PDFIUM_VERSION_STR, get_authoritative_pdfium,
-    get_pdfium, lock_pdfium, pdfium_version_info, verify_pdfium_library_identity,
-    verify_pdfium_library_identity_with_expected,
+    get_pdfium, lock_pdfium, pdfium_version_info, resolve_candidate_library_path,
+    verify_pdfium_library_identity, verify_pdfium_library_identity_with_expected,
 };
 pub use request::{
     DEFAULT_LOCATOR_VERSION, DEFAULT_PARSER_PROFILE_VERSION, DEFAULT_TEXT_NORMALIZATION_VERSION,
