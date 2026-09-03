@@ -61,6 +61,22 @@ pub enum ParserFailure {
     #[error("I/O error during parse: {0}")]
     Io(String),
 
+    /// Authoritative PDFium backend is unavailable or not found.
+    #[error("Authoritative PDFium backend is unavailable: {0}")]
+    PdfiumUnavailable(String),
+
+    /// Authoritative PDFium backend failed to bind or load dynamic library.
+    #[error("Authoritative PDFium backend bind failure: {0}")]
+    PdfiumBindFailure(String),
+
+    /// Authoritative PDFium backend identity or version could not be verified.
+    #[error("Authoritative PDFium identity or version unverifiable: {0}")]
+    PdfiumUnverified(String),
+
+    /// PDFium native page text extraction error.
+    #[error("PDFium native page text extraction error: {0}")]
+    PageTextExtractionFailed(String),
+
     /// Internal parser execution error.
     #[error("Internal parser failure: {0}")]
     Internal(String),
@@ -82,6 +98,10 @@ impl ParserFailure {
             | Self::RasterLimitExceeded { .. }
             | Self::InputChecksumMismatch { .. }
             | Self::Io(_)
+            | Self::PdfiumUnavailable(_)
+            | Self::PdfiumBindFailure(_)
+            | Self::PdfiumUnverified(_)
+            | Self::PageTextExtractionFailed(_)
             | Self::Internal(_) => SandboxStatus::Failed,
         }
     }
@@ -101,6 +121,10 @@ impl ParserFailure {
             Self::CorruptedFile(_) => "CORRUPTED_PDF",
             Self::InputChecksumMismatch { .. } => "INPUT_CHECKSUM_MISMATCH",
             Self::Io(_) => "PARSER_IO_ERROR",
+            Self::PdfiumUnavailable(_) => "PDFIUM_UNAVAILABLE",
+            Self::PdfiumBindFailure(_) => "PDFIUM_BIND_FAILURE",
+            Self::PdfiumUnverified(_) => "PDFIUM_UNVERIFIED",
+            Self::PageTextExtractionFailed(_) => "PAGE_TEXT_EXTRACTION_ERROR",
             Self::Internal(_) => "PARSER_INTERNAL_ERROR",
         }
     }

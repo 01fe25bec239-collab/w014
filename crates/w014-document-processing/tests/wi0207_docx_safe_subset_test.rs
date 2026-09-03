@@ -603,3 +603,57 @@ async fn test_overall_ocr_job_budget_exhaustion_and_decrease_across_pages() {
         "Job exceeding total wall-clock budget must fail closed"
     );
 }
+
+#[test]
+fn test_ooxmlsdk_authoritative_safe_subset_path_execution() {
+    let doc_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+        <w:body>
+            <w:p>
+                <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+                <w:r><w:t>OOXMLSDK Authoritative Heading</w:t></w:r>
+            </w:p>
+            <w:p>
+                <w:r><w:t>First paragraph under authoritative heading.</w:t></w:r>
+                <w:r><w:br w:type="page"/></w:r>
+            </w:p>
+            <w:p>
+                <w:r><w:t>Second page content.</w:t></w:r>
+            </w:p>
+            <w:tbl>
+                <w:tr>
+                    <w:tc><w:p><w:r><w:t>Cell 1</w:t></w:r></w:p></w:tc>
+                    <w:tc><w:p><w:r><w:t>Cell 2</w:t></w:r></w:p></w:tc>
+                </w:tr>
+            </w:tbl>
+        </w:body>
+    </w:document>"#;
+
+    let docx_bytes = DocxBuilder::new().with_document_xml(doc_xml).build();
+
+    let parsed = DocxParser::parse_from_bytes(&docx_bytes)
+        .expect("ooxmlsdk authoritative parse must succeed");
+
+    assert_eq!(parsed.pages.len(), 2, "Must segment into exactly 2 pages");
+    assert_eq!(parsed.pages[0].page_number, 1);
+    assert_eq!(parsed.pages[0].blocks.len(), 2);
+    assert_eq!(parsed.pages[0].blocks[0].kind, BlockKind::Heading);
+    assert_eq!(
+        parsed.pages[0].blocks[0].text,
+        "OOXMLSDK Authoritative Heading"
+    );
+    assert_eq!(
+        parsed.pages[0].blocks[0].section_path,
+        vec!["OOXMLSDK Authoritative Heading"]
+    );
+
+    assert_eq!(parsed.pages[1].page_number, 2);
+    assert_eq!(parsed.pages[1].blocks[0].kind, BlockKind::Paragraph);
+    assert_eq!(parsed.pages[1].blocks[0].text, "Second page content.");
+
+    // Table cells on page 2
+    assert_eq!(parsed.pages[1].blocks[1].kind, BlockKind::TableCell);
+    assert_eq!(parsed.pages[1].blocks[1].text, "Cell 1");
+    assert_eq!(parsed.pages[1].blocks[2].kind, BlockKind::TableCell);
+    assert_eq!(parsed.pages[1].blocks[2].text, "Cell 2");
+}

@@ -589,3 +589,106 @@ async fn test_pdfium_parse_failure_fail_closed_prevents_heuristic_fallback_matri
         );
     }
 }
+
+#[test]
+fn test_pdfium_unavailable_fails_closed_without_fallback() {
+    use std::path::Path;
+    use w014_document_processing::parser::verify_pdfium_library_identity;
+
+    let non_existent = Path::new("/nonexistent/path/to/libpdfium.dylib");
+    let err = verify_pdfium_library_identity(non_existent)
+        .expect_err("Must fail closed when PDFium is unavailable");
+
+    assert!(
+        matches!(err, ParserFailure::PdfiumUnavailable(_)),
+        "Expected PdfiumUnavailable, got: {:?}",
+        err
+    );
+    assert_eq!(err.failure_code(), "PDFIUM_UNAVAILABLE");
+    assert_eq!(
+        err.status(),
+        w014_document_processing::sandbox::SandboxStatus::Failed
+    );
+}
+
+#[test]
+fn test_pdfium_unverified_hash_fails_closed() {
+    use w014_document_processing::parser::{
+        resolve_candidate_library_path, verify_pdfium_library_identity_with_expected,
+    };
+
+    let lib_path = resolve_candidate_library_path().expect(
+        "Authoritative PDFium library must be resolvable via deterministic candidate discovery",
+    );
+
+    let mismatching_sha = "0000000000000000000000000000000000000000000000000000000000000000";
+    let verify_result =
+        verify_pdfium_library_identity_with_expected(&lib_path, Some(mismatching_sha), None);
+
+    let err = verify_result.expect_err("Must reject binary with hash mismatch");
+    assert!(
+        matches!(err, ParserFailure::PdfiumUnverified(_)),
+        "Expected PdfiumUnverified, got: {:?}",
+        err
+    );
+    assert_eq!(err.failure_code(), "PDFIUM_UNVERIFIED");
+}
+
+#[test]
+fn test_pdfium_invalid_version_fails_closed() {
+    use w014_document_processing::parser::{
+        resolve_candidate_library_path, verify_pdfium_library_identity_with_expected,
+    };
+
+    let lib_path = resolve_candidate_library_path().expect(
+        "Authoritative PDFium library must be resolvable via deterministic candidate discovery",
+    );
+
+    let unpinned_version = "9999";
+    let verify_result =
+        verify_pdfium_library_identity_with_expected(&lib_path, None, Some(unpinned_version));
+
+    let err = verify_result.expect_err("Must reject unpinned version");
+    assert!(
+        matches!(err, ParserFailure::PdfiumUnverified(_)),
+        "Expected PdfiumUnverified, got: {:?}",
+        err
+    );
+    assert_eq!(err.failure_code(), "PDFIUM_UNVERIFIED");
+}
+
+#[test]
+fn test_arbitrary_native_library_rejected_fail_closed() {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use w014_document_processing::parser::verify_pdfium_library_identity;
+
+    let mut temp_file = NamedTempFile::new().expect("create tempfile");
+    temp_file
+        .write_all(b"arbitrary non-pdfium binary payload")
+        .expect("write temp binary");
+    let temp_path = temp_file.path();
+
+    // Verification against pinned release catalog must fail closed
+    let err = verify_pdfium_library_identity(temp_path)
+        .expect_err("Arbitrary native library must not be trusted");
+
+    assert!(
+        matches!(err, ParserFailure::PdfiumUnverified(_)),
+        "Expected PdfiumUnverified for arbitrary native library, got: {:?}",
+        err
+    );
+    assert_eq!(err.failure_code(), "PDFIUM_UNVERIFIED");
+}
+
+#[test]
+fn test_page_text_extraction_failure_fails_closed_no_empty_success() {
+    let err = ParserFailure::PageTextExtractionFailed(
+        "Simulated PDFium native text extraction internal crash".to_string(),
+    );
+    assert_eq!(err.failure_code(), "PAGE_TEXT_EXTRACTION_ERROR");
+    assert_eq!(
+        err.status(),
+        w014_document_processing::sandbox::SandboxStatus::Failed
+    );
+}
