@@ -479,7 +479,57 @@ async fn test_e18_get_document_by_id_and_idor_protection() {
 }
 
 #[tokio::test]
+async fn test_e20_unconfigured_s3_fails_closed() {
+    let _unconfigured = DocumentService::scoped_unconfigured_storage().await;
+    let db = provision_migrated_db().await;
+    let config = create_test_config();
+    let app = create_test_app(&config, db.pool().clone());
+
+    let org = create_org(&db, "Org 20 Fail Closed", "org-20-fail-closed").await;
+    let prog = create_program(&db, org.id, "Prog 20 Fail Closed", "prog-20-fail-closed").await;
+    let ws = create_workspace(&db, &prog, "WS 20 Fail Closed", "ws-20-fail-closed").await;
+
+    let user = create_principal(&db, org.id, "user20fc@test.com", "User 20 Fail Closed").await;
+    add_membership(&db, ws.id, user.id, MembershipRole::Operator).await;
+    let (cookie, csrf) = create_session_and_csrf(&db, user.id, &config).await;
+
+    let doc = {
+        let mut tx = db.pool().begin().await.unwrap();
+        let doc =
+            Document::new(ws.id, "Target Document", DocumentClass::Pdf, Some(user.id)).unwrap();
+        DocumentRepository::insert(&mut tx, &doc).await.unwrap();
+        tx.commit().await.unwrap();
+        doc
+    };
+
+    let valid_payload = json!({
+        "filename": "specification.pdf",
+        "media_type": "application/pdf",
+        "byte_length": 2048576,
+        "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    });
+    let req = Request::builder()
+        .uri(format!(
+            "/api/v1/workspaces/{}/documents/{}/upload-intents",
+            ws.id, doc.id
+        ))
+        .method("POST")
+        .header(COOKIE, &cookie)
+        .header(CSRF_HEADER_NAME, &csrf)
+        .header(ORIGIN, "http://127.0.0.1:3000")
+        .header("idempotency-key", "upload-intent-fail-closed-key")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(valid_payload.to_string()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    // Production behavior when S3 configuration is absent MUST FAIL CLOSED with 412 Precondition Failed.
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
 async fn test_e20_upload_intent_presign_put_security_gates() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -610,6 +660,7 @@ async fn test_e20_upload_intent_presign_put_security_gates() {
 
 #[tokio::test]
 async fn test_e21_finalize_upload_intent_full_flow() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -903,6 +954,7 @@ async fn test_e23_accept_version_atomic_transaction_and_gates() {
 
 #[tokio::test]
 async fn test_e24_download_signing_presigned_get() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());

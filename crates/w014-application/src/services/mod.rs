@@ -14,7 +14,8 @@ pub mod workspace_init;
 pub use capability_service::CapabilityGrantService;
 pub use document_service::{
     DocumentService, FinalizeUploadError, MALWARE_SCAN_MAX_ATTEMPTS, MAX_DOWNLOAD_TTL_SECS,
-    PresignedGetContract, PresignedPutContract, StoredObjectMetadata, UploadFinalizeResult,
+    PresignedGetContract, PresignedPutContract, ScopedTestStorageGuard,
+    ScopedUnconfiguredStorageGuard, StoredObjectMetadata, UploadFinalizeResult,
     can_manage_documents, can_read_documents, can_upload_documents,
 };
 pub use idempotency_service::IdempotencyCoordinator;

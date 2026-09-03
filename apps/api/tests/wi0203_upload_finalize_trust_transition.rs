@@ -160,7 +160,56 @@ async fn create_session_and_csrf(
 // ============================================================================
 
 #[tokio::test]
+async fn test_wi0203_unconfigured_s3_fails_closed() {
+    let _unconfigured = DocumentService::scoped_unconfigured_storage().await;
+    let db = provision_migrated_db().await;
+    let config = create_test_config();
+    let app = create_test_app(&config, db.pool().clone());
+
+    let org = create_org(&db, "Org Wi0203 FC", "org-wi0203-fc").await;
+    let prog = create_program(&db, org.id, "Prog Wi0203 FC", "prog-wi0203-fc").await;
+    let ws = create_workspace(&db, &prog, "WS Wi0203 FC", "ws-wi0203-fc").await;
+
+    let user = create_principal(&db, org.id, "user_fc@test.com", "User FC").await;
+    add_membership(&db, ws.id, user.id, MembershipRole::Operator).await;
+    let (cookie, csrf) = create_session_and_csrf(&db, user.id, &config).await;
+
+    let doc = {
+        let mut tx = db.pool().begin().await.unwrap();
+        let doc = Document::new(ws.id, "Doc FC", DocumentClass::Pdf, Some(user.id)).unwrap();
+        DocumentRepository::insert(&mut tx, &doc).await.unwrap();
+        tx.commit().await.unwrap();
+        doc
+    };
+
+    let req = Request::builder()
+        .uri(format!(
+            "/api/v1/workspaces/{}/documents/{}/upload-intents",
+            ws.id, doc.id
+        ))
+        .method("POST")
+        .header(COOKIE, &cookie)
+        .header(CSRF_HEADER_NAME, &csrf)
+        .header(ORIGIN, "http://127.0.0.1:3000")
+        .header("idempotency-key", "intent-fc-key")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "filename": "fc.pdf",
+                "media_type": "application/pdf",
+                "byte_length": 4096,
+                "sha256_b64": Sha256::digest(b"fail closed content").to_base64(),
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
 async fn test_wi0203_gate01_authoritative_upload_finalize_pdf_happy_path() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -401,6 +450,7 @@ async fn test_wi0203_gate01_authoritative_upload_finalize_pdf_happy_path() {
 
 #[tokio::test]
 async fn test_wi0203_gate02_authoritative_upload_finalize_docx_enqueues_docx_ocr_job() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -498,6 +548,7 @@ async fn test_wi0203_gate02_authoritative_upload_finalize_docx_enqueues_docx_ocr
 
 #[tokio::test]
 async fn test_wi0203_gate04_multiversion_sequential_version_numbering() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -635,6 +686,7 @@ async fn test_wi0203_gate04_multiversion_sequential_version_numbering() {
 
 #[tokio::test]
 async fn test_wi0203_gate05_authn_and_deactivated_recheck() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -691,6 +743,7 @@ async fn test_wi0203_gate05_authn_and_deactivated_recheck() {
 
 #[tokio::test]
 async fn test_wi0203_gate06_revoked_after_presign_recheck() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -774,6 +827,7 @@ async fn test_wi0203_gate06_revoked_after_presign_recheck() {
 
 #[tokio::test]
 async fn test_wi0203_gate07_document_upload_capability_reauthorization() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -856,6 +910,7 @@ async fn test_wi0203_gate07_document_upload_capability_reauthorization() {
 
 #[tokio::test]
 async fn test_wi0203_gate08_missing_idempotency_key_header() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -889,6 +944,7 @@ async fn test_wi0203_gate08_missing_idempotency_key_header() {
 
 #[tokio::test]
 async fn test_wi0203_gate09_idempotency_replay_and_mismatch() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1023,6 +1079,7 @@ async fn test_wi0203_gate09_idempotency_replay_and_mismatch() {
 
 #[tokio::test]
 async fn test_wi0203_gate10_expired_intent_rejected() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1089,6 +1146,7 @@ async fn test_wi0203_gate10_expired_intent_rejected() {
 
 #[tokio::test]
 async fn test_wi0203_gate11_abandoned_intent_rejected() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1155,6 +1213,7 @@ async fn test_wi0203_gate11_abandoned_intent_rejected() {
 
 #[tokio::test]
 async fn test_wi0203_gate12_already_finalized_intent_new_key_rejected() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1245,6 +1304,7 @@ async fn test_wi0203_gate12_already_finalized_intent_new_key_rejected() {
 
 #[tokio::test]
 async fn test_wi0203_gate13_cross_workspace_finalize_rejected() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1327,6 +1387,7 @@ async fn test_wi0203_gate13_cross_workspace_finalize_rejected() {
 
 #[tokio::test]
 async fn test_wi0203_gate14_object_head_required_missing_storage_upload() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1377,8 +1438,6 @@ async fn test_wi0203_gate14_object_head_required_missing_storage_upload() {
     };
 
     // We do NOT stage anything in mock storage -> HEAD returns None
-    DocumentService::ensure_test_storage_injected();
-
     let req = Request::builder()
         .uri(format!(
             "/api/v1/workspaces/{}/upload-intents/{}/finalize",
@@ -1398,6 +1457,7 @@ async fn test_wi0203_gate14_object_head_required_missing_storage_upload() {
 
 #[tokio::test]
 async fn test_wi0203_gate15_byte_length_mismatch_rejected() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1473,6 +1533,7 @@ async fn test_wi0203_gate15_byte_length_mismatch_rejected() {
 
 #[tokio::test]
 async fn test_wi0203_gate16_sha256_checksum_mismatch_rejected() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1552,6 +1613,7 @@ async fn test_wi0203_gate16_sha256_checksum_mismatch_rejected() {
 
 #[tokio::test]
 async fn test_wi0203_gate17_content_type_mismatch_rejected() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1628,6 +1690,7 @@ async fn test_wi0203_gate17_content_type_mismatch_rejected() {
 
 #[tokio::test]
 async fn test_wi0203_gate18_oversize_upload_rejected() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1720,6 +1783,7 @@ async fn test_wi0203_gate20_database_immutability_triggers() {
 
 #[tokio::test]
 async fn test_wi0203_gate03_standalone_intent_without_doc_creates_new_document() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1808,6 +1872,7 @@ async fn test_wi0203_gate03_standalone_intent_without_doc_creates_new_document()
 
 #[tokio::test]
 async fn test_wi0203_gate21_csrf_protection_on_finalize() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());
@@ -1858,6 +1923,7 @@ async fn test_wi0203_gate21_csrf_protection_on_finalize() {
 
 #[tokio::test]
 async fn test_wi0203_gate22_sha256_mandatory_and_empty_digest_rejected() {
+    let _storage = DocumentService::scoped_test_storage().await;
     let db = provision_migrated_db().await;
     let config = create_test_config();
     let app = create_test_app(&config, db.pool().clone());

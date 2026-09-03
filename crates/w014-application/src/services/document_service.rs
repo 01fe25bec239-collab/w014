@@ -9,7 +9,9 @@
 //! - Download signing for immutable object artifacts (max 5 minutes TTL)
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
+use tokio::sync::RwLock as TokioRwLock;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,62 @@ static INJECTED_STORAGE: RwLock<Option<Arc<dyn ObjectStorage>>> = RwLock::new(No
 /// Process-local test storage instance for deterministic test execution.
 static TEST_STORAGE_INSTANCE: LazyLock<Arc<TestStorageAdapter>> =
     LazyLock::new(|| Arc::new(TestStorageAdapter::new()));
+
+/// Coordination lock ensuring isolated execution between tests requiring test storage
+/// and tests asserting production fail-closed behavior on unconfigured storage.
+static TEST_STORAGE_COORDINATOR: LazyLock<TokioRwLock<()>> = LazyLock::new(|| TokioRwLock::new(()));
+
+/// Active scoped test storage guard counter.
+static ACTIVE_TEST_STORAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Scoped RAII test storage guard for isolated integration test execution.
+///
+/// Holds a shared read lock on `TEST_STORAGE_COORDINATOR`, allowing parallel
+/// execution of tests requiring storage, while blocking tests verifying
+/// unconfigured fail-closed behavior (which take an exclusive write lock).
+#[derive(Debug)]
+pub struct ScopedTestStorageGuard {
+    _read_guard: tokio::sync::RwLockReadGuard<'static, ()>,
+}
+
+impl ScopedTestStorageGuard {
+    /// Helper to stage object bytes into the active test storage.
+    pub fn stage_object(
+        &self,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        bytes: &[u8],
+        content_type: impl Into<String>,
+    ) {
+        DocumentService::stage_mock_upload_bytes(bucket, key, bytes, content_type);
+    }
+}
+
+impl Drop for ScopedTestStorageGuard {
+    fn drop(&mut self) {
+        if ACTIVE_TEST_STORAGE_COUNT.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
+            *w = None;
+            TEST_STORAGE_INSTANCE.clear();
+        }
+    }
+}
+
+/// Scoped RAII guard for tests verifying unconfigured fail-closed behavior.
+///
+/// Holds an exclusive write lock on `TEST_STORAGE_COORDINATOR`, guaranteeing
+/// that no tests with injected test storage run concurrently.
+#[derive(Debug)]
+pub struct ScopedUnconfiguredStorageGuard {
+    _write_guard: tokio::sync::RwLockWriteGuard<'static, ()>,
+}
+
+impl Drop for ScopedUnconfiguredStorageGuard {
+    fn drop(&mut self) {
+        let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
+        *w = None;
+    }
+}
 
 /// Authoritative object metadata returned by object storage HEAD queries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,6 +542,41 @@ impl DocumentService {
         let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
         if w.is_none() {
             *w = Some(TEST_STORAGE_INSTANCE.clone());
+        }
+    }
+
+    /// Activates scoped test storage authority for the duration of the returned guard.
+    ///
+    /// Ensures test storage authority is explicitly established, supports concurrent
+    /// test execution with other storage-enabled tests, and safely restores
+    /// production authority on drop when all scoped tests complete.
+    pub async fn scoped_test_storage() -> ScopedTestStorageGuard {
+        let read_guard = TEST_STORAGE_COORDINATOR.read().await;
+        if ACTIVE_TEST_STORAGE_COUNT.fetch_add(1, Ordering::SeqCst) == 0 {
+            let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
+            *w = Some(TEST_STORAGE_INSTANCE.clone());
+        } else {
+            let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
+            if w.is_none() {
+                *w = Some(TEST_STORAGE_INSTANCE.clone());
+            }
+        }
+        ScopedTestStorageGuard {
+            _read_guard: read_guard,
+        }
+    }
+
+    /// Activates scoped unconfigured storage authority for fail-closed tests.
+    ///
+    /// Takes an exclusive lock preventing concurrent storage tests, and ensures
+    /// `INJECTED_STORAGE` is strictly None.
+    pub async fn scoped_unconfigured_storage() -> ScopedUnconfiguredStorageGuard {
+        let write_guard = TEST_STORAGE_COORDINATOR.write().await;
+        let mut w = INJECTED_STORAGE.write().expect("storage lock poisoned");
+        *w = None;
+        TEST_STORAGE_INSTANCE.clear();
+        ScopedUnconfiguredStorageGuard {
+            _write_guard: write_guard,
         }
     }
 
