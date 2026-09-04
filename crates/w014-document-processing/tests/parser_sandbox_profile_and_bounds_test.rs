@@ -487,7 +487,7 @@ async fn test_process_sandbox_profile_enforcement_fail_closed_matrix() {
     )
     .unwrap();
 
-    let runner = ProcessSandboxRunner::new("/bin/sh").with_args(["-c", "exit 0"]);
+    let runner = ProcessSandboxRunner::new("w014-parser-sandbox");
 
     // Case 1: Permissive network ingress -> Fail closed
     let mut bad_profile = SandboxSecurityProfile::frozen_default();
@@ -641,7 +641,7 @@ async fn test_process_sandbox_profile_enforcement_fail_closed_matrix() {
 
     // Case 26: Valid profile BUT missing isolation wrapper -> Fail closed (unsandboxed direct execution impossible)
     let good_profile = SandboxSecurityProfile::frozen_default();
-    let unisolated_runner = ProcessSandboxRunner::new("/bin/sh").with_args(["-c", "exit 0"]);
+    let unisolated_runner = ProcessSandboxRunner::new("w014-parser-sandbox");
     let err = unisolated_runner
         .run(&good_profile, &input)
         .await
@@ -652,13 +652,13 @@ async fn test_process_sandbox_profile_enforcement_fail_closed_matrix() {
             ref detail,
         } => {
             assert_eq!(violation_type, "MISSING_ISOLATION_WRAPPER");
-            assert!(detail.contains("isolation wrapper"));
+            assert!(detail.contains("isolation"));
         }
         other => panic!("Expected MISSING_ISOLATION_WRAPPER, got {other:?}"),
     }
 
     // Case 27: Nonexistent isolation wrapper -> Fail closed
-    let bad_wrapper_runner = ProcessSandboxRunner::new("/bin/sh")
+    let bad_wrapper_runner = ProcessSandboxRunner::new("w014-parser-sandbox")
         .with_wrapper("/nonexistent/bin/sandbox-wrapper-404", ["--isolated"]);
     let err = bad_wrapper_runner
         .run(&good_profile, &input)
@@ -677,12 +677,22 @@ async fn test_process_sandbox_profile_enforcement_fail_closed_matrix() {
 }
 
 fn create_test_runner(args: &[&str]) -> ProcessSandboxRunner {
-    let runner = ProcessSandboxRunner::new("/bin/sh").with_args(args.iter().copied());
+    // Live OCI execution uses the approved `docker` backend with a minimal
+    // test image; the in-image binary is `sh` (test-only). Production uses
+    // the parser image plus the concrete `w014-parser-sandbox` binary under
+    // the identical W014-generated mandatory flag set.
+    let runner = ProcessSandboxRunner::new("sh")
+        .with_oci_image("ubuntu:24.04")
+        .with_args(args.iter().copied());
     if let Some((wb, wa)) = ProcessSandboxRunner::platform_default_wrapper() {
         runner.with_wrapper(wb, wa)
     } else {
-        runner.with_wrapper("/usr/bin/env", ["--"])
+        runner
     }
+}
+
+fn oci_backend_available() -> bool {
+    ProcessSandboxRunner::platform_default_wrapper().is_some()
 }
 
 #[tokio::test]
@@ -716,6 +726,14 @@ async fn test_process_sandbox_credential_and_environment_scrubbing() {
     .unwrap();
 
     let profile = SandboxSecurityProfile::frozen_default();
+
+    // Without the OCI runtime on the host, demonstrate deterministic fail-closed behavior.
+    if !oci_backend_available() {
+        let runner = create_test_runner(&["-c", "exit 0"]);
+        let err = runner.run(&profile, &input).await.unwrap_err();
+        assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+        return;
+    }
 
     // Launch a process that checks for sensitive environment variables
     let check_script = r#"
@@ -762,6 +780,14 @@ async fn test_process_sandbox_wall_clock_timeout_terminates_and_reaps() {
     let mut profile = SandboxSecurityProfile::frozen_default();
     profile.ceilings.max_wall_clock_seconds = 1; // Strict 1 second timeout
 
+    // Without the OCI runtime on the host, demonstrate deterministic fail-closed behavior.
+    if !oci_backend_available() {
+        let runner = create_test_runner(&["-c", "exit 0"]);
+        let err = runner.run(&profile, &input).await.unwrap_err();
+        assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+        return;
+    }
+
     // Run a process that attempts to sleep for 10 seconds
     let runner = create_test_runner(&["-c", "sleep 10"]);
 
@@ -798,6 +824,14 @@ async fn test_process_sandbox_oversized_stdout_terminates_during_streaming() {
 
     let mut profile = SandboxSecurityProfile::frozen_default();
     profile.ceilings.max_output_bytes = 4096; // Tight 4 KB bound for test
+
+    // Without the OCI runtime on the host, demonstrate deterministic fail-closed behavior.
+    if !oci_backend_available() {
+        let runner = create_test_runner(&["-c", "exit 0"]);
+        let err = runner.run(&profile, &input).await.unwrap_err();
+        assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+        return;
+    }
 
     // Script generates 100 KB of stdout (well exceeding the 4 KB bound)
     let runner = create_test_runner(&["-c", "head -c 102400 /dev/zero | tr '\\000' 'A'"]);
@@ -837,6 +871,14 @@ async fn test_process_sandbox_oversized_stderr_terminates_during_streaming() {
     let mut profile = SandboxSecurityProfile::frozen_default();
     profile.ceilings.max_output_bytes = 4096; // Tight 4 KB bound for test
 
+    // Without the OCI runtime on the host, demonstrate deterministic fail-closed behavior.
+    if !oci_backend_available() {
+        let runner = create_test_runner(&["-c", "exit 0"]);
+        let err = runner.run(&profile, &input).await.unwrap_err();
+        assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+        return;
+    }
+
     // Script generates 100 KB of stderr (well exceeding the 4 KB bound)
     let runner = create_test_runner(&["-c", "head -c 102400 /dev/zero | tr '\\000' 'E' >&2"]);
 
@@ -873,6 +915,14 @@ async fn test_process_sandbox_crash_captures_bounded_stderr_and_fails_closed() {
     .unwrap();
 
     let profile = SandboxSecurityProfile::frozen_default();
+
+    // Without the OCI runtime on the host, demonstrate deterministic fail-closed behavior.
+    if !oci_backend_available() {
+        let runner = create_test_runner(&["-c", "exit 0"]);
+        let err = runner.run(&profile, &input).await.unwrap_err();
+        assert!(matches!(err, SandboxError::SandboxViolation { .. }));
+        return;
+    }
 
     let runner = create_test_runner(&["-c", "echo 'Fatal memory fault inside parser' >&2; exit 2"]);
 
@@ -911,7 +961,7 @@ async fn test_process_sandbox_real_os_boundary_enforcement() {
     let profile = SandboxSecurityProfile::frozen_default();
 
     // 1. Missing wrapper deterministically fails closed (direct execution is impossible)
-    let direct_runner = ProcessSandboxRunner::new("/bin/sh").with_args(["-c", "exit 0"]);
+    let direct_runner = ProcessSandboxRunner::new("w014-parser-sandbox");
     let err = direct_runner.run(&profile, &input).await.unwrap_err();
     assert!(matches!(
         err,
@@ -921,39 +971,84 @@ async fn test_process_sandbox_real_os_boundary_enforcement() {
         } if violation_type == "MISSING_ISOLATION_WRAPPER"
     ));
 
-    // 2. If a platform wrapper is available, verify real OS boundary enforcement
+    // 1b. Arbitrary existing host executables are never accepted as sandbox
+    // authority, even though the paths exist on disk.
+    for unapproved in ["/bin/sh", "/usr/bin/env", "/bin/echo"] {
+        if std::path::Path::new(unapproved).is_file() {
+            let runner = ProcessSandboxRunner::new("w014-parser-sandbox")
+                .with_wrapper(unapproved, Vec::<String>::new());
+            let err = runner.run(&profile, &input).await.unwrap_err();
+            match err {
+                SandboxError::SandboxViolation {
+                    ref violation_type, ..
+                } => {
+                    assert_eq!(
+                        violation_type, "UNAPPROVED_ISOLATION_BACKEND",
+                        "existing executable '{unapproved}' must not confer sandbox authority"
+                    );
+                }
+                other => panic!(
+                    "Expected UNAPPROVED_ISOLATION_BACKEND for '{unapproved}', got {other:?}"
+                ),
+            }
+        }
+    }
+
+    // 2. If the approved OCI backend is available, verify real container
+    // boundary enforcement with live probes.
     if let Some((wb, wa)) = ProcessSandboxRunner::platform_default_wrapper() {
-        // Sub-test A: Root filesystem write is blocked by OS boundary (Fail Closed)
-        let write_attempt_script = "touch /etc/w014_hacked_root 2>&1";
-        let runner_write = ProcessSandboxRunner::new("/bin/sh")
-            .with_wrapper(wb.clone(), wa.clone())
-            .with_args(["-c", write_attempt_script]);
-        let err = runner_write.run(&profile, &input).await.unwrap_err();
+        let oci_runner = |script: &str| {
+            ProcessSandboxRunner::new("sh")
+                .with_oci_image("ubuntu:24.04")
+                .with_wrapper(wb.clone(), wa.clone())
+                .with_args(["-c", script])
+        };
+        // Sub-test A: Root filesystem write is blocked by the read-only root (Fail Closed)
+        let err = oci_runner("touch /etc/w014_hacked_root 2>&1")
+            .run(&profile, &input)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, SandboxError::ProcessCrash { .. }),
-            "Attempt to write to root filesystem must fail closed via OS boundary, got {err:?}"
+            "Attempt to write to root filesystem must fail closed via OCI boundary, got {err:?}"
         );
 
-        // Sub-test B: Network socket connect is blocked by OS boundary (Fail Closed)
-        let network_attempt_script = "nc -z -w 1 8.8.8.8 53 2>&1 || exit 42";
-        let runner_net = ProcessSandboxRunner::new("/bin/sh")
-            .with_wrapper(wb.clone(), wa.clone())
-            .with_args(["-c", network_attempt_script]);
-        let err = runner_net.run(&profile, &input).await.unwrap_err();
-        assert!(
-            matches!(err, SandboxError::ProcessCrash { .. }),
-            "Attempt to access network must fail closed via OS boundary, got {err:?}"
-        );
+        // Sub-test B: DNS/egress is blocked by network isolation (Fail Closed).
+        // With `--network=none`, name resolution fails; exit 7 proves the
+        // probe ran inside the isolated network namespace.
+        let err = oci_runner("getent hosts google.com >/dev/null 2>&1 && exit 42 || exit 7")
+            .run(&profile, &input)
+            .await
+            .unwrap_err();
+        match err {
+            SandboxError::ProcessCrash { exit_code, .. } => {
+                assert_eq!(exit_code, Some(7));
+            }
+            other => panic!("Expected DNS-blocked ProcessCrash(7), got {other:?}"),
+        }
 
-        // Sub-test C: Docker socket communication is blocked by OS boundary
-        let docker_socket_script = "nc -U /var/run/docker.sock </dev/null 2>&1 || exit 88";
-        let runner_docker = ProcessSandboxRunner::new("/bin/sh")
-            .with_wrapper(wb, wa)
-            .with_args(["-c", docker_socket_script]);
-        let err = runner_docker.run(&profile, &input).await.unwrap_err();
-        assert!(
-            matches!(err, SandboxError::ProcessCrash { .. }),
-            "Docker socket communication must be blocked by OS boundary, got {err:?}"
-        );
+        // Sub-test C: Docker socket is absent inside the sandbox (Fail Closed).
+        let err = oci_runner("if test -e /var/run/docker.sock; then exit 88; else exit 73; fi")
+            .run(&profile, &input)
+            .await
+            .unwrap_err();
+        match err {
+            SandboxError::ProcessCrash { exit_code, .. } => {
+                assert_eq!(exit_code, Some(73));
+            }
+            other => panic!("Expected absent-socket ProcessCrash(73), got {other:?}"),
+        }
+
+        // Sub-test D: Host root paths are not visible inside the sandbox.
+        let err = oci_runner("if test -e /Users; then exit 91; else exit 72; fi")
+            .run(&profile, &input)
+            .await
+            .unwrap_err();
+        match err {
+            SandboxError::ProcessCrash { exit_code, .. } => {
+                assert_eq!(exit_code, Some(72));
+            }
+            other => panic!("Expected host-root-absent ProcessCrash(72), got {other:?}"),
+        }
     }
 }

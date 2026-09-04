@@ -12,6 +12,7 @@
 pub mod error;
 pub mod input;
 pub mod mock;
+pub mod oci;
 pub mod output;
 pub mod pdf;
 pub mod process;
@@ -21,6 +22,11 @@ pub mod traits;
 pub use error::SandboxError;
 pub use input::SandboxInput;
 pub use mock::{MockSandboxBehavior, MockSandboxRunner};
+pub use oci::{
+    APPROVED_DOCKER_CANDIDATE_PATHS, APPROVED_ISOLATION_BINARY_NAME, DEFAULT_OCI_IMAGE,
+    build_docker_run_argv, discover_docker_binary, is_approved_isolation_binary,
+    resolve_approved_docker_binary,
+};
 pub use output::{
     MAX_BOUNDED_BLOCK_COUNT, MAX_BOUNDED_PAGE_COUNT, MAX_BOUNDED_SPAN_COUNT,
     MAX_EXECUTION_DURATION_MS, OutputValidationError, SANDBOX_PROTOCOL_VERSION, SandboxOutput,

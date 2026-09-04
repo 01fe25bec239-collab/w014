@@ -81,6 +81,7 @@ pub use parser_blocks_row::{NewParserBlockRow, ParserBlockRow};
 pub use parser_pages_row::{NewParserPageRow, ParserPageRow};
 pub use quarantine_records_row::{NewQuarantineRecordRow, QuarantineRecordRow};
 pub use sandbox::{
+    APPROVED_DOCKER_CANDIDATE_PATHS, APPROVED_ISOLATION_BINARY_NAME, DEFAULT_OCI_IMAGE,
     ENV_PARSER_SANDBOX_WRAPPER_ARGS, ENV_PARSER_SANDBOX_WRAPPER_BIN, FROZEN_MAX_CPU_CORES,
     FROZEN_MAX_MEMORY_BYTES, FROZEN_MAX_OUTPUT_BYTES, FROZEN_MAX_PIDS, FROZEN_MAX_TMPFS_BYTES,
     FROZEN_MAX_WALL_CLOCK_SECS, MAX_BOUNDED_BLOCK_COUNT, MAX_BOUNDED_PAGE_COUNT,
@@ -89,6 +90,8 @@ pub use sandbox::{
     SANDBOX_PROTOCOL_VERSION, SandboxCredentialsPolicy, SandboxError, SandboxFilesystemPolicy,
     SandboxInput, SandboxNetworkPolicy, SandboxOutput, SandboxProcessPolicy,
     SandboxResourceCeilings, SandboxRunner, SandboxSecurityProfile, SandboxStatus,
+    build_docker_run_argv, discover_docker_binary, is_approved_isolation_binary,
+    resolve_approved_docker_binary,
 };
 pub use scanner::{
     ClamAvClient, ClamAvConfig, ClamAvVersionInfo, DEFAULT_SCAN_TIMEOUT_SECS, EICAR_TEST_SIGNATURE,

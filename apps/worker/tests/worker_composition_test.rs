@@ -27,6 +27,7 @@ use w014_application::services::{
 use w014_authz::AuthorizedWorkspaceContext;
 use w014_document_processing::sandbox::{
     MockSandboxRunner, ProcessSandboxRunner, SandboxError, SandboxInput, SandboxSecurityProfile,
+    SandboxStatus,
 };
 use w014_document_processing::scanner::MockClamAvScanner;
 use w014_domain::ids::{DocumentVersionId, ObjectArtifactId, WorkspaceId};
@@ -892,41 +893,59 @@ async fn test_production_sandbox_runner_composition_and_fail_closed_boundaries()
     // 1. PRODUCTION_WRAPPER_COMPOSED & PRODUCTION_RUNNER_USES_ACCEPTED_ISOLATION:
     // Production runner executes real sandboxed child process rather than MockSandboxRunner
     // or direct unwrapped execution.
+    //
+    // Foundation production-image note (WI0205): once the authoritative
+    // `w014-parser-sandbox:local` image is composed, malformed input yields a
+    // real typed fail-closed envelope (Ok with non-Success status) instead of
+    // a transport error. Both outcomes prove real sandboxed execution; only
+    // mock Success is forbidden.
     let runner = create_default_sandbox_runner();
     let res = runner.run(&profile, &input).await;
-    assert!(
-        res.is_err(),
-        "Production runner must execute real sandboxed child process, not return mock success"
-    );
-    let err = res.unwrap_err();
-
-    if ProcessSandboxRunner::platform_default_wrapper().is_some() {
-        // Platform wrapper is available: wrapper was resolved and executed.
-        // It must NOT fail with MISSING_ISOLATION_WRAPPER.
-        match &err {
-            SandboxError::SandboxViolation { violation_type, .. } => {
-                assert_ne!(
-                    violation_type, "MISSING_ISOLATION_WRAPPER",
-                    "Production runner must have platform wrapper composed when platform wrapper is available"
-                );
-            }
-            SandboxError::ProcessCrash { .. } | SandboxError::IO { .. } => {
-                // Expected: wrapper executed and failed to exec non-existent dummy binary
-            }
-            other => panic!("Unexpected error from sandboxed runner execution: {other:?}"),
+    let err_opt: Option<SandboxError> = match res {
+        Ok(output) => {
+            assert_ne!(
+                output.status,
+                SandboxStatus::Success,
+                "Production runner must never return mock success for malformed input"
+            );
+            output
+                .validate_against_input(&input)
+                .expect("real sandbox failure envelope must validate against input");
+            None
         }
-    } else {
-        // Platform wrapper is not available on host: must fail closed without unsandboxed fallback.
-        match &err {
-            SandboxError::SandboxViolation { violation_type, .. } => {
-                assert_eq!(
-                    violation_type, "MISSING_ISOLATION_WRAPPER",
-                    "Missing platform wrapper on host must fail closed with MISSING_ISOLATION_WRAPPER"
-                );
+        Err(err) => Some(err),
+    };
+
+    if let Some(err) = err_opt.as_ref() {
+        if ProcessSandboxRunner::platform_default_wrapper().is_some() {
+            // Platform wrapper is available: wrapper was resolved and executed.
+            // It must NOT fail with MISSING_ISOLATION_WRAPPER.
+            match &err {
+                SandboxError::SandboxViolation { violation_type, .. } => {
+                    assert_ne!(
+                        violation_type, "MISSING_ISOLATION_WRAPPER",
+                        "Production runner must have platform wrapper composed when platform wrapper is available"
+                    );
+                }
+                SandboxError::ProcessCrash { .. } | SandboxError::IO { .. } => {
+                    // Expected when the image/binary is absent: wrapper executed
+                    // and the container backend failed closed.
+                }
+                other => panic!("Unexpected error from sandboxed runner execution: {other:?}"),
             }
-            other => panic!(
-                "Expected MISSING_ISOLATION_WRAPPER when no platform wrapper exists, got {other:?}"
-            ),
+        } else {
+            // Platform wrapper is not available on host: must fail closed without unsandboxed fallback.
+            match &err {
+                SandboxError::SandboxViolation { violation_type, .. } => {
+                    assert_eq!(
+                        violation_type, "MISSING_ISOLATION_WRAPPER",
+                        "Missing platform wrapper on host must fail closed with MISSING_ISOLATION_WRAPPER"
+                    );
+                }
+                other => panic!(
+                    "Expected MISSING_ISOLATION_WRAPPER when no platform wrapper exists, got {other:?}"
+                ),
+            }
         }
     }
 

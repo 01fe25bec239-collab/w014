@@ -11,7 +11,7 @@ chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
-tokio = { version = "1", features = ["net", "io-util", "time", "sync", "process", "macros"] }
+tokio = { version = "1", features = ["net", "io-util", "io-std", "time", "sync", "process", "macros", "rt", "rt-multi-thread"] }
 tracing = "0.1"
 async-trait = "0.1"
 unicode-normalization = "0.1"
@@ -24,4 +24,8 @@ tempfile = "3"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net"] }
 w014-persistence = { path = "../w014-persistence" }
+
+[[bin]]
+name = "w014-parser-sandbox"
+path = "src/bin/w014-parser-sandbox.rs"
 
