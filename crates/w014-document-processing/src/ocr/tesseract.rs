@@ -2,12 +2,21 @@
 //!
 //! Enforces:
 //! - Engine: Tesseract orchestrated directly by Rust (zero Python components)
-//! - Hard per-page timeout: <= 15 seconds
+//! - Hard per-page timeout: <= 15 seconds, shared as ONE wall-clock deadline
+//!   per OCR page across every image/media invocation on that page
 //! - Hard per-job timeout: <= 30 minutes
 //! - Hard page ceiling: <= 250 pages
 //! - Raster limit: <= 40 Megapixels per image
 //! - Target DPI: <= 300 DPI
 //! - Fail closed on error/timeout/crash: NO GUESS, NO AI FALLBACK
+//!
+//! Shared page-deadline contract (WI0207 D2):
+//! Callers establish ONE `page_deadline = page_start + effective_page_timeout`
+//! per OCR page and pass `min(remaining_page_budget, remaining_job_budget)`
+//! as `max_duration` to EVERY child OCR operation on that page. The deadline
+//! MUST NOT reset between media operations. This engine additionally bounds
+//! the effective timeout by the configured page limit and terminates + reaps
+//! the child on timeout.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -23,6 +32,20 @@ use super::config::{MAX_PAGE_DURATION_SECS, OcrPolicyConfig, TARGET_DPI};
 use super::error::OcrError;
 use super::image_inspector::inspect_and_validate_raster;
 use crate::normalization::normalize_nfc;
+
+/// Computes the maximum duration a child OCR operation may receive.
+///
+/// Returns `min(remaining_page_budget, remaining_job_budget,
+/// configured_page_limit)` so that multiple images on the same page share
+/// ONE page deadline and no invocation can reset the page clock.
+#[must_use]
+pub fn child_ocr_budget(
+    remaining_page: Duration,
+    remaining_job: Duration,
+    configured_page_limit: Duration,
+) -> Duration {
+    remaining_page.min(remaining_job).min(configured_page_limit)
+}
 
 /// Output resulting from single image OCR extraction.
 #[derive(Debug, Clone, PartialEq)]
@@ -163,7 +186,9 @@ impl OcrEngine for ProcessTesseractEngine {
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        // 4. Calculate effective timeout: bounded by configured page timeout (<= 15s) and max_duration
+        // 4. Calculate effective timeout: bounded by configured page timeout (<= 15s) and max_duration.
+        //    Callers pass min(remaining_page_budget, remaining_job_budget) as
+        //    max_duration so the shared page deadline is honored per image.
         let configured_page_limit = Duration::from_secs(self.config.effective_page_timeout_secs());
         let effective_timeout = configured_page_limit.min(max_duration);
 
@@ -388,5 +413,46 @@ impl OcrEngine for MockTesseractEngine {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_child_ocr_budget_is_min_of_remaining_budgets() {
+        // Required example shape: page starts t=0 with 15s; image 1 consumes
+        // 8s; image 2 must see at most ~7s while the job still has budget.
+        let budget = child_ocr_budget(
+            Duration::from_secs(7),
+            Duration::from_secs(1700),
+            Duration::from_secs(15),
+        );
+        assert_eq!(budget, Duration::from_secs(7));
+
+        // Job budget is the binding constraint.
+        let budget = child_ocr_budget(
+            Duration::from_secs(15),
+            Duration::from_millis(400),
+            Duration::from_secs(15),
+        );
+        assert_eq!(budget, Duration::from_millis(400));
+
+        // Exhausted page budget yields zero (caller fails closed before spawn).
+        let budget = child_ocr_budget(
+            Duration::ZERO,
+            Duration::from_secs(100),
+            Duration::from_secs(15),
+        );
+        assert!(budget.is_zero());
+
+        // Configured page limit caps even generous remaining budgets.
+        let budget = child_ocr_budget(
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(15),
+        );
+        assert_eq!(budget, Duration::from_secs(15));
     }
 }
