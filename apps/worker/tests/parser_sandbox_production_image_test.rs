@@ -24,6 +24,12 @@ const PDF_MEDIA: &str = "application/pdf";
 
 static MINIMAL_DOCX: &[u8] = include_bytes!("fixtures/minimal-hello.docx");
 
+// Deterministic OCR-requiring DOCX: one page, zero native <w:t> text
+// (native_text_len 0 < LOW_TEXT_CHAR_THRESHOLD 50), two embedded PNG
+// raster images on that single page carrying sentinel text
+// "W014 OCR RUNTIME ALPHA" / "W014 OCR RUNTIME BETA".
+static OCR_DOCX: &[u8] = include_bytes!("fixtures/ocr-runtime-two-image-sentinels.docx");
+
 fn runtime_required() -> bool {
     std::env::var("W014_REQUIRE_PRODUCTION_IMAGE_RUNTIME").is_ok()
 }
@@ -260,6 +266,104 @@ async fn test_production_image_docx_real_docker_runtime() {
     output
         .validate_against_input(&input)
         .expect("protocol must validate");
+}
+
+#[tokio::test]
+async fn test_production_image_docx_ocr_real_tesseract_runtime() {
+    // Final OCR production-runtime evidence (W2 BLOCKED_D2_FINAL_IMAGE_OCR_RUNTIME_EVIDENCE).
+    //
+    // Path under proof:
+    //   OCR-requiring DOCX -> create_default_sandbox_runner()
+    //   -> ProcessSandboxRunner -> authoritative hardened Docker policy
+    //   -> w014-parser-sandbox:local -> real w014-parser-sandbox
+    //   -> DocxOcrProducer<ProcessTesseractEngine> -> real Tesseract.
+    //
+    // Fixture construction (verified by inspection, see
+    // fixtures/ocr-runtime-two-image-sentinels.docx):
+    //   - structurally valid DOCX / OOXML ZIP package,
+    //   - word/document.xml contains zero <w:t> elements, so native text is
+    //     EMPTY (length 0 < LOW_TEXT_CHAR_THRESHOLD 50),
+    //   - word/media/image1.png + word/media/image2.png are valid PNG
+    //     rasters (1600x500 each) on the single OCR page,
+    //   - rasters carry deterministic high-contrast sentinel text
+    //     "W014 OCR RUNTIME ALPHA" / "W014 OCR RUNTIME BETA", confirmed
+    //     readable by the image's own Tesseract 5.3.0 as a supplemental
+    //     fixture diagnostic.
+    //
+    // Combined OCR-necessity reasoning (no product change to expose ocr_used):
+    //   fixture native text is empty, so a Success with non-empty
+    //   text_sha256 plus non-zero block/span counts cannot come from native
+    //   DOCX text and necessarily traversed the accepted D2 OCR fallback.
+    //   The accepted parser binary binds this DOCX media path to
+    //   DocxOcrProducer with the real ProcessTesseractEngine, and D2
+    //   in-process tests prove the shared page-deadline semantics of that
+    //   path. SandboxOutput exposes no full-text field for DOCX
+    //   (parsed_artifact is None by product design), so the exact
+    //   deterministic text_sha256 digest of the combined sentinel OCR text
+    //   is asserted as the strongest observable proof.
+    if !require_live_runtime("docx_ocr_real_tesseract_runtime") {
+        return;
+    }
+    let input = sample_input(DOCX_MEDIA, OCR_DOCX.to_vec());
+    let profile = SandboxSecurityProfile::frozen_default();
+    // Exact real production runner: default binary + platform docker
+    // wrapper + default w014-parser-sandbox:local image.
+    let runner = create_default_sandbox_runner();
+
+    let output = runner
+        .run(&profile, &input)
+        .await
+        .expect("OCR DOCX must execute inside the authoritative sandbox");
+    assert_eq!(output.protocol_version, SANDBOX_PROTOCOL_VERSION);
+    assert_eq!(output.status, SandboxStatus::Success);
+    assert_eq!(
+        output.parser_name, "w014-docx-safe-parser",
+        "OCR DOCX must use authoritative ooxmlsdk + OCR producer path"
+    );
+    output
+        .validate_against_input(&input)
+        .expect("protocol must validate");
+    eprintln!(
+        "OCR_RUNTIME_EVIDENCE parser={} pages={} blocks={} spans={} text_sha256={} parsed_artifact_present={}",
+        output.parser_name,
+        output.page_count,
+        output.block_count,
+        output.span_count,
+        output
+            .text_sha256
+            .as_ref()
+            .map(|h| h.to_hex())
+            .unwrap_or_else(|| "<none>".to_string()),
+        output.parsed_artifact.is_some()
+    );
+    // Single scanned page fixture: every media item shares this one OCR page.
+    assert_eq!(
+        output.page_count, 1,
+        "OCR fixture must yield exactly one page"
+    );
+    assert!(
+        output.block_count > 0,
+        "OCR-derived text must produce blocks, got {}",
+        output.block_count
+    );
+    assert!(
+        output.span_count > 0,
+        "OCR-derived text must produce spans, got {}",
+        output.span_count
+    );
+    assert!(
+        output.text_sha256.is_some(),
+        "OCR-derived text must produce a non-empty text digest (native text is empty)"
+    );
+    // Exact deterministic OCR-content binding: with empty native text, the
+    // producer adopts combined OCR text
+    // "W014 OCR RUNTIME ALPHA\n" + "\n" + "W014 OCR RUNTIME BETA\n".
+    // This digest is SHA256("W014 OCR RUNTIME ALPHA\n\nW014 OCR RUNTIME BETA\n").
+    assert_eq!(
+        output.text_sha256.as_ref().map(|h| h.to_hex()).as_deref(),
+        Some("14e9a62298067c5e8a00356ae78622f81951a7f93df3f268eb95f122df265c2f"),
+        "text digest must equal the deterministic OCR sentinel digest"
+    );
 }
 
 #[tokio::test]
