@@ -34,6 +34,14 @@ type HmacSha256 = Hmac<HashingSha256>;
 pub const MAX_PUT_EXPIRATION_SECS: i64 = 600; // 10 minutes max (<= 600s)
 pub const MAX_GET_EXPIRATION_SECS: i64 = 300; // 5 minutes max (<= 300s)
 
+/// Authoritative AWS S3 HEAD checksum-mode contract (WI0203).
+///
+/// AWS requires `x-amz-checksum-mode: ENABLED` to be explicitly requested on
+/// HEAD so that the authoritative `x-amz-checksum-sha256` is retrievable.
+/// The value sent over HTTP must exactly match the value bound into SigV4.
+pub const HEAD_CHECKSUM_MODE_HEADER_NAME: &str = "x-amz-checksum-mode";
+pub const HEAD_CHECKSUM_MODE_HEADER_VALUE: &str = "ENABLED";
+
 /// Authoritative object storage contract implemented by production and test providers.
 #[async_trait::async_trait]
 pub trait ObjectStorage: Send + Sync {
@@ -542,9 +550,43 @@ impl S3StorageAdapter {
         })
     }
 
+    /// Constructs the authoritative AWS S3 HEAD request parts.
+    ///
+    /// Returns `(signed_url, headers_to_send)` where:
+    /// - `signed_url` is a SigV4 presigned HEAD URL whose `X-Amz-SignedHeaders`
+    ///   binds `x-amz-checksum-mode: ENABLED`.
+    /// - `headers_to_send` contains exactly the `x-amz-checksum-mode: ENABLED`
+    ///   header that must be sent over HTTP.
+    ///
+    /// The header value in `headers_to_send` exactly matches the value used
+    /// while constructing the SigV4 signature (single constant source).
+    pub fn build_head_request(
+        &self,
+        object_key: &str,
+        now: DateTime<Utc>,
+    ) -> (String, Vec<(String, String)>) {
+        let signed_url = self.generate_sigv4_presigned_url(
+            "HEAD",
+            object_key,
+            now,
+            300,
+            &[(
+                HEAD_CHECKSUM_MODE_HEADER_NAME,
+                HEAD_CHECKSUM_MODE_HEADER_VALUE,
+            )],
+        );
+        let headers = vec![(
+            HEAD_CHECKSUM_MODE_HEADER_NAME.to_string(),
+            HEAD_CHECKSUM_MODE_HEADER_VALUE.to_string(),
+        )];
+        (signed_url, headers)
+    }
+
     /// Authoritative HEAD request verifying object existence, length, content type, and digest.
     ///
     /// Always executes real HTTP request against configured endpoint or AWS standard endpoint.
+    /// Explicitly requests AWS checksum retrieval via `x-amz-checksum-mode: ENABLED`
+    /// (SigV4-bound and actually sent over HTTP).
     /// Fails closed on missing configuration, missing checksums, malformed checksums, empty digest fallbacks,
     /// or network errors. Never falls back to mock storage.
     pub async fn head_object(
@@ -561,12 +603,16 @@ impl S3StorageAdapter {
             ));
         }
 
-        let signed_url = self.generate_sigv4_presigned_url("HEAD", key, Utc::now(), 300, &[]);
+        let (signed_url, head_headers) = self.build_head_request(key, Utc::now());
 
-        let resp =
-            self.client.head(&signed_url).send().await.map_err(|e| {
-                FinalizeUploadError::Internal(format!("S3 HEAD network failure: {e}"))
-            })?;
+        let mut request = self.client.head(&signed_url);
+        for (name, value) in &head_headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| FinalizeUploadError::Internal(format!("S3 HEAD network failure: {e}")))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -608,16 +654,14 @@ impl S3StorageAdapter {
             .map(str::to_string);
 
         // HEAD_SHA256_REQUIRED: YES, HEAD_MISSING_CHECKSUM: FAIL_CLOSED, HEAD_MALFORMED_CHECKSUM: FAIL_CLOSED
-        let sha_header = resp
-            .headers()
-            .get("x-amz-checksum-sha256")
-            .or_else(|| resp.headers().get("x-amz-meta-content-sha256"))
-            .ok_or_else(|| {
-                FinalizeUploadError::PreconditionFailed(
-                    "S3 HEAD authoritative error: missing required x-amz-checksum-sha256 header"
-                        .to_string(),
-                )
-            })?;
+        // x-amz-checksum-sha256 is AUTHORITATIVE. No metadata fallback is accepted
+        // as a substitute for requesting AWS checksum mode.
+        let sha_header = resp.headers().get("x-amz-checksum-sha256").ok_or_else(|| {
+            FinalizeUploadError::PreconditionFailed(
+                "S3 HEAD authoritative error: missing required x-amz-checksum-sha256 header"
+                    .to_string(),
+            )
+        })?;
 
         let sha_str = sha_header.to_str().map_err(|_| {
             FinalizeUploadError::PreconditionFailed(
