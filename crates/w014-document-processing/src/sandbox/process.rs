@@ -16,11 +16,24 @@
 //!   (`--cpus`), not via accumulated-CPU-time accounting. Resource,
 //!   privilege, and isolation setup failures fail closed.
 //! - stdin carries ONLY the scoped single-object bytes; stdout/stderr are
-//!   hard-bounded during streaming consumption; wall-clock timeout kills and
-//!   reaps the container; no product credentials enter the container.
+//!   hard-bounded during streaming consumption; no product credentials enter
+//!   the container.
+//! - ONE authoritative global wall-clock deadline (<=600s) covers the complete
+//!   execution lifecycle: OCI launch, stdin handoff, stdout/stderr drain,
+//!   container execution, backend wait, and abort processing. The stdin writer
+//!   task is always joined inside that deadline (aborted on expiry) and can
+//!   never extend execution past it.
+//! - Production Docker invocation uses `--pull=never` with a local image
+//!   preflight (`w014-parser-sandbox:local` existence + revision/identity
+//!   labels); a missing image fails closed without any registry pull.
+//! - Every execution mints a W014-generated `--name` identity; abort paths
+//!   terminate the ACTUAL OCI container (`docker rm -f <name>`, bounded) and
+//!   reap the `docker run` client. Unestablished termination fails closed
+//!   instead of reporting an ordinary execution error.
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -29,7 +42,11 @@ use tokio::process::Command;
 
 use super::error::SandboxError;
 use super::input::SandboxInput;
-use super::oci::{DEFAULT_OCI_IMAGE, build_docker_run_argv, resolve_approved_docker_binary};
+use super::oci::{
+    CLIENT_REAP_TIMEOUT_SECS, DEFAULT_OCI_IMAGE, build_docker_run_argv,
+    build_docker_run_argv_with_container_name, generate_container_name, preflight_local_image,
+    resolve_approved_docker_binary, terminate_container_by_name,
+};
 use super::output::SandboxOutput;
 use super::profile::{
     FROZEN_MAX_CPU_CORES, FROZEN_MAX_MEMORY_BYTES, FROZEN_MAX_OUTPUT_BYTES, FROZEN_MAX_PIDS,
@@ -68,6 +85,11 @@ pub struct ProcessSandboxRunner {
     pub wrapper_args: Vec<String>,
     /// OCI image reference carrying the concrete parser binary.
     pub oci_image: String,
+    /// W014-generated container identity of the most recent execution.
+    ///
+    /// Test/verification observability only: lets lifecycle tests prove the
+    /// actual OCI container was terminated and removed. Never read as policy.
+    last_container_name: Arc<Mutex<Option<String>>>,
 }
 
 impl ProcessSandboxRunner {
@@ -80,6 +102,7 @@ impl ProcessSandboxRunner {
             wrapper_binary: None,
             wrapper_args: Vec::new(),
             oci_image: DEFAULT_OCI_IMAGE.to_string(),
+            last_container_name: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -133,6 +156,28 @@ impl ProcessSandboxRunner {
             self.wrapper_args = wrapper_args;
         }
         self
+    }
+
+    /// Returns the W014-generated container identity of the most recent
+    /// execution, if any.
+    ///
+    /// Test/verification observability only: lets lifecycle tests prove the
+    /// actual OCI container was terminated and removed. The identity is
+    /// server-generated per execution and never derived from browser input,
+    /// job payloads, document bytes, or parser output.
+    #[must_use]
+    pub fn last_container_name(&self) -> Option<String> {
+        self.last_container_name
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Records the W014-generated container identity for the current execution.
+    fn record_container_name(&self, container_name: &str) {
+        if let Ok(mut guard) = self.last_container_name.lock() {
+            *guard = Some(container_name.to_string());
+        }
     }
 
     /// Resolves the authoritative isolation backend binary.
@@ -290,6 +335,159 @@ impl ProcessSandboxRunner {
 
         Ok(())
     }
+
+    /// Aborts execution with the given error after terminating the ACTUAL OCI
+    /// container and reaping the backend client.
+    ///
+    /// A pending stdin writer task is aborted (never awaited unboundedly and
+    /// never polled after completion), remaining pipes are dropped by the
+    /// caller, `docker rm -f <name>` terminates the real container (bounded),
+    /// and the `docker run` client is killed and reaped (bounded). When
+    /// actual-container termination cannot be established, the termination
+    /// failure is returned INSTEAD of `err` (fail closed: never report an
+    /// ordinary execution error while a parser container may remain alive).
+    async fn abort_with_error(
+        backend_program: &std::path::Path,
+        container_name: &str,
+        child: &mut tokio::process::Child,
+        writer_task: &mut Option<tokio::task::JoinHandle<Result<(), std::io::Error>>>,
+        err: SandboxError,
+    ) -> SandboxError {
+        if let Some(handle) = writer_task.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        match terminate_container_by_name(backend_program, container_name).await {
+            Ok(()) => {
+                kill_and_reap_client(child).await;
+                err
+            }
+            Err(termination_err) => {
+                kill_and_reap_client(child).await;
+                termination_err
+            }
+        }
+    }
+
+    /// Aborts execution on global wall-clock expiry (see [`Self::abort_with_error`]).
+    async fn abort_with_timeout(
+        backend_program: &std::path::Path,
+        container_name: &str,
+        child: &mut tokio::process::Child,
+        writer_task: &mut Option<tokio::task::JoinHandle<Result<(), std::io::Error>>>,
+        elapsed_secs: u64,
+        limit_secs: u64,
+    ) -> SandboxError {
+        Self::abort_with_error(
+            backend_program,
+            container_name,
+            child,
+            writer_task,
+            SandboxError::Timeout {
+                elapsed_secs,
+                limit_secs,
+            },
+        )
+        .await
+    }
+}
+
+/// Kills (if still running) and reaps the `docker run` backend client.
+///
+/// Bounded: the reap wait itself cannot block indefinitely.
+async fn kill_and_reap_client(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = tokio::time::timeout(Duration::from_secs(CLIENT_REAP_TIMEOUT_SECS), child.wait()).await;
+}
+
+/// Concurrently drains stdout/stderr to hard bounds, then waits for the backend.
+///
+/// The caller bounds this future with the single authoritative global
+/// wall-clock deadline and retains ownership of `child` so abort paths can
+/// still kill and reap the client after this future is dropped.
+async fn drain_and_wait(
+    child: &mut tokio::process::Child,
+    mut stdout_pipe: Option<tokio::process::ChildStdout>,
+    mut stderr_pipe: Option<tokio::process::ChildStderr>,
+    max_output_bytes: usize,
+    max_stderr_bytes: usize,
+) -> StreamResult {
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+
+    let mut stdout_done = stdout_pipe.is_none();
+    let mut stderr_done = stderr_pipe.is_none();
+
+    let mut stdout_chunk = [0u8; 8192];
+    let mut stderr_chunk = [0u8; 8192];
+
+    loop {
+        if stdout_done && stderr_done {
+            break;
+        }
+
+        tokio::select! {
+            res = async {
+                if let Some(ref mut out) = stdout_pipe {
+                    out.read(&mut stdout_chunk).await
+                } else {
+                    std::future::pending().await
+                }
+            }, if !stdout_done => {
+                match res {
+                    Ok(0) => {
+                        stdout_done = true;
+                        stdout_pipe = None;
+                    }
+                    Ok(n) => {
+                        if stdout_buf.len() + n > max_output_bytes {
+                            return StreamResult::StdoutOverflow {
+                                attempted_bytes: stdout_buf.len() + n,
+                            };
+                        }
+                        stdout_buf.extend_from_slice(&stdout_chunk[..n]);
+                    }
+                    Err(e) => {
+                        return StreamResult::IoError(format!("Error reading sandbox stdout: {e}"));
+                    }
+                }
+            }
+            res = async {
+                if let Some(ref mut err) = stderr_pipe {
+                    err.read(&mut stderr_chunk).await
+                } else {
+                    std::future::pending().await
+                }
+            }, if !stderr_done => {
+                match res {
+                    Ok(0) => {
+                        stderr_done = true;
+                        stderr_pipe = None;
+                    }
+                    Ok(n) => {
+                        if stderr_buf.len() + n > max_stderr_bytes {
+                            return StreamResult::StderrOverflow {
+                                attempted_bytes: stderr_buf.len() + n,
+                            };
+                        }
+                        stderr_buf.extend_from_slice(&stderr_chunk[..n]);
+                    }
+                    Err(e) => {
+                        return StreamResult::IoError(format!("Error reading sandbox stderr: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    match child.wait().await {
+        Ok(status) => StreamResult::Success {
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+            status,
+        },
+        Err(e) => StreamResult::IoError(format!("Failed waiting for sandbox exit status: {e}")),
+    }
 }
 
 /// Internal result of streaming consumption of stdout and stderr.
@@ -328,11 +526,57 @@ impl SandboxRunner for ProcessSandboxRunner {
             })
         })?;
 
-        // 3. Resolve the approved OCI backend and build the W014-generated
-        // mandatory container policy. Unapproved/missing backends fail closed;
-        // no caller-controlled isolation arguments are honored.
-        let (backend_program, backend_args) = self.build_oci_command(profile, input)?;
+        // 3. Resolve the approved OCI backend, mint the W014-generated
+        // actual-container identity, and build the mandatory container policy
+        // (`--pull=never`, `--name`, hardening). Unapproved/missing backends
+        // fail closed; no caller-controlled isolation arguments are honored.
+        let (backend_program, _) = self.resolve_isolation_wrapper()?;
+        let container_name = generate_container_name();
+        self.record_container_name(&container_name);
+        let backend_args = build_docker_run_argv_with_container_name(
+            profile,
+            &self.oci_image,
+            &self.binary_path.to_string_lossy(),
+            &self.extra_args,
+            input,
+            &container_name,
+        )?;
 
+        // 4. ONE authoritative global wall-clock deadline (<=600s) covering the
+        // COMPLETE execution lifecycle: local image preflight, OCI launch,
+        // stdin handoff, stdout/stderr drain, container execution, backend
+        // wait, and abort processing. Every phase below is bounded by this
+        // single `deadline`; the stdin writer is always joined inside it
+        // (aborted on expiry) and can never extend execution past it.
+        let wall_clock_limit = Duration::from_secs(profile.ceilings.max_wall_clock_seconds);
+        let start_instant = Instant::now();
+        let deadline = tokio::time::Instant::now() + wall_clock_limit;
+        let max_wall_clock_seconds = profile.ceilings.max_wall_clock_seconds;
+
+        // Local image preflight inside the same deadline: missing images,
+        // inspect failures, and revision/identity violations fail closed here,
+        // before any parser output can be accepted. No pull is ever attempted.
+        let preflight_outcome = tokio::select! {
+            res = preflight_local_image(&backend_program, &self.oci_image) => Some(res),
+            () = tokio::time::sleep_until(deadline) => None,
+        };
+        match preflight_outcome {
+            None => {
+                return Err(SandboxError::Timeout {
+                    elapsed_secs: start_instant.elapsed().as_secs(),
+                    limit_secs: max_wall_clock_seconds,
+                });
+            }
+            Some(Err(preflight_err)) => return Err(preflight_err),
+            Some(Ok(())) => {}
+        }
+
+        // NOTE: CPU/memory/PID quotas are enforced by the container runtime
+        // flags above (`--cpus`, `--memory`, `--pids-limit`). Accumulated
+        // CPU-time accounting is NOT capacity enforcement and is therefore
+        // never used as the authoritative vCPU mechanism.
+
+        // Configure stdio: pipe stdin (scoped object bytes only), stdout, stderr.
         let mut cmd = Command::new(&backend_program);
         cmd.args(&backend_args);
 
@@ -342,171 +586,197 @@ impl SandboxRunner for ProcessSandboxRunner {
         if let Ok(host_path) = std::env::var("PATH") {
             cmd.env("PATH", host_path);
         }
-
-        // NOTE: CPU/memory/PID quotas are enforced by the container runtime
-        // flags above (`--cpus`, `--memory`, `--pids-limit`). Accumulated
-        // CPU-time accounting is NOT capacity enforcement and is therefore
-        // never used as the authoritative vCPU mechanism.
-
-        // Configure stdio: pipe stdin (scoped object bytes only), stdout, stderr.
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
 
-        // 4. Spawn the OCI backend.
+        // 5. Launch the OCI backend inside the global deadline window.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SandboxError::Timeout {
+                elapsed_secs: start_instant.elapsed().as_secs(),
+                limit_secs: max_wall_clock_seconds,
+            });
+        }
         let mut child = cmd.spawn().map_err(|e| SandboxError::IO {
             detail: format!("Failed to spawn sandbox isolation backend '{backend_program:?}': {e}"),
         })?;
 
-        let mut child_stdin = child.stdin.take().ok_or_else(|| SandboxError::IO {
-            detail: "Failed to open sandbox stdin pipe".to_string(),
-        })?;
-
-        // Write scoped input bytes to container stdin, then close the pipe.
-        let input_bytes = input.bytes.clone();
-        let writer_task = tokio::spawn(async move {
-            let res = child_stdin.write_all(&input_bytes).await;
-            let _ = child_stdin.flush().await;
-            drop(child_stdin);
-            res
-        });
-
-        // 5. Hard Bounded Streaming Output Consumption with Wall-Clock Timeout.
-        let max_output_bytes = profile.ceilings.max_output_bytes;
-        let max_stderr_bytes = profile.ceilings.max_output_bytes;
-        let wall_clock_limit = Duration::from_secs(profile.ceilings.max_wall_clock_seconds);
-        let start_instant = Instant::now();
-
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
-
-        let stream_future = async {
-            let mut stdout_buf = Vec::new();
-            let mut stderr_buf = Vec::new();
-
-            let mut stdout_done = stdout_pipe.is_none();
-            let mut stderr_done = stderr_pipe.is_none();
-
-            let mut stdout_chunk = [0u8; 8192];
-            let mut stderr_chunk = [0u8; 8192];
-
-            loop {
-                if stdout_done && stderr_done {
-                    break;
-                }
-
-                tokio::select! {
-                    res = async {
-                        if let Some(ref mut out) = stdout_pipe {
-                            out.read(&mut stdout_chunk).await
-                        } else {
-                            std::future::pending().await
-                        }
-                    }, if !stdout_done => {
-                        match res {
-                            Ok(0) => {
-                                stdout_done = true;
-                                stdout_pipe = None;
-                            }
-                            Ok(n) => {
-                                if stdout_buf.len() + n > max_output_bytes {
-                                    return StreamResult::StdoutOverflow {
-                                        attempted_bytes: stdout_buf.len() + n,
-                                    };
-                                }
-                                stdout_buf.extend_from_slice(&stdout_chunk[..n]);
-                            }
-                            Err(e) => {
-                                return StreamResult::IoError(format!("Error reading sandbox stdout: {e}"));
-                            }
-                        }
+        let child_stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let io_err = SandboxError::IO {
+                    detail: "Failed to open sandbox stdin pipe".to_string(),
+                };
+                match terminate_container_by_name(&backend_program, &container_name).await {
+                    Ok(()) => {
+                        kill_and_reap_client(&mut child).await;
+                        return Err(io_err);
                     }
-                    res = async {
-                        if let Some(ref mut err) = stderr_pipe {
-                            err.read(&mut stderr_chunk).await
-                        } else {
-                            std::future::pending().await
-                        }
-                    }, if !stderr_done => {
-                        match res {
-                            Ok(0) => {
-                                stderr_done = true;
-                                stderr_pipe = None;
-                            }
-                            Ok(n) => {
-                                if stderr_buf.len() + n > max_stderr_bytes {
-                                    return StreamResult::StderrOverflow {
-                                        attempted_bytes: stderr_buf.len() + n,
-                                    };
-                                }
-                                stderr_buf.extend_from_slice(&stderr_chunk[..n]);
-                            }
-                            Err(e) => {
-                                return StreamResult::IoError(format!("Error reading sandbox stderr: {e}"));
-                            }
-                        }
+                    Err(termination_err) => {
+                        kill_and_reap_client(&mut child).await;
+                        return Err(termination_err);
                     }
-                }
-            }
-
-            match child.wait().await {
-                Ok(status) => StreamResult::Success {
-                    stdout: stdout_buf,
-                    stderr: stderr_buf,
-                    status,
-                },
-                Err(e) => {
-                    StreamResult::IoError(format!("Failed waiting for sandbox exit status: {e}"))
                 }
             }
         };
 
-        let stream_result = tokio::time::timeout(wall_clock_limit, stream_future).await;
-        let _ = writer_task.await;
+        // 6. stdin handoff progresses CONCURRENTLY with the stdout/stderr drain
+        // below (never "write everything then read", never "read without
+        // progressing stdin"). The writer is joined inside the same global
+        // deadline and aborted on expiry.
+        let input_bytes = input.bytes.clone();
+        let mut writer_task: Option<tokio::task::JoinHandle<Result<(), std::io::Error>>> =
+            Some(tokio::spawn(async move {
+                let mut stdin = child_stdin;
+                let res = stdin.write_all(&input_bytes).await;
+                let _ = stdin.flush().await;
+                drop(stdin);
+                res
+            }));
+
+        // 7. Hard-bounded concurrent streaming consumption under the SAME
+        // global deadline: stdout/stderr drain here while the stdin writer
+        // progresses concurrently. If the deadline fires first, this future is
+        // dropped (closing the retained pipes) while `child` stays owned
+        // outside so abort paths still terminate the ACTUAL container and reap
+        // the client.
+        let max_output_bytes = profile.ceilings.max_output_bytes;
+        let max_stderr_bytes = profile.ceilings.max_output_bytes;
+
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+
+        let drain_outcome = tokio::select! {
+            outcome = drain_and_wait(
+                &mut child,
+                stdout_pipe,
+                stderr_pipe,
+                max_output_bytes,
+                max_stderr_bytes,
+            ) => Some(outcome),
+            () = tokio::time::sleep_until(deadline) => None,
+        };
+        let stream_result = match drain_outcome {
+            Some(outcome) => outcome,
+            None => {
+                return Err(Self::abort_with_timeout(
+                    &backend_program,
+                    &container_name,
+                    &mut child,
+                    &mut writer_task,
+                    start_instant.elapsed().as_secs(),
+                    max_wall_clock_seconds,
+                )
+                .await);
+            }
+        };
+
+        // 8. Join the stdin writer INSIDE the same global deadline. A blocked
+        // writer can never extend execution past the ceiling: on expiry it is
+        // aborted and the actual container is terminated. No unbounded
+        // `writer_task.await` exists anywhere past the deadline, and a
+        // completed handle is taken (never polled again by abort paths).
+        let write_outcome = tokio::select! {
+            res = writer_task.as_mut().expect("writer task pending") => Some(res),
+            () = tokio::time::sleep_until(deadline) => None,
+        };
+        match write_outcome {
+            None => {
+                return Err(Self::abort_with_timeout(
+                    &backend_program,
+                    &container_name,
+                    &mut child,
+                    &mut writer_task,
+                    start_instant.elapsed().as_secs(),
+                    max_wall_clock_seconds,
+                )
+                .await);
+            }
+            Some(Err(_)) => {
+                writer_task.take();
+                return Err(Self::abort_with_error(
+                    &backend_program,
+                    &container_name,
+                    &mut child,
+                    &mut writer_task,
+                    SandboxError::IO {
+                        detail: "Sandbox stdin writer task terminated unexpectedly".to_string(),
+                    },
+                )
+                .await);
+            }
+            Some(Ok(Err(e))) => {
+                writer_task.take();
+                return Err(Self::abort_with_error(
+                    &backend_program,
+                    &container_name,
+                    &mut child,
+                    &mut writer_task,
+                    SandboxError::IO {
+                        detail: format!("Failed writing scoped input to sandbox stdin: {e}"),
+                    },
+                )
+                .await);
+            }
+            Some(Ok(Ok(()))) => {
+                writer_task.take();
+            }
+        }
 
         let (stdout_bytes, stderr_bytes, status) = match stream_result {
-            Ok(StreamResult::Success {
+            StreamResult::Success {
                 stdout,
                 stderr,
                 status,
-            }) => (stdout, stderr, status),
-            Ok(StreamResult::StdoutOverflow { attempted_bytes }) => {
-                // Hard ceiling crossed during stdout streaming: terminate and reap child immediately.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(SandboxError::ResourceViolation {
-                    resource: "stdout_output_bytes".to_string(),
-                    limit: format!("{max_output_bytes} bytes"),
-                    detail: format!(
-                        "Sandbox stdout exceeded hard output ceiling of {max_output_bytes} bytes during consumption (attempted {attempted_bytes} bytes)"
-                    ),
-                });
+            } => (stdout, stderr, status),
+            StreamResult::StdoutOverflow { attempted_bytes } => {
+                // Hard ceiling crossed during stdout streaming: terminate the
+                // ACTUAL container and reap the client (fail closed when
+                // termination cannot be established).
+                return Err(Self::abort_with_error(
+                    &backend_program,
+                    &container_name,
+                    &mut child,
+                    &mut writer_task,
+                    SandboxError::ResourceViolation {
+                        resource: "stdout_output_bytes".to_string(),
+                        limit: format!("{max_output_bytes} bytes"),
+                        detail: format!(
+                            "Sandbox stdout exceeded hard output ceiling of {max_output_bytes} bytes during consumption (attempted {attempted_bytes} bytes)"
+                        ),
+                    },
+                )
+                .await);
             }
-            Ok(StreamResult::StderrOverflow { attempted_bytes }) => {
-                // Hard ceiling crossed during stderr streaming: terminate and reap child immediately.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(SandboxError::ResourceViolation {
-                    resource: "stderr_output_bytes".to_string(),
-                    limit: format!("{max_stderr_bytes} bytes"),
-                    detail: format!(
-                        "Sandbox stderr exceeded hard output ceiling of {max_stderr_bytes} bytes during consumption (attempted {attempted_bytes} bytes)"
-                    ),
-                });
+            StreamResult::StderrOverflow { attempted_bytes } => {
+                // Hard ceiling crossed during stderr streaming: terminate the
+                // ACTUAL container and reap the client (fail closed when
+                // termination cannot be established).
+                return Err(Self::abort_with_error(
+                    &backend_program,
+                    &container_name,
+                    &mut child,
+                    &mut writer_task,
+                    SandboxError::ResourceViolation {
+                        resource: "stderr_output_bytes".to_string(),
+                        limit: format!("{max_stderr_bytes} bytes"),
+                        detail: format!(
+                            "Sandbox stderr exceeded hard output ceiling of {max_stderr_bytes} bytes during consumption (attempted {attempted_bytes} bytes)"
+                        ),
+                    },
+                )
+                .await);
             }
-            Ok(StreamResult::IoError(detail)) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(SandboxError::IO { detail });
-            }
-            Err(_) => {
-                // Wall-clock timeout fired: kill and reap child immediately.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(SandboxError::Timeout {
-                    elapsed_secs: start_instant.elapsed().as_secs(),
-                    limit_secs: profile.ceilings.max_wall_clock_seconds,
-                });
+            StreamResult::IoError(detail) => {
+                return Err(Self::abort_with_error(
+                    &backend_program,
+                    &container_name,
+                    &mut child,
+                    &mut writer_task,
+                    SandboxError::IO { detail },
+                )
+                .await);
             }
         };
 

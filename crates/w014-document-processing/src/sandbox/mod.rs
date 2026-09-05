@@ -23,9 +23,16 @@ pub use error::SandboxError;
 pub use input::SandboxInput;
 pub use mock::{MockSandboxBehavior, MockSandboxRunner};
 pub use oci::{
-    APPROVED_DOCKER_CANDIDATE_PATHS, APPROVED_ISOLATION_BINARY_NAME, DEFAULT_OCI_IMAGE,
-    build_docker_run_argv, discover_docker_binary, is_approved_isolation_binary,
-    resolve_approved_docker_binary,
+    APPROVED_DOCKER_CANDIDATE_PATHS, APPROVED_ISOLATION_BINARY_NAME, AUTHORITATIVE_OCI_IMAGE,
+    CLIENT_REAP_TIMEOUT_SECS, CONTAINER_INSPECT_TIMEOUT_SECS, CONTAINER_NAME_PREFIX,
+    CONTAINER_RM_TIMEOUT_SECS, DEFAULT_EXPECTED_IMAGE_REVISION, DEFAULT_OCI_IMAGE,
+    ENV_EXPECTED_IMAGE_REVISION, EXPECTED_OOXMLSDK_VERSION, EXPECTED_PARSER_BINARY_NAME,
+    EXPECTED_PDFIUM_SHA256, EXPECTED_PDFIUM_VERSION, IMAGE_PREFLIGHT_TIMEOUT_SECS,
+    LABEL_IMAGE_REVISION, LABEL_OOXMLSDK_VERSION, LABEL_PARSER_BINARY, LABEL_PDFIUM_SHA256,
+    LABEL_PDFIUM_VERSION, build_docker_run_argv, build_docker_run_argv_with_container_name,
+    container_present, discover_docker_binary, expected_image_revision, generate_container_name,
+    is_approved_isolation_binary, is_authoritative_image, is_valid_container_name,
+    preflight_local_image, resolve_approved_docker_binary, terminate_container_by_name,
 };
 pub use output::{
     MAX_BOUNDED_BLOCK_COUNT, MAX_BOUNDED_PAGE_COUNT, MAX_BOUNDED_SPAN_COUNT,
