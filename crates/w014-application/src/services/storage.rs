@@ -42,6 +42,14 @@ pub const MAX_GET_EXPIRATION_SECS: i64 = 300; // 5 minutes max (<= 300s)
 pub const HEAD_CHECKSUM_MODE_HEADER_NAME: &str = "x-amz-checksum-mode";
 pub const HEAD_CHECKSUM_MODE_HEADER_VALUE: &str = "ENABLED";
 
+/// Authoritative storage-level signed GET cache posture (WI0202 / E24).
+///
+/// The S3 `response-cache-control` override must be bound into the canonical
+/// SigV4 signed request (never appended as an unsigned post-sign mutation).
+/// URL lifetime alone is insufficient; delivery must be `private, no-store`.
+pub const SIGNED_GET_RESPONSE_CACHE_CONTROL_PARAM: &str = "response-cache-control";
+pub const SIGNED_GET_CACHE_CONTROL_VALUE: &str = "private, no-store";
+
 /// Authoritative object storage contract implemented by production and test providers.
 #[async_trait::async_trait]
 pub trait ObjectStorage: Send + Sync {
@@ -301,6 +309,10 @@ impl S3StorageAdapter {
     }
 
     /// Generates an AWS Signature Version 4 presigned URL.
+    ///
+    /// `extra_query_params` are bound into the canonical signed query string
+    /// before the signature is derived. Callers must NOT append signed query
+    /// parameters after signing (unsigned post-sign mutation is forbidden).
     pub fn generate_sigv4_presigned_url(
         &self,
         method: &str,
@@ -308,6 +320,7 @@ impl S3StorageAdapter {
         now: DateTime<Utc>,
         expires_in_secs: u64,
         extra_signed_headers: &[(&str, &str)],
+        extra_query_params: &[(&str, &str)],
     ) -> String {
         let datestamp = now.format("%Y%m%d").to_string();
         let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -336,7 +349,9 @@ impl S3StorageAdapter {
             canonical_headers.push_str(&format!("{}:{}\n", k.to_lowercase(), v.trim()));
         }
 
-        // Canonical query parameters (alphabetically sorted by key)
+        // Canonical query parameters (alphabetically sorted by key).
+        // Extra query params (e.g. S3 response-cache-control override) are
+        // bound into the signature here; appending afterwards is forbidden.
         let credential_param = format!("{}/{}", self.config.access_key_id, credential_scope);
         let mut query_params: Vec<(&str, String)> = vec![
             ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
@@ -345,6 +360,9 @@ impl S3StorageAdapter {
             ("X-Amz-Expires", expires_in_secs.to_string()),
             ("X-Amz-SignedHeaders", signed_headers_str.clone()),
         ];
+        for (k, v) in extra_query_params {
+            query_params.push((k, (*v).to_string()));
+        }
         query_params.sort_by(|a, b| a.0.cmp(b.0));
 
         let canonical_query_string = query_params
@@ -494,6 +512,7 @@ impl S3StorageAdapter {
             now,
             bounded_secs,
             &signed_headers,
+            &[],
         );
 
         Ok(PresignedPutContract {
@@ -511,9 +530,12 @@ impl S3StorageAdapter {
     /// - Server-owned key shape (fail-closed)
     /// - Bounded TTL (clamped to max 300s)
     /// - AWS SigV4 signed URL
+    /// - Signed `response-cache-control=private, no-store` override bound into
+    ///   the canonical signed request (E24; URL lifetime alone is insufficient)
     /// - No permanent object URL stored in product state
     /// - No mock fallback
     /// - No fake signature injection
+    /// - No unsigned post-sign query mutation
     pub fn generate_presigned_get(
         &self,
         artifact: &ObjectArtifact,
@@ -537,8 +559,20 @@ impl S3StorageAdapter {
         let bounded_secs = remaining_secs.min(MAX_GET_EXPIRATION_SECS) as u64;
         let effective_expires_at = now + chrono::Duration::seconds(bounded_secs as i64);
 
-        let download_url =
-            self.generate_sigv4_presigned_url("GET", artifact.key.as_str(), now, bounded_secs, &[]);
+        // E24: bind the private/no-store delivery posture into the signature.
+        // This query param is part of the canonical signed request; it must
+        // never be appended after signing.
+        let download_url = self.generate_sigv4_presigned_url(
+            "GET",
+            artifact.key.as_str(),
+            now,
+            bounded_secs,
+            &[],
+            &[(
+                SIGNED_GET_RESPONSE_CACHE_CONTROL_PARAM,
+                SIGNED_GET_CACHE_CONTROL_VALUE,
+            )],
+        );
 
         Ok(PresignedGetContract {
             download_url,
@@ -574,6 +608,7 @@ impl S3StorageAdapter {
                 HEAD_CHECKSUM_MODE_HEADER_NAME,
                 HEAD_CHECKSUM_MODE_HEADER_VALUE,
             )],
+            &[],
         );
         let headers = vec![(
             HEAD_CHECKSUM_MODE_HEADER_NAME.to_string(),
@@ -684,28 +719,115 @@ impl S3StorageAdapter {
         }
 
         let (configured_mode, configured_key) = self.encryption_posture();
-        let sse_mode = if let Some(sse_hdr) = resp
-            .headers()
-            .get("x-amz-server-side-encryption")
-            .and_then(|v| v.to_str().ok())
+        // WI0203_S3_HEAD_ENCRYPTION_POSTURE: observed immutable object facts MUST
+        // come from the authoritative HEAD response. Configuration validates
+        // expected policy but NEVER substitutes for observed object metadata.
+        // Missing / malformed / unexpected / inconsistent encryption metadata
+        // fails closed; nothing is persisted from configuration.
+        let observed_sse: Option<String> = match resp.headers().get("x-amz-server-side-encryption")
         {
-            if sse_hdr == "aws:kms" {
-                w014_domain::EncryptionMode::AwsKms
-            } else {
-                configured_mode
-            }
-        } else {
-            configured_mode
+            None => None,
+            Some(v) => match v.to_str() {
+                Ok(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        return Err(FinalizeUploadError::PreconditionFailed(
+                                "S3 HEAD authoritative error: malformed x-amz-server-side-encryption header (empty)"
+                                    .to_string(),
+                            ));
+                    }
+                    Some(trimmed.to_string())
+                }
+                Err(_) => {
+                    return Err(FinalizeUploadError::PreconditionFailed(
+                            "S3 HEAD authoritative error: malformed x-amz-server-side-encryption header (invalid ASCII)"
+                                .to_string(),
+                        ));
+                }
+            },
+        };
+        let observed_kms: Option<String> = match resp
+            .headers()
+            .get("x-amz-server-side-encryption-aws-kms-key-id")
+        {
+            None => None,
+            Some(v) => match v.to_str() {
+                Ok(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        return Err(FinalizeUploadError::PreconditionFailed(
+                            "S3 HEAD authoritative error: malformed x-amz-server-side-encryption-aws-kms-key-id header (empty)"
+                                .to_string(),
+                        ));
+                    }
+                    Some(trimmed.to_string())
+                }
+                Err(_) => {
+                    return Err(FinalizeUploadError::PreconditionFailed(
+                        "S3 HEAD authoritative error: malformed x-amz-server-side-encryption-aws-kms-key-id header (invalid ASCII)"
+                            .to_string(),
+                    ));
+                }
+            },
         };
 
-        let kms_key_id = if sse_mode == w014_domain::EncryptionMode::AwsKms {
-            resp.headers()
-                .get("x-amz-server-side-encryption-aws-kms-key-id")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-                .or(configured_key)
-        } else {
-            None
+        let (sse_mode, kms_key_id) = match configured_mode {
+            w014_domain::EncryptionMode::AwsKms | w014_domain::EncryptionMode::SseAes256 => {
+                match observed_sse.as_deref() {
+                    None => {
+                        return Err(FinalizeUploadError::PreconditionFailed(
+                            "S3 HEAD authoritative error: missing required x-amz-server-side-encryption header (observed encryption fact required; configuration cannot substitute)"
+                                .to_string(),
+                        ));
+                    }
+                    Some("aws:kms") => {}
+                    Some(other) => {
+                        return Err(FinalizeUploadError::PreconditionFailed(format!(
+                            "S3 HEAD authoritative error: unexpected x-amz-server-side-encryption '{other}' (expected 'aws:kms'; observed/configured encryption mismatch)"
+                        )));
+                    }
+                }
+                match (configured_key.clone(), observed_kms.clone()) {
+                    (Some(expected), Some(observed)) => {
+                        if observed != expected {
+                            return Err(FinalizeUploadError::PreconditionFailed(format!(
+                                "S3 HEAD authoritative error: observed KMS key '{observed}' mismatches configured KMS policy"
+                            )));
+                        }
+                        (w014_domain::EncryptionMode::AwsKms, Some(observed))
+                    }
+                    (Some(_), None) => {
+                        return Err(FinalizeUploadError::PreconditionFailed(
+                            "S3 HEAD authoritative error: missing required x-amz-server-side-encryption-aws-kms-key-id header (configured KMS key cannot substitute for observed fact)"
+                                .to_string(),
+                        ));
+                    }
+                    (None, observed) => (w014_domain::EncryptionMode::AwsKms, observed),
+                }
+            }
+            _ => {
+                // Frozen local-storage authority semantics: local objects carry
+                // no AWS HEAD encryption facts. Absent SSE persists as local;
+                // any present AWS SSE fact is inconsistent with local policy and
+                // fails closed. Configuration is never fabricated into facts.
+                if let Some(other) = observed_sse.as_deref() {
+                    if other == "aws:kms" {
+                        return Err(FinalizeUploadError::PreconditionFailed(
+                            "S3 HEAD authoritative error: observed x-amz-server-side-encryption 'aws:kms' mismatches configured 'local' policy"
+                                .to_string(),
+                        ));
+                    }
+                    return Err(FinalizeUploadError::PreconditionFailed(format!(
+                        "S3 HEAD authoritative error: unexpected x-amz-server-side-encryption '{other}' for configured 'local' policy"
+                    )));
+                }
+                if let Some(kms) = observed_kms.as_deref() {
+                    return Err(FinalizeUploadError::PreconditionFailed(format!(
+                        "S3 HEAD authoritative error: unexpected KMS key '{kms}' for configured 'local' policy"
+                    )));
+                }
+                (w014_domain::EncryptionMode::Local, None)
+            }
         };
 
         Ok(Some(StoredObjectMetadata {
@@ -739,7 +861,7 @@ impl S3StorageAdapter {
             ));
         }
 
-        let signed_url = self.generate_sigv4_presigned_url("GET", key, Utc::now(), 300, &[]);
+        let signed_url = self.generate_sigv4_presigned_url("GET", key, Utc::now(), 300, &[], &[]);
 
         let resp =
             self.client.get(&signed_url).send().await.map_err(|e| {
@@ -999,7 +1121,7 @@ impl ObjectStorage for TestStorageAdapter {
         let effective_expires_at = now + chrono::Duration::seconds(bounded_secs);
 
         let download_url = format!(
-            "https://storage.local/{}/{}?expires={}&signature=valid",
+            "https://storage.local/{}/{}?expires={}&response-cache-control=private%2C%20no-store&signature=valid",
             artifact.bucket,
             artifact.key.as_str(),
             effective_expires_at.timestamp()
